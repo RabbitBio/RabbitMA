@@ -1,0 +1,17 @@
+RabbitMA
+========
+
+RabbitMA is a performance-oriented derivative of MEGAHIT v1.2.9.
+
+Upstream project: https://github.com/voutcn/megahit
+Upstream release: MEGAHIT v1.2.9
+
+The original MEGAHIT source and its copyright notices remain attributed to
+their respective authors and organizations. RabbitMA is not an official
+MEGAHIT distribution and is not endorsed by the upstream project.
+
+RabbitMA is distributed under the GNU General Public License, version 3 or (at
+your option) any later version. See LICENSE for the complete license text.
+
+Vendored third-party components retain their own notices and license files,
+including those under third_party/rapidgzip.
