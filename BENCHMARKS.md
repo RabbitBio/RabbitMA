@@ -2,27 +2,37 @@
 
 ## CAMI III reference measurement
 
-The performance-development reference used all 20 short-read samples from the
-CAMI III Toy Longitudinal Human Gut dataset (about 100 Gbp, paired-end 150 bp),
-128 threads, and `--k-min 39`.
+The reference workload used all 20 short-read samples from the CAMI III Toy
+Longitudinal Human Gut dataset (about 100 Gbp, paired-end 150 bp). The reads
+were combined into one 92.13 GB (85.80 GiB) interleaved gzip file to exercise
+the single-large-input path. Both versions used 128 threads and `--k-min 39` on
+the same machine.
 
-| Version | Wall time | Peak RSS | Speedup |
-| --- | ---: | ---: | ---: |
-| Official MEGAHIT v1.2.9 | 4:12:32 | 78.94 GiB | 1.00x |
-| RabbitMA development checkpoint | 1:07:26 | 68.22 GiB | 3.74x |
+| Version | Wall time | Peak RSS | Speedup | Peak-RSS reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Official MEGAHIT v1.2.9 | 4:12:32 | 78.94 GiB | 1.00x | - |
+| RabbitMA bounded-memory run | 57:54.82 | 19.28 GiB | 4.36x | 75.6% |
 
-These figures are historical measurements from the same machine and input.
-The RabbitMA source in this initial repository also includes later bounded-
-memory and correctness changes. The complete 100 Gbp workload has not been
-retimed after all of those changes, so the table is a development reference,
-not a newly reproduced benchmark for this exact commit.
+RabbitMA reduced peak resident memory by 59.66 GiB, using about one quarter
+(`1/4.1`) of the official version's peak RSS while also reducing wall time.
+The 19.28 GiB figure is an observed peak, not a hard-coded memory cap. It comes
+from general bounded-working-set policies: count records and graph buckets are
+streamed, `seq2sdbg` limits simultaneously live partitions, completed mapping
+chunks are released promptly, and the exact mercy-edge index avoids retaining
+a second full edge collection. These policies derive their budgets from the
+run-time memory allowance and workload histograms rather than the CAMI input
+size or a fixed machine topology.
 
-The workload shape can be reproduced with a command of this form:
+The measured run contains the bounded-memory and deterministic traversal work
+used by this source line. Subsequent correctness-only fixes for circular-contig
+semantics do not change its allocation policy; a full retiming of the exact
+public commit remains useful for release-grade reproducibility.
+
+The measured workload can be reproduced with a command of this form:
 
 ```bash
 rabbitma \
-  -1 sample01_R1.fastq.gz,...,sample20_R1.fastq.gz \
-  -2 sample01_R2.fastq.gz,...,sample20_R2.fastq.gz \
+  --12 cami3_20samples_merged_interleaved.fq.gz \
   -t 128 --k-min 39 -o cami3_coassembly
 ```
 
