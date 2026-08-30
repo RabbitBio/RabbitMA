@@ -2,22 +2,141 @@ name: Publish release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - ".github/release-build-target"
 
 permissions:
   contents: write
 
 jobs:
-  github-release:
+  linux-x86-64:
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub release
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="$(tr -d '[:space:]' < .github/release-build-target)"
+          fi
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: ${release_tag}" >&2
+            exit 1
+          fi
+          git rev-parse --verify "refs/tags/${release_tag}^{commit}"
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          git checkout --detach "${release_tag}"
+
+      - name: Build and test portable Linux package
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          docker run --rm \
+            -e RELEASE_TAG \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            rockylinux:8 \
+            bash -euxo pipefail -c '
+              dnf install -y \
+                gcc gcc-c++ make cmake zlib-devel libdeflate-devel \
+                python3 gzip bzip2 tar
+
+              package_name="RabbitMA-${RELEASE_TAG}-linux-x86_64"
+              package_dir="/src/dist/${package_name}"
+              mkdir -p /src/release-build /src/dist
+              cd /src/release-build
+
+              cmake \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/ \
+                -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib \
+                -DZLIB_LIBRARY=/usr/lib64/libz.so \
+                -DZLIB_INCLUDE_DIR=/usr/include \
+                ..
+              cmake --build . -- -j2
+              DESTDIR="${package_dir}" cmake --build . --target install
+
+              install -d "${package_dir}/lib"
+              install -m 755 /usr/lib64/libdeflate.so.0 "${package_dir}/lib/"
+              install -m 755 /usr/lib64/libz.so.1 "${package_dir}/lib/"
+              install -m 755 /usr/lib64/libstdc++.so.6 "${package_dir}/lib/"
+              install -m 755 /usr/lib64/libgcc_s.so.1 "${package_dir}/lib/"
+              install -m 755 /usr/lib64/libgomp.so.1 "${package_dir}/lib/"
+
+              install -m 644 \
+                /src/README.md /src/BENCHMARKS.md /src/LICENSE /src/NOTICE \
+                "${package_dir}/"
+              install -d "${package_dir}/share/licenses"
+              cp -a /usr/share/licenses/libdeflate \
+                "${package_dir}/share/licenses/libdeflate"
+              cp -a /usr/share/licenses/zlib \
+                "${package_dir}/share/licenses/zlib"
+              cp -a /usr/share/licenses/libgcc \
+                "${package_dir}/share/licenses/gcc-runtime"
+
+              {
+                echo "RabbitMA ${RELEASE_TAG}"
+                echo "Platform: Linux x86_64, glibc 2.28 or newer"
+                gcc --version | head -n 1
+                cmake --version | head -n 1
+                echo
+                echo "Bundled runtime libraries:"
+                ls -1 "${package_dir}/lib"
+                echo
+                echo "Dynamic-link audit:"
+                for core in \
+                  megahit_core megahit_core_popcnt megahit_core_no_hw_accel
+                do
+                  echo "[${core}]"
+                  ldd "${package_dir}/bin/${core}"
+                done
+              } > "${package_dir}/BUILD_INFO.txt"
+
+              if grep -q "not found" "${package_dir}/BUILD_INFO.txt"; then
+                echo "Unresolved dynamic dependency" >&2
+                exit 1
+              fi
+
+              mkdir -p /tmp/rabbitma-release-smoke
+              cd /tmp/rabbitma-release-smoke
+              "${package_dir}/bin/rabbitma" --version
+              "${package_dir}/bin/rabbitma" --test -t 2
+
+              cd /src/dist
+              tar --sort=name --owner=0 --group=0 --numeric-owner \
+                -czf "${package_name}.tar.gz" "${package_name}"
+              sha256sum "${package_name}.tar.gz" \
+                > "${package_name}.tar.gz.sha256"
+            '
+
+      - name: Create release and upload package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
+          asset="RabbitMA-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          if ! gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1
+          then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "RabbitMA ${RELEASE_TAG}" \
+              --generate-notes
+          fi
+          gh release upload "${RELEASE_TAG}" \
+            "dist/${asset}" "dist/${asset}.sha256" \
             --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --title "RabbitMA ${GITHUB_REF_NAME}" \
-            --generate-notes
+            --clobber

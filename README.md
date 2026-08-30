@@ -52,6 +52,23 @@ cmake -DCMAKE_INSTALL_PREFIX=/path/to/install .
 cmake --build . --target install
 ```
 
+### Prebuilt Linux package
+
+Users who do not have a suitable CMake/compiler toolchain can download
+`RabbitMA-v0.1.0-linux-x86_64.tar.gz` from the
+[v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
+It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
+CMake and a compiler are not needed. The package contains both `rabbitma` and
+the compatible `megahit` command, all three CPU core variants, test data, and
+the required non-glibc runtime libraries.
+
+```bash
+sha256sum -c RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
+tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
+export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
+rabbitma --test -t 4
+```
+
 The build produces BMI2/POPCNT, POPCNT-only, and portable core binaries. The
 Python driver selects a supported variant at run time.
 
