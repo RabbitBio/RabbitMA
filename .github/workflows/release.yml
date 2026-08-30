@@ -82,6 +82,7 @@ jobs:
               cmake -E remove "${package_dir}/bin/rabbitma"
               sed -i "s/rabbitma (or megahit)/megahit/" \
                 "${package_dir}/bin/megahit"
+              cmake -E create_symlink bin/megahit "${package_dir}/megahit"
 
               install -d "${package_dir}/lib"
               install -m 755 /usr/lib64/libdeflate.so.0 "${package_dir}/lib/"
@@ -129,6 +130,10 @@ jobs:
                 echo "Unexpected rabbitma CLI in the release package" >&2
                 exit 1
               fi
+              if ! test -L "${package_dir}/megahit"; then
+                echo "Missing top-level megahit entry point" >&2
+                exit 1
+              fi
               for core in \
                 megahit_core megahit_core_popcnt megahit_core_no_hw_accel
               do
@@ -146,8 +151,8 @@ jobs:
 
               mkdir -p /tmp/megahit-release-smoke
               cd /tmp/megahit-release-smoke
-              "${package_dir}/bin/megahit" --version
-              "${package_dir}/bin/megahit" --test -t 2
+              "${package_dir}/megahit" --version
+              "${package_dir}/megahit" --test -t 2
 
               cd /src/dist
               tar --sort=name --owner=0 --group=0 --numeric-owner \

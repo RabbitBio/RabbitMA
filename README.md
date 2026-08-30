@@ -38,14 +38,15 @@ The quickest way to use RabbitMA is to download the prebuilt
 `RabbitMA-v0.1.0-linux-x86_64.tar.gz` package from the
 [v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
 It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
-CMake and a compiler are not needed. The package exposes only the `megahit`
-command, plus the internal CPU core variants, test data, and required
-non-glibc runtime libraries.
+CMake and a compiler are not needed. The package exposes `megahit` as its only
+public command and includes the internal CPU core variants, test data, and
+required non-glibc runtime libraries.
 
 ```bash
 wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz
 tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
-RabbitMA-v0.1.0-linux-x86_64/bin/megahit --test -t 4
+cd RabbitMA-v0.1.0-linux-x86_64
+./megahit --test -t 4
 ```
 
 The package includes BMI2/POPCNT, POPCNT-only, and portable core binaries. The
@@ -64,7 +65,7 @@ cd RabbitMA
 mkdir build
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . -- -j
+cmake --build . -- -j4
 ./megahit --test -t 4
 ```
 
@@ -77,16 +78,19 @@ cmake --build . --target install
 
 ## Usage
 
+The commands below assume the current directory is the extracted prebuilt
+package. A source build provides the same command as `build/megahit`.
+
 One paired-end library:
 
 ```bash
-megahit -1 reads_1.fastq.gz -2 reads_2.fastq.gz -t 32 -o assembly
+./megahit -1 reads_1.fastq.gz -2 reads_2.fastq.gz -t 32 -o assembly
 ```
 
 Multiple paired-end libraries:
 
 ```bash
-megahit \
+./megahit \
   -1 sample1_R1.fastq.gz,sample2_R1.fastq.gz \
   -2 sample1_R2.fastq.gz,sample2_R2.fastq.gz \
   -t 64 --k-min 39 -o coassembly
@@ -95,11 +99,11 @@ megahit \
 Interleaved and single-end inputs remain compatible with MEGAHIT:
 
 ```bash
-megahit --12 interleaved.fastq.gz -o assembly
-megahit -r reads.fastq.gz -o assembly
+./megahit --12 interleaved.fastq.gz -o assembly
+./megahit -r reads.fastq.gz -o assembly
 ```
 
-Run `megahit --help` for the complete option list. Final contigs are written
+Run `./megahit --help` for the complete option list. Final contigs are written
 to `OUT_DIR/final.contigs.fa`.
 
 ## Compatibility and validation
