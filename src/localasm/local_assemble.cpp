@@ -367,6 +367,17 @@ int32_t GetMaxLocalRange(const SequenceLibCollection &lib_collection,
   return max_local_range;
 }
 
+unsigned LegacySingleEndMappingCopies() {
+  // Upstream MEGAHIT's single-end loop used `omp parallel` without `for`.
+  // Consequently every worker inserted the same mapping.  Mapping results
+  // are sorted and local assembly keeps at most the first three entries at a
+  // contig position, so the only observable multiplicity is
+  // min(team_size, 3).  Preserve that historical result while still dividing
+  // the read scan among workers and without retaining dozens of redundant
+  // copies on high-core-count machines.
+  return static_cast<unsigned>(std::min(omp_get_num_threads(), 3));
+}
+
 void MapToContigs(const HashMapper &mapper,
                   const SequenceLibCollection &lib_collection,
                   const std::vector<TInsertSize> &insert_sizes,
@@ -406,15 +417,22 @@ void MapToContigs(const HashMapper &mapper,
       }
     } else {
 #pragma omp parallel reduction(+ : num_added, num_mapped)
-      for (size_t i = 0; i < lib.seq_count(); ++i) {
-        auto seq = lib.GetSequenceView(i);
-        auto rec = mapper.TryMap(seq);
+      {
+        const unsigned mapping_copies = LegacySingleEndMappingCopies();
+#pragma omp for
+        for (size_t i = 0; i < lib.seq_count(); ++i) {
+          auto seq = lib.GetSequenceView(i);
+          auto rec = mapper.TryMap(seq);
 
-        if (rec.valid) {
-          ++num_mapped;
-          num_added += collector->AddSingle(
-              rec, mapper.refseq().GetSeqView(rec.contig_id).length(),
-              seq.length(), local_range);
+          if (rec.valid) {
+            ++num_mapped;
+            const int32_t contig_len =
+                mapper.refseq().GetSeqView(rec.contig_id).length();
+            for (unsigned copy = 0; copy < mapping_copies; ++copy) {
+              num_added += collector->AddSingle(rec, contig_len, seq.length(),
+                                                local_range);
+            }
+          }
         }
       }
     }
@@ -484,6 +502,7 @@ void MapToContigsMapped(const HashMapper &mapper,
           }
         }
       } else {
+        const unsigned mapping_copies = LegacySingleEndMappingCopies();
         const uint32_t *cursor = reads.LocateRead(chunk, first);
         for (uint64_t read_id = first; read_id < end; ++read_id) {
           const PackedReadRecord seq = MappedReadFile::Next(&cursor);
@@ -491,9 +510,12 @@ void MapToContigsMapped(const HashMapper &mapper,
               mapper.TryMap(seq.words, seq.length, read_id);
           if (rec.valid) {
             ++num_mapped;
-            num_added += collector->AddSingle(
-                rec, mapper.refseq().GetSeqView(rec.contig_id).length(),
-                seq.length, local_range);
+            const int32_t contig_len =
+                mapper.refseq().GetSeqView(rec.contig_id).length();
+            for (unsigned copy = 0; copy < mapping_copies; ++copy) {
+              num_added += collector->AddSingle(rec, contig_len, seq.length,
+                                                local_range);
+            }
           }
         }
       }

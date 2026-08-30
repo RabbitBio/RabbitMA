@@ -20,7 +20,9 @@
 
 
 
+import errno
 import getopt
+import glob
 import json
 import logging
 import multiprocessing
@@ -707,9 +709,17 @@ def inpipe_cmd(file_name):
     # lets buildlib process independent libraries in parallel instead of
     # blocking dozens of external gzip processes on sequentially-read FIFOs.
     if file_name.endswith('.bz2'):
-        return 'bzip2 -cd ' + file_name
+        return ['bzip2', '-cd', file_name]
     else:
-        return ''
+        return []
+
+
+def quote_library_path(file_name):
+    # The internal read-library reader accepts quoted and historical unquoted
+    # paths.  Quoting keeps spaces and shell metacharacters as ordinary data.
+    if '\n' in file_name or '\r' in file_name:
+        raise Usage('Input and temporary paths cannot contain newlines.')
+    return '"' + file_name.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
 @check_point
@@ -717,32 +727,35 @@ def create_library_file():
     with open(opt.read_lib_path, 'w') as lib:
         for i, file_name in enumerate(opt.pe12):
             print(file_name, file=lib)
-            if inpipe_cmd(file_name) != '':
-                print('interleaved ' + os.path.join(opt.temp_dir, 'inpipe.pe12.' + str(i)), file=lib)
+            if inpipe_cmd(file_name):
+                print('interleaved ' + quote_library_path(
+                    os.path.join(opt.temp_dir, 'inpipe.pe12.' + str(i))), file=lib)
             else:
-                print('interleaved ' + file_name, file=lib)
+                print('interleaved ' + quote_library_path(file_name), file=lib)
 
         for i, (file_name1, file_name2) in enumerate(zip(opt.pe1, opt.pe2)):
             print(','.join([file_name1, file_name2]), file=lib)
 
-            if inpipe_cmd(file_name1) != '':
+            if inpipe_cmd(file_name1):
                 f1 = os.path.join(opt.temp_dir, 'inpipe.pe1.' + str(i))
             else:
                 f1 = file_name1
 
-            if inpipe_cmd(file_name2) != '':
+            if inpipe_cmd(file_name2):
                 f2 = os.path.join(opt.temp_dir, 'inpipe.pe2.' + str(i))
             else:
                 f2 = file_name2
 
-            print('pe ' + f1 + ' ' + f2, file=lib)
+            print('pe ' + quote_library_path(f1) + ' ' +
+                  quote_library_path(f2), file=lib)
 
         for i, file_name in enumerate(opt.se):
             print(file_name, file=lib)
-            if inpipe_cmd(file_name) != '':
-                print('se ' + os.path.join(opt.temp_dir, 'inpipe.se.' + str(i)), file=lib)
+            if inpipe_cmd(file_name):
+                print('se ' + quote_library_path(
+                    os.path.join(opt.temp_dir, 'inpipe.se.' + str(i))), file=lib)
             else:
-                print('se ' + file_name, file=lib)
+                print('se ' + quote_library_path(file_name), file=lib)
 
 
 @check_point
@@ -750,6 +763,7 @@ def build_library():
     cmd = [opt.megahit_core, 'buildlib', opt.read_lib_path, opt.read_lib_path,
            str(opt.num_cpu_threads)]
     fifos = list()
+    fifo_commands = list()
     pipes = list()
 
     def create_fifo(read_type, num, command):
@@ -757,27 +771,56 @@ def build_library():
         remove_if_exists(fifo_path)
         os.mkfifo(fifo_path)
         fifos.append(fifo_path)
-        p = subprocess.Popen('{0} > {1}'.format(command, fifo_path), shell=True, preexec_fn=os.setsid)
-        pipes.append(p)
+        fifo_commands.append((fifo_path, command))
+
+    def start_fifo_writers(build_process):
+        # buildlib is already running by the time this callback executes, so
+        # opening a FIFO writer synchronizes with its reader without a shell
+        # redirection or an O_RDWR anchor that can lose early decoder output.
+        for fifo_path, command in fifo_commands:
+            while True:
+                try:
+                    fifo_fd = os.open(
+                        fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                    try:
+                        os.set_blocking(fifo_fd, True)
+                    except Exception:
+                        os.close(fifo_fd)
+                        raise
+                    break
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
+                    if build_process.poll() is not None:
+                        raise RuntimeError(
+                            'buildlib exited before opening ' + fifo_path)
+                    time.sleep(0.01)
+            try:
+                p = subprocess.Popen(command, stdout=fifo_fd,
+                                     start_new_session=True)
+            finally:
+                os.close(fifo_fd)
+            pipes.append(p)
 
     try:
         # create inpipe
         for i in range(len(opt.pe12)):
-            if inpipe_cmd(opt.pe12[i]) != '':
+            if inpipe_cmd(opt.pe12[i]):
                 create_fifo('pe12', i, inpipe_cmd(opt.pe12[i]))
 
         for i in range(len(opt.pe1)):
-            if inpipe_cmd(opt.pe1[i]) != '':
+            if inpipe_cmd(opt.pe1[i]):
                 create_fifo('pe1', i, inpipe_cmd(opt.pe1[i]))
 
-            if inpipe_cmd(opt.pe2[i]) != '':
+            if inpipe_cmd(opt.pe2[i]):
                 create_fifo('pe2', i, inpipe_cmd(opt.pe2[i]))
 
         for i in range(len(opt.se)):
-            if inpipe_cmd(opt.se[i]) != '':
+            if inpipe_cmd(opt.se[i]):
                 create_fifo('se', i, inpipe_cmd(opt.se[i]))
 
-        run_sub_command(cmd, 'Convert reads to binary library', verbose=True)
+        run_sub_command(cmd, 'Convert reads to binary library', verbose=True,
+                        on_started=start_fifo_writers)
 
         for p in pipes:
             pipe_ret = p.wait()
@@ -971,11 +1014,25 @@ def merge_final(final_k):
         final_contig_name = os.path.join(opt.out_dir, opt.out_prefix + '.contigs.fa')
 
     with open(final_contig_name, 'w') as final_contigs:
-        merge_cmd = 'cat ' + opt.contig_dir + '/*.final.contigs.fa ' + \
-                    contig_prefix(final_k) + '.contigs.fa | ' + \
-                    opt.megahit_core + ' filterbylen ' + str(opt.min_contig_len)
-        p = subprocess.Popen(merge_cmd, shell=True, stdout=final_contigs, stderr=subprocess.PIPE)
-        _, log = p.communicate()
+        merge_cmd = [opt.megahit_core, 'filterbylen', str(opt.min_contig_len)]
+        p = subprocess.Popen(merge_cmd, stdin=subprocess.PIPE,
+                             stdout=final_contigs, stderr=subprocess.PIPE)
+        input_files = sorted(glob.glob(
+            os.path.join(opt.contig_dir, '*.final.contigs.fa')))
+        input_files.append(contig_prefix(final_k) + '.contigs.fa')
+        try:
+            for input_file in input_files:
+                with open(input_file, 'rb') as source:
+                    shutil.copyfileobj(source, p.stdin)
+        except BrokenPipeError:
+            pass
+        except Exception:
+            p.stdin.close()
+            p.terminate()
+            p.wait()
+            raise
+        p.stdin.close()
+        log = p.stderr.read()
         logger.info(log.rstrip().decode('utf-8'))
         ret_code = p.wait()
 
@@ -985,7 +1042,7 @@ def merge_final(final_k):
         exit(ret_code)
 
 
-def run_sub_command(cmd, msg, verbose=False):
+def run_sub_command(cmd, msg, verbose=False, on_started=None):
     if opt.verbose:
         verbose = True
     logger.info(msg)
@@ -994,6 +1051,8 @@ def run_sub_command(cmd, msg, verbose=False):
     p = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
     try:
+        if on_started is not None:
+            on_started(p)
         while True:
             raw_line = p.stderr.readline()
             if raw_line == b'':
@@ -1015,6 +1074,10 @@ def run_sub_command(cmd, msg, verbose=False):
         p.terminate()
         p.wait()
         exit(signal.SIGINT)
+    except Exception:
+        p.terminate()
+        p.wait()
+        raise
 
 
 def main(argv=None):

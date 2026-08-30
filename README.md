@@ -101,19 +101,23 @@ to `OUT_DIR/final.contigs.fa`.
 
 ## Compatibility and validation
 
-RabbitMA is intended to preserve MEGAHIT v1.2.9 assembly semantics. Six
-simulated datasets covering unique sequence, strain bubbles, repeats,
-uneven/error-prone coverage, circular sequence, and single-end tips were
-compared with official MEGAHIT. Across 100 final and per-k checks, 95 artifacts
-were byte/canonical-sequence exact and the remaining five differed only by the
-rotation origin of circular contigs; no substantive sequence or multiplicity
-difference was found.
+RabbitMA is intended to preserve MEGAHIT v1.2.9 assembly semantics. Structured
+simulations cover unique sequence, strain bubbles, repeats, uneven/error-prone
+coverage, circular sequence, single-end tips, ambiguous bases, variable read
+lengths, paired-end, interleaved, gzip, and bzip2 inputs. The v0.1.0
+compatibility audit also compared four real single-end datasets and exercised
+1-, 2-, 3-, and high-thread local assembly. All non-circular final contigs
+matched the official normalized sequence, flag, and multiplicity multisets;
+circular contigs matched the same complete graph-edge sets.
 
 Raw FASTA MD5 values are not a reliable semantic comparison for parallel
 assemblers: record order, reverse-complement orientation, and the chosen origin
-of a circular contig can change without changing the assembled sequence.
-Validation should compare normalized sequence and multiplicity multisets, with
-circular sequences compared modulo rotation.
+of a circular contig can change without changing the assembled graph. Official
+MEGAHIT can select different circular origins at different thread counts; its
+seed-weighted circular depth can consequently differ slightly as well.
+Validation should compare normalized sequence, flag, and multiplicity
+multisets for non-circular contigs, and exact graph-edge sets for circular
+contigs.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the CAMI III reference measurement and
 its scope.

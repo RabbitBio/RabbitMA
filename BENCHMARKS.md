@@ -24,14 +24,15 @@ run-time memory allowance and workload histograms rather than the CAMI input
 size or a fixed machine topology.
 
 The measured run contains the bounded-memory and deterministic traversal work
-used by this source line. Subsequent correctness-only fixes for circular-contig
-semantics do not change its allocation policy; a full retiming of the exact
-public commit remains useful for release-grade reproducibility.
+used by this source line. Subsequent correctness-only fixes for single-end
+local-mapping compatibility, circular-contig semantics, and path handling do
+not change this paired CAMI workload's allocation policy; a full retiming of
+the exact public commit remains useful for release-grade reproducibility.
 
 The measured workload can be reproduced with a command of this form:
 
 ```bash
-rabbitma \
+megahit \
   --12 cami3_20samples_merged_interleaved.fq.gz \
   -t 128 --k-min 39 -o cami3_coassembly
 ```
@@ -62,8 +63,13 @@ official MEGAHIT v1.2.9. The datasets exercise:
 - single-end tips.
 
 Across 100 final and per-k artifact comparisons, 95 matched exactly after the
-same canonicalization and five were circular-origin-only matches. There were no
-missing artifacts or substantive sequence/multiplicity failures.
+same canonicalization and five represented the same circular edge sets from a
+different origin. The v0.1.0 audit additionally covered four real single-end
+datasets, 1/2/3/high-thread single-end local assembly, mixed library types,
+ambiguous bases, variable read lengths, paths containing spaces and quotes,
+and all three CPU-dispatch binaries. Every non-circular final contig matched
+the official normalized sequence, flag, and multiplicity multiset; circular
+contigs matched the same complete graph-edge sets.
 
 ## Main performance changes
 

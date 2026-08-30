@@ -44,6 +44,35 @@ struct InputLibrary {
   std::string file_name2;
 };
 
+bool ReadLibraryPath(std::istream &input, std::string *path) {
+  input >> std::ws;
+  if (!input.good()) {
+    return false;
+  }
+
+  if (input.peek() != '"') {
+    return static_cast<bool>(input >> *path);
+  }
+
+  input.get();
+  path->clear();
+  bool escaped = false;
+  char ch = '\0';
+  while (input.get(ch)) {
+    if (escaped) {
+      path->push_back(ch);
+      escaped = false;
+    } else if (ch == '\\') {
+      escaped = true;
+    } else if (ch == '"') {
+      return true;
+    } else {
+      path->push_back(ch);
+    }
+  }
+  return false;
+}
+
 struct BuiltLibrary {
   int64_t num_reads{0};
   int64_t num_bases{0};
@@ -1226,15 +1255,17 @@ void SequenceLibCollection::Build(const std::string &lib_file,
     if (!(lib_config >> lib.type)) {
       xfatal("Missing read library type after: {s}\n", metadata.c_str());
     }
+    bool paths_valid = true;
     if (lib.type == "pe") {
-      lib_config >> lib.file_name1 >> lib.file_name2;
+      paths_valid = ReadLibraryPath(lib_config, &lib.file_name1) &&
+                    ReadLibraryPath(lib_config, &lib.file_name2);
     } else if (lib.type == "se" || lib.type == "interleaved") {
-      lib_config >> lib.file_name1;
+      paths_valid = ReadLibraryPath(lib_config, &lib.file_name1);
     } else {
       xerr("Cannot identify read library type {}\n", lib.type.c_str());
       xfatal("Valid types: pe, se, interleaved\n");
     }
-    if (!lib_config) {
+    if (!paths_valid) {
       xfatal("Malformed read library entry: {s}\n", metadata.c_str());
     }
     input_libs.emplace_back(std::move(lib));
