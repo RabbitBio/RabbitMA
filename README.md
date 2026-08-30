@@ -25,22 +25,26 @@ installed as well, so existing pipelines do not need to change immediately.
 
 ## Build
 
-RabbitMA requires a C++ compiler with OpenMP support, CMake, zlib, Python 3,
-gzip, and bzip2. A C++17-capable compiler enables the bundled parallel gzip
-reader. If libdeflate is installed, RabbitMA detects and uses it automatically.
+RabbitMA requires a C++ compiler with OpenMP support, CMake 2.8.12 or newer,
+zlib, Python 3, gzip, and bzip2. A C++17-capable compiler enables the bundled
+parallel gzip reader. If libdeflate is installed, RabbitMA detects and uses it
+automatically.
 
 ```bash
 git clone https://github.com/RabbitBio/RabbitMA.git
 cd RabbitMA
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-build/rabbitma --test -t 4
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . -- -j
+./rabbitma --test -t 4
 ```
 
 Optional installation:
 
 ```bash
-cmake --install build --prefix /path/to/install
+cmake -DCMAKE_INSTALL_PREFIX=/path/to/install .
+cmake --build . --target install
 ```
 
 The build produces BMI2/POPCNT, POPCNT-only, and portable core binaries. The

@@ -1,12 +1,6 @@
-cmake_minimum_required(VERSION 3.5...4.1)
+cmake_minimum_required(VERSION 2.8.12...4.1)
 project(RabbitMA)
 set(CMAKE_VERBOSE_MAKEFILE ON)
-
-if (CMAKE_VERSION VERSION_LESS "3.1")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-else ()
-    set(CMAKE_CXX_STANDARD 11)
-endif ()
 
 option(COVERAGE "Generate coverage report" OFF)
 option(STATIC_BUILD "Build static executation" OFF)
@@ -49,19 +43,29 @@ find_package(Threads REQUIRED)
 # small library into all CPU variants.  The dependency is fully vendored, so
 # configuring and running MEGAHIT never performs a network download.
 set(MEGAHIT_RAPIDGZIP_LIBRARY "")
-if (BUNDLED_RAPIDGZIP AND "cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
+set(MEGAHIT_CXX17_FLAG "")
+if (BUNDLED_RAPIDGZIP)
+    include(CheckCXXCompilerFlag)
+    if (MSVC)
+        set(MEGAHIT_CXX17_FLAG "/std:c++17")
+    else ()
+        set(MEGAHIT_CXX17_FLAG "-std=c++17")
+    endif ()
+    check_cxx_compiler_flag("${MEGAHIT_CXX17_FLAG}"
+            MEGAHIT_COMPILER_HAS_CXX17)
+endif ()
+
+if (BUNDLED_RAPIDGZIP AND MEGAHIT_COMPILER_HAS_CXX17)
     add_library(megahit_rapidgzip STATIC
             third_party/rapidgzip/megahit_rapidgzip_adapter.cpp)
     set_target_properties(megahit_rapidgzip PROPERTIES
-            CXX_STANDARD 17
-            CXX_STANDARD_REQUIRED YES
-            CXX_EXTENSIONS NO)
+            COMPILE_FLAGS "${MEGAHIT_CXX17_FLAG}")
     target_include_directories(megahit_rapidgzip SYSTEM PRIVATE
             ${CMAKE_SOURCE_DIR}/third_party/rapidgzip/include)
     target_include_directories(megahit_rapidgzip PRIVATE
             ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(megahit_rapidgzip PUBLIC
-            ${ZLIB_LIBRARIES} Threads::Threads)
+            ${ZLIB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
     if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
         CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9")
         target_link_libraries(megahit_rapidgzip PUBLIC stdc++fs)
@@ -71,6 +75,16 @@ if (BUNDLED_RAPIDGZIP AND "cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
     message(STATUS "Bundled rapidgzip enabled (adaptive intra-file parallel gzip)")
 elseif (BUNDLED_RAPIDGZIP)
     message(WARNING "Bundled rapidgzip disabled: the compiler lacks C++17")
+endif ()
+
+# CMAKE_CXX_STANDARD was introduced in CMake 3.1.  Keep the assembly core on
+# C++11 without making a recent CMake release a build-time requirement.  This
+# is intentionally set after creating the rapidgzip adapter so its per-target
+# C++17 flag is not overwritten by the core default.
+if (CMAKE_VERSION VERSION_LESS "3.1")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+else ()
+    set(CMAKE_CXX_STANDARD 11)
 endif ()
 
 # Optional: whole-file gzip decompression (~3x faster than zlib streaming)
