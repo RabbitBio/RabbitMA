@@ -30,12 +30,36 @@ to change their command lines.
 - Runtime CPU and NUMA discovery without fixed socket, core-count, or
   CAMI-specific thresholds.
 
-## Build
+## Installation
 
-RabbitMA requires a C++17-capable compiler with OpenMP support, CMake 2.8.12 or
-newer, zlib, Python 3, gzip, and bzip2. C++17 enables the bundled parallel gzip
-reader used by the advertised high-performance configuration. If libdeflate is
-installed, RabbitMA detects and uses it automatically.
+### Prebuilt Linux package (recommended)
+
+The quickest way to use RabbitMA is to download the prebuilt
+`RabbitMA-v0.1.0-linux-x86_64.tar.gz` package from the
+[v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
+It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
+CMake and a compiler are not needed. The package exposes only the `megahit`
+command, plus the internal CPU core variants, test data, and required
+non-glibc runtime libraries.
+
+```bash
+wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz
+wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
+sha256sum -c RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
+tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
+export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
+megahit --test -t 4
+```
+
+The package includes BMI2/POPCNT, POPCNT-only, and portable core binaries. The
+Python driver selects a supported variant at run time.
+
+### Build from source
+
+Building RabbitMA requires a C++17-capable compiler with OpenMP support, CMake
+2.8.12 or newer, zlib, Python 3, gzip, and bzip2. C++17 enables the bundled
+parallel gzip reader used by the advertised high-performance configuration. If
+libdeflate is installed, RabbitMA detects and uses it automatically.
 
 ```bash
 git clone https://github.com/RabbitBio/RabbitMA.git
@@ -53,26 +77,6 @@ Optional installation:
 cmake -DCMAKE_INSTALL_PREFIX=/path/to/install .
 cmake --build . --target install
 ```
-
-### Prebuilt Linux package
-
-Users who do not have a suitable CMake/compiler toolchain can download
-`RabbitMA-v0.1.0-linux-x86_64.tar.gz` from the
-[v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
-It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
-CMake and a compiler are not needed. The package exposes only the `megahit`
-command, plus the internal CPU core variants, test data, and required
-non-glibc runtime libraries.
-
-```bash
-sha256sum -c RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
-tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
-export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
-megahit --test -t 4
-```
-
-The build produces BMI2/POPCNT, POPCNT-only, and portable core binaries. The
-Python driver selects a supported variant at run time.
 
 ## Usage
 
