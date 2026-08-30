@@ -1,5 +1,10 @@
 # RabbitMA
 
+> **Build requirement:** RabbitMA's supported high-performance build requires
+> a **C++17-capable C++ compiler** with OpenMP support. CMake itself may be as
+> old as 2.8.12; the CMake version does not remove the C++17 compiler
+> requirement.
+
 RabbitMA is a high-performance, memory-aware metagenome assembler derived
 from [MEGAHIT v1.2.9](https://github.com/voutcn/megahit). It retains the
 MEGAHIT assembly model, command-line options, and output layout while reducing
@@ -25,10 +30,10 @@ installed as well, so existing pipelines do not need to change immediately.
 
 ## Build
 
-RabbitMA requires a C++ compiler with OpenMP support, CMake 2.8.12 or newer,
-zlib, Python 3, gzip, and bzip2. A C++17-capable compiler enables the bundled
-parallel gzip reader. If libdeflate is installed, RabbitMA detects and uses it
-automatically.
+RabbitMA requires a C++17-capable compiler with OpenMP support, CMake 2.8.12 or
+newer, zlib, Python 3, gzip, and bzip2. C++17 enables the bundled parallel gzip
+reader used by the advertised high-performance configuration. If libdeflate is
+installed, RabbitMA detects and uses it automatically.
 
 ```bash
 git clone https://github.com/RabbitBio/RabbitMA.git
