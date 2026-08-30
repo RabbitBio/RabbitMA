@@ -45,8 +45,7 @@ non-glibc runtime libraries.
 ```bash
 wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz
 tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
-export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
-megahit --test -t 4
+RabbitMA-v0.1.0-linux-x86_64/bin/megahit --test -t 4
 ```
 
 The package includes BMI2/POPCNT, POPCNT-only, and portable core binaries. The
