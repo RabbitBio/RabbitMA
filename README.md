@@ -1,9 +1,11 @@
 # RabbitMA
 
-> **Build requirement:** RabbitMA's supported high-performance build requires
-> a **C++17-capable C++ compiler** with OpenMP support. CMake itself may be as
-> old as 2.8.12; the CMake version does not remove the C++17 compiler
-> requirement.
+> **Build and CLI compatibility:** Building RabbitMA from source requires a
+> **C++17-capable C++ compiler** with OpenMP support. The public command is
+> **`megahit`**, with the same command-line syntax, options, and output layout
+> as official MEGAHIT v1.2.9, so existing MEGAHIT commands run unchanged.
+> CMake itself may be as old as 2.8.12. Users of the prebuilt package do not
+> need CMake or a C++ compiler.
 
 RabbitMA is a high-performance, memory-aware metagenome assembler derived
 from [MEGAHIT v1.2.9](https://github.com/voutcn/megahit). It retains the
