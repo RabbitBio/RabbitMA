@@ -44,8 +44,6 @@ non-glibc runtime libraries.
 
 ```bash
 wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz
-wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
-sha256sum -c RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
 tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
 export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
 megahit --test -t 4
