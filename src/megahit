@@ -39,7 +39,7 @@ _usage_message = '''
 contact: Dinghua Li <voutcn@gmail.com>
 
 Usage:
-  rabbitma (or megahit) [options] {{-1 <pe1> -2 <pe2> | --12 <pe12> | -r <se>}} [-o <out_dir>]
+  megahit [options] {{-1 <pe1> -2 <pe2> | --12 <pe12> | -r <se>}} [-o <out_dir>]
 
   Input options that can be specified for multiple times (supporting plain text and gz/bz2 extensions)
     -1                       <pe1>          comma-separated list of fasta/q paired-end #1 files, paired with files in <pe2>

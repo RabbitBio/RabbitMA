@@ -24,10 +24,19 @@ jobs:
         id: release
         shell: bash
         run: |
+          # The binary is built from the immutable release tag, while the
+          # package carries the latest packaging/compatibility documentation.
+          mkdir -p .release-package-docs
+          git show "${GITHUB_SHA}:README.md" \
+            > .release-package-docs/README.md
+          git show "${GITHUB_SHA}:BENCHMARKS.md" \
+            > .release-package-docs/BENCHMARKS.md
+
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
           else
-            release_tag="$(tr -d '[:space:]' < .github/release-build-target)"
+            release_tag="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+              .github/release-build-target)"
           fi
           if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid release tag: ${release_tag}" >&2
@@ -48,8 +57,9 @@ jobs:
             -w /src \
             rockylinux:8 \
             bash -euxo pipefail -c '
+              dnf install -y epel-release
               dnf install -y \
-                gcc gcc-c++ make cmake zlib-devel libdeflate-devel \
+                gcc gcc-c++ make cmake binutils zlib-devel libdeflate-devel \
                 python3 gzip bzip2 tar
 
               package_name="RabbitMA-${RELEASE_TAG}-linux-x86_64"
@@ -67,6 +77,12 @@ jobs:
               cmake --build . -- -j2
               DESTDIR="${package_dir}" cmake --build . --target install
 
+              # Keep one public CLI name.  The megahit_core variants and
+              # megahit_toolkit are internal executables required at runtime.
+              cmake -E remove "${package_dir}/bin/rabbitma"
+              sed -i "s/rabbitma (or megahit)/megahit/" \
+                "${package_dir}/bin/megahit"
+
               install -d "${package_dir}/lib"
               install -m 755 /usr/lib64/libdeflate.so.0 "${package_dir}/lib/"
               install -m 755 /usr/lib64/libz.so.1 "${package_dir}/lib/"
@@ -75,7 +91,9 @@ jobs:
               install -m 755 /usr/lib64/libgomp.so.1 "${package_dir}/lib/"
 
               install -m 644 \
-                /src/README.md /src/BENCHMARKS.md /src/LICENSE /src/NOTICE \
+                /src/.release-package-docs/README.md \
+                /src/.release-package-docs/BENCHMARKS.md \
+                /src/LICENSE /src/NOTICE \
                 "${package_dir}/"
               install -d "${package_dir}/share/licenses"
               cp -a /usr/share/licenses/libdeflate \
@@ -107,11 +125,29 @@ jobs:
                 echo "Unresolved dynamic dependency" >&2
                 exit 1
               fi
+              if test -e "${package_dir}/bin/rabbitma"; then
+                echo "Unexpected rabbitma CLI in the release package" >&2
+                exit 1
+              fi
+              for core in \
+                megahit_core megahit_core_popcnt megahit_core_no_hw_accel
+              do
+                if readelf -d "${package_dir}/bin/${core}" | \
+                    grep -q "/usr/local"
+                then
+                  echo "Non-portable /usr/local runtime path in ${core}" >&2
+                  exit 1
+                fi
+              done
+              if grep -q "/usr/local" "${package_dir}/BUILD_INFO.txt"; then
+                echo "Non-portable /usr/local dynamic dependency" >&2
+                exit 1
+              fi
 
-              mkdir -p /tmp/rabbitma-release-smoke
-              cd /tmp/rabbitma-release-smoke
-              "${package_dir}/bin/rabbitma" --version
-              "${package_dir}/bin/rabbitma" --test -t 2
+              mkdir -p /tmp/megahit-release-smoke
+              cd /tmp/megahit-release-smoke
+              "${package_dir}/bin/megahit" --version
+              "${package_dir}/bin/megahit" --test -t 2
 
               cd /src/dist
               tar --sort=name --owner=0 --group=0 --numeric-owner \

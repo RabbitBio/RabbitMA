@@ -11,8 +11,8 @@ MEGAHIT assembly model, command-line options, and output layout while reducing
 the repeated data movement, graph traversal, synchronization, and serial I/O
 costs that dominate large multi-sample and single-file workloads.
 
-The primary command is `rabbitma`. A compatible `megahit` command is built and
-installed as well, so existing pipelines do not need to change immediately.
+The supported command is `megahit`, so existing MEGAHIT pipelines do not need
+to change their command lines.
 
 ## Highlights
 
@@ -42,7 +42,7 @@ mkdir build
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -- -j
-./rabbitma --test -t 4
+./megahit --test -t 4
 ```
 
 Optional installation:
@@ -58,15 +58,15 @@ Users who do not have a suitable CMake/compiler toolchain can download
 `RabbitMA-v0.1.0-linux-x86_64.tar.gz` from the
 [v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
 It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
-CMake and a compiler are not needed. The package contains both `rabbitma` and
-the compatible `megahit` command, all three CPU core variants, test data, and
-the required non-glibc runtime libraries.
+CMake and a compiler are not needed. The package exposes only the `megahit`
+command, plus the internal CPU core variants, test data, and required
+non-glibc runtime libraries.
 
 ```bash
 sha256sum -c RabbitMA-v0.1.0-linux-x86_64.tar.gz.sha256
 tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
 export PATH="$PWD/RabbitMA-v0.1.0-linux-x86_64/bin:$PATH"
-rabbitma --test -t 4
+megahit --test -t 4
 ```
 
 The build produces BMI2/POPCNT, POPCNT-only, and portable core binaries. The
@@ -77,13 +77,13 @@ Python driver selects a supported variant at run time.
 One paired-end library:
 
 ```bash
-rabbitma -1 reads_1.fastq.gz -2 reads_2.fastq.gz -t 32 -o assembly
+megahit -1 reads_1.fastq.gz -2 reads_2.fastq.gz -t 32 -o assembly
 ```
 
 Multiple paired-end libraries:
 
 ```bash
-rabbitma \
+megahit \
   -1 sample1_R1.fastq.gz,sample2_R1.fastq.gz \
   -2 sample1_R2.fastq.gz,sample2_R2.fastq.gz \
   -t 64 --k-min 39 -o coassembly
@@ -92,11 +92,11 @@ rabbitma \
 Interleaved and single-end inputs remain compatible with MEGAHIT:
 
 ```bash
-rabbitma --12 interleaved.fastq.gz -o assembly
-rabbitma -r reads.fastq.gz -o assembly
+megahit --12 interleaved.fastq.gz -o assembly
+megahit -r reads.fastq.gz -o assembly
 ```
 
-Run `rabbitma --help` for the complete option list. Final contigs are written
+Run `megahit --help` for the complete option list. Final contigs are written
 to `OUT_DIR/final.contigs.fa`.
 
 ## Compatibility and validation

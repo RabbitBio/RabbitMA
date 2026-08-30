@@ -160,12 +160,6 @@ add_custom_target(
                 ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_CURRENT_BINARY_DIR}/megahit
 )
 
-add_custom_target(
-        rabbitma ALL
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_CURRENT_BINARY_DIR}/rabbitma
-)
-
 add_custom_target(megahit_toolkit ALL
         COMMAND ${CMAKE_COMMAND} -E create_symlink megahit_core_no_hw_accel megahit_toolkit)
 
@@ -185,12 +179,10 @@ add_custom_target(
 )
 
 add_dependencies(megahit megahit_core megahit_core_popcnt megahit_core_no_hw_accel megahit_toolkit)
-add_dependencies(rabbitma megahit_core megahit_core_popcnt megahit_core_no_hw_accel megahit_toolkit)
-add_dependencies(simple_test rabbitma megahit)
+add_dependencies(simple_test megahit)
 
 install(TARGETS megahit_core megahit_core_popcnt megahit_core_no_hw_accel DESTINATION bin)
 install(PROGRAMS
-        ${CMAKE_CURRENT_BINARY_DIR}/rabbitma
         ${CMAKE_CURRENT_BINARY_DIR}/megahit
         ${CMAKE_CURRENT_BINARY_DIR}/megahit_toolkit
         DESTINATION bin)
