@@ -57,7 +57,17 @@ jobs:
           curl --fail --location --retry 3 \
             --output release-deps/libdeflate-v1.9.tar.gz \
             https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.9.tar.gz
+          curl --fail --location --retry 3 \
+            --output release-deps/gcc-COPYING3 \
+            https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-10.2.0/COPYING3
+          curl --fail --location --retry 3 \
+            --output release-deps/gcc-COPYING.RUNTIME \
+            https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-10.2.0/COPYING.RUNTIME
           echo "a537ab6125c226b874c02b166488b326aece954930260dbf682d88fc339137e3  release-deps/libdeflate-v1.9.tar.gz" \
+            | sha256sum --check
+          echo "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903  release-deps/gcc-COPYING3" \
+            | sha256sum --check
+          echo "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74  release-deps/gcc-COPYING.RUNTIME" \
             | sha256sum --check
 
           docker run --rm \
@@ -133,12 +143,14 @@ jobs:
               install -m 644 /tmp/libdeflate-1.9/COPYING \
                 "${package_dir}/share/licenses/libdeflate/"
               install -d "${package_dir}/share/licenses/zlib"
-              install -m 644 /usr/share/doc/zlib-*/README \
-                "${package_dir}/share/licenses/zlib/"
+              # The manylinux2014 image omits RPM documentation to stay small.
+              # zlib.h carries the upstream license notice in lines 1-29.
+              sed -n "1,29p" /usr/include/zlib.h \
+                > "${package_dir}/share/licenses/zlib/LICENSE"
               install -d "${package_dir}/share/licenses/gcc-runtime"
               install -m 644 \
-                /opt/rh/devtoolset-10/root/usr/share/doc/devtoolset-10-gcc-*/COPYING3 \
-                /opt/rh/devtoolset-10/root/usr/share/doc/devtoolset-10-gcc-*/COPYING.RUNTIME \
+                /src/release-deps/gcc-COPYING3 \
+                /src/release-deps/gcc-COPYING.RUNTIME \
                 "${package_dir}/share/licenses/gcc-runtime/"
 
               {
