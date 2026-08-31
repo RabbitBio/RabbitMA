@@ -1,2 +1,2 @@
 v0.1.0
-# Rebuild on glibc 2.17 with GNU tar 1.26-compatible packaging.
+# Rebuild on glibc 2.17 with container-safe dependency parsing.

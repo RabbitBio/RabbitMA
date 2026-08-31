@@ -114,7 +114,7 @@ jobs:
               do
                 resolved="$(LD_LIBRARY_PATH=/opt/rabbitma-deps/lib:${LD_LIBRARY_PATH:-} \
                   ldd "${package_dir}/bin/megahit_core" | \
-                  awk -v name="${library}" '$1 == name { print $3; exit }')"
+                  awk -v name="${library}" "\$1 == name { print \$3; exit }")"
                 if test -z "${resolved}" || ! test -f "${resolved}"; then
                   echo "Cannot resolve ${library}" >&2
                   exit 1
