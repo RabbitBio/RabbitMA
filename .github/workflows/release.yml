@@ -205,7 +205,7 @@ jobs:
               "${package_dir}/megahit" --test -t 2
 
               cd /src/dist
-              tar --sort=name --owner=0 --group=0 --numeric-owner \
+              tar --owner=0 --group=0 --numeric-owner \
                 -czf "${package_name}.tar.gz" "${package_name}"
               sha256sum "${package_name}.tar.gz" \
                 > "${package_name}.tar.gz.sha256"

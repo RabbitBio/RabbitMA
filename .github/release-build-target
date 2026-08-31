@@ -1,2 +1,2 @@
 v0.1.0
-# Rebuild on the glibc 2.17 ABI baseline and audit every bundled ELF.
+# Rebuild on glibc 2.17 with GNU tar 1.26-compatible packaging.
