@@ -24,8 +24,8 @@ PATH=$runtime_path python3 - \
 import py_compile
 import sys
 
-if sys.version_info < (3, 5):
-    raise SystemExit("RabbitMA requires Python 3.5 or newer")
+if sys.version_info < (3, 6):
+    raise SystemExit("RabbitMA requires Python 3.6 or newer")
 py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)
 print("python runtime: %s" % sys.version.split()[0])
 PY

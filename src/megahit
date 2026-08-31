@@ -578,7 +578,8 @@ def check_and_correct_option():
 
 def find_test_data_path():
     script_path = software_info.script_path
-    for path in [os.path.join(script_path, '..'),
+    for path in [script_path,
+                 os.path.join(script_path, '..'),
                  os.path.join(script_path, '../share/RabbitMA'),
                  os.path.join(script_path, '../share/megahit')]:
         test_data_dir = abspath(os.path.join(path, 'test_data'))
@@ -603,20 +604,105 @@ def check_reads():
             raise Usage('Cannot find file ' + r)
 
 
+def _read_finite_memory_limit(path):
+    try:
+        with open(path) as memory_file:
+            text = memory_file.read().strip()
+    except (IOError, OSError):
+        return None
+
+    if not text or text == 'max':
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+
+    # cgroup v1 uses a value close to INT64_MAX to represent no limit.
+    # Treat anything above one exbibyte as unlimited; it cannot be a real
+    # memory allocation budget on a supported host.
+    if value <= 0 or value >= (1 << 60):
+        return None
+    return value
+
+
+def _minimum_limit_in_hierarchy(root, relative_path, limit_name):
+    root = os.path.realpath(root)
+    directory = os.path.realpath(
+        os.path.join(root, relative_path.lstrip('/')))
+    if directory != root and not directory.startswith(root + os.sep):
+        return None
+
+    result = None
+    while True:
+        value = _read_finite_memory_limit(
+            os.path.join(directory, limit_name))
+        if value is not None and (result is None or value < result):
+            result = value
+        if directory == root:
+            break
+        parent = os.path.dirname(directory)
+        if parent == directory or len(parent) < len(root):
+            break
+        directory = parent
+    return result
+
+
+def detect_cgroup_memory_limit(cgroup_file='/proc/self/cgroup',
+                               unified_root='/sys/fs/cgroup',
+                               legacy_root='/sys/fs/cgroup/memory'):
+    unified_path = None
+    legacy_path = None
+    try:
+        with open(cgroup_file) as cgroups:
+            for line in cgroups:
+                fields = line.rstrip('\n').split(':', 2)
+                if len(fields) != 3:
+                    continue
+                controllers = fields[1].split(',') if fields[1] else []
+                if not controllers:
+                    unified_path = fields[2]
+                if 'memory' in controllers:
+                    legacy_path = fields[2]
+    except (IOError, OSError):
+        return None
+
+    limits = []
+    if unified_path is not None:
+        limit = _minimum_limit_in_hierarchy(
+            unified_root, unified_path, 'memory.max')
+        if limit is not None:
+            limits.append(limit)
+    if legacy_path is not None:
+        limit = _minimum_limit_in_hierarchy(
+            legacy_root, legacy_path, 'memory.limit_in_bytes')
+        if limit is not None:
+            limits.append(limit)
+    return min(limits) if limits else None
+
+
 def detect_available_mem():
     try:
         psize = os.sysconf('SC_PAGE_SIZE')
         pcount = os.sysconf('SC_PHYS_PAGES')
         if psize < 0 or pcount < 0:
             raise SystemError
-        return psize * pcount
+        total_memory = psize * pcount
     except ValueError:
         if sys.platform.find("darwin") != -1:
-            return int(float(os.popen("sysctl hw.memsize").readlines()[0].split()[1]))
+            total_memory = int(float(
+                os.popen("sysctl hw.memsize").readlines()[0].split()[1]))
         elif sys.platform.find("linux") != -1:
-            return int(float(os.popen("free").readlines()[1].split()[1]) * 1024)
+            total_memory = int(float(
+                os.popen("free").readlines()[1].split()[1]) * 1024)
         else:
             raise
+
+    if sys.platform.find("linux") != -1:
+        cgroup_limit = detect_cgroup_memory_limit()
+        if cgroup_limit is not None:
+            total_memory = min(total_memory, cgroup_limit)
+    return total_memory
 
 
 def cpu_dispatch():

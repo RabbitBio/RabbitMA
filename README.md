@@ -37,7 +37,8 @@ to change their command lines.
 The quickest way to use RabbitMA is to download the prebuilt
 `RabbitMA-v0.1.0-linux-x86_64.tar.gz` package from the
 [v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
-It requires Linux x86_64 with glibc 2.17 or newer, Python 3, gzip, and bzip2;
+It requires Linux x86_64 with glibc 2.17 or newer, Python 3.6 or newer, gzip,
+and bzip2;
 CMake and a compiler are not needed. The package exposes `megahit` as its only
 public command and includes the internal CPU core variants, test data, and
 required non-glibc runtime libraries.
@@ -52,12 +53,19 @@ cd RabbitMA-v0.1.0-linux-x86_64
 The package includes BMI2/POPCNT, POPCNT-only, and portable core binaries. The
 Python driver selects a supported variant at run time.
 
+The v0.1.0 prebuilt launcher predates automatic cgroup memory detection. When
+running that package inside Docker, Kubernetes, or a scheduler job with a hard
+memory limit, pass the job limit explicitly with `-m`. The current source tree
+detects cgroup v1/v2 limits automatically; this fix will be included in the
+next binary release.
+
 ### Build from source
 
 Building RabbitMA requires a C++17-capable compiler with OpenMP support, CMake
-2.8.12 or newer, zlib, Python 3, gzip, and bzip2. C++17 enables the bundled
-parallel gzip reader used by the advertised high-performance configuration. If
-libdeflate is installed, RabbitMA detects and uses it automatically.
+2.8.12 or newer, zlib, Python 3.6 or newer, gzip, and bzip2. C++17 enables the
+bundled parallel gzip reader used by the advertised high-performance
+configuration. If libdeflate is installed, RabbitMA detects and uses it
+automatically.
 
 ```bash
 git clone https://github.com/RabbitBio/RabbitMA.git

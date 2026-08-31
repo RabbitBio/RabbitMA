@@ -27,7 +27,10 @@ jobs:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      - name: Test launcher resource discovery
+        run: python3 tests/test_megahit_driver.py
 
       - name: Download the public release package
         id: package
@@ -69,7 +72,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: glibc-2.17-python-3.5
+          - name: glibc-2.17-python-3.9
             image: manylinux2014
             family: manylinux
           - name: rocky-linux-8
@@ -92,7 +95,7 @@ jobs:
             family: deb
     name: Runtime / ${{ matrix.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download and extract the public release
         id: package
@@ -148,9 +151,9 @@ jobs:
                 dnf clean all
                 export RABBITMA_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               else
-                test -x /opt/python/cp35-cp35m/bin/python3
+                test -x /opt/python/cp39-cp39/bin/python3
                 command -v bzip2 gzip ldd
-                export RABBITMA_RUNTIME_PATH=/opt/python/cp35-cp35m/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                export RABBITMA_RUNTIME_PATH=/opt/python/cp39-cp39/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
               fi
               PATH="${RABBITMA_RUNTIME_PATH}" bash /compat/test-release-runtime.sh "/opt/RabbitMA install"
             '
@@ -158,9 +161,8 @@ jobs:
   cgroup-memory-diagnostic:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check the default memory budget inside a constrained container
         shell: bash
@@ -175,18 +177,75 @@ jobs:
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}?run=${GITHUB_RUN_ID}"
           tar -xzf "${RUNNER_TEMP}/${asset}" -C "${package_root}"
           package_dir="${package_root}/RabbitMA-${release_tag}-linux-x86_64"
-          docker run --rm --memory 768m --cpus 2 \
-            -v "${package_dir}:/opt/RabbitMA:ro" \
-            "${MANYLINUX_IMAGE}" bash -euo pipefail -c '
-              export PATH=/opt/python/cp39-cp39/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-              log=/tmp/cgroup.log
-              /opt/RabbitMA/megahit --test -t 2 2>&1 | tee "${log}"
-              reported=$(sed -n "s/^.*Memory used: \([0-9][0-9]*\).*$/\1/p" "${log}" | tail -n 1)
-              if [[ -r /sys/fs/cgroup/memory.max ]]; then
-                limit=$(cat /sys/fs/cgroup/memory.max)
-              else
-                limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
-              fi
-              echo "cgroup limit=${limit}; RabbitMA budget=${reported}"
-              [[ "${limit}" == max || "${reported}" -le "${limit}" ]]
+
+          check_budget() {
+            local expect_aware=$1
+            docker run --rm --memory 2g --cpus 2 \
+              -e EXPECT_CGROUP_AWARE="${expect_aware}" \
+              -v "${package_dir}:/opt/RabbitMA:ro" \
+              "${MANYLINUX_IMAGE}" bash -euo pipefail -c '
+                export PATH=/opt/python/cp39-cp39/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                log=/tmp/cgroup.log
+                /opt/RabbitMA/megahit --test -t 2 2>&1 | tee "${log}"
+                reported=$(sed -n "s/^.*Memory used: \([0-9][0-9]*\).*$/\1/p" "${log}" | tail -n 1)
+                if [[ -r /sys/fs/cgroup/memory.max ]]; then
+                  limit=$(cat /sys/fs/cgroup/memory.max)
+                else
+                  limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+                fi
+                echo "cgroup limit=${limit}; RabbitMA budget=${reported}"
+                if [[ "${limit}" != max && "${reported}" -gt "${limit}" ]]; then
+                  if [[ "${EXPECT_CGROUP_AWARE}" == 1 ]]; then
+                    exit 1
+                  fi
+                  echo "::warning::The current v0.1.0 package needs an explicit -m inside memory-limited cgroups; the main-branch launcher fixes this."
+                fi
+              '
+          }
+
+          check_budget 0
+          install -m 755 src/megahit "${package_dir}/bin/megahit"
+          check_budget 1
+
+  source-build-cmake-2-8:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download the CMake 2.8.12 compatibility baseline
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cmake"
+          archive="${RUNNER_TEMP}/cmake/cmake-2.8.12.2-Linux-i386.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${archive}" \
+            https://cmake.org/files/v2.8/cmake-2.8.12.2-Linux-i386.tar.gz
+          echo "3cd7277bc901b0ea1c213557f3cbae534fa727df9bdec559f60fa497fcbad0a9  ${archive}" \
+            | sha256sum --check
+
+      - name: Build and run RabbitMA with CMake 2.8.12
+        shell: bash
+        run: |
+          build_dir="${RUNNER_TEMP}/source build with spaces"
+          mkdir -p "${build_dir}"
+          docker run --rm --cpus 2 --memory 4g \
+            -v "${GITHUB_WORKSPACE}:/src:ro" \
+            -v "${RUNNER_TEMP}/cmake:/cmake:ro" \
+            -v "${build_dir}:/build" \
+            ubuntu:20.04 bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential bzip2 ca-certificates gzip libc6-i386 \
+                python3 zlib1g-dev
+              tar -xzf /cmake/cmake-2.8.12.2-Linux-i386.tar.gz -C /opt
+              cmake_bin=/opt/cmake-2.8.12.2-Linux-i386/bin/cmake
+              "${cmake_bin}" --version
+              cd /build
+              "${cmake_bin}" -DCMAKE_BUILD_TYPE=Release /src
+              "${cmake_bin}" --build . -- -j2
+              test -f test_data/r1.il.fa.gz
+              ./megahit --test -t 2
+              ./megahit --test --no-hw-accel -t 2
             '

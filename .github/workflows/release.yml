@@ -18,7 +18,7 @@ jobs:
     env:
       MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:42116048e6568c83796535fc1698beb9d7dc328c2ae3b3d098678ea595845b8d
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

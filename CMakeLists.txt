@@ -158,6 +158,8 @@ add_custom_target(
         megahit ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${CMAKE_SOURCE_DIR}/src/megahit ${CMAKE_CURRENT_BINARY_DIR}/megahit
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${CMAKE_SOURCE_DIR}/test_data ${CMAKE_CURRENT_BINARY_DIR}/test_data
 )
 
 add_custom_target(megahit_toolkit ALL
