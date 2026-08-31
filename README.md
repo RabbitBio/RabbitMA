@@ -37,7 +37,7 @@ to change their command lines.
 The quickest way to use RabbitMA is to download the prebuilt
 `RabbitMA-v0.1.0-linux-x86_64.tar.gz` package from the
 [v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
-It requires Linux x86_64 with glibc 2.28 or newer, Python 3, gzip, and bzip2;
+It requires Linux x86_64 with glibc 2.17 or newer, Python 3, gzip, and bzip2;
 CMake and a compiler are not needed. The package exposes `megahit` as its only
 public command and includes the internal CPU core variants, test data, and
 required non-glibc runtime libraries.

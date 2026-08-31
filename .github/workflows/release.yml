@@ -15,6 +15,8 @@ permissions:
 jobs:
   linux-x86-64:
     runs-on: ubuntu-latest
+    env:
+      MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:42116048e6568c83796535fc1698beb9d7dc328c2ae3b3d098678ea595845b8d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,16 +53,35 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         shell: bash
         run: |
+          mkdir -p release-deps
+          curl --fail --location --retry 3 \
+            --output release-deps/libdeflate-v1.9.tar.gz \
+            https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.9.tar.gz
+          echo "a537ab6125c226b874c02b166488b326aece954930260dbf682d88fc339137e3  release-deps/libdeflate-v1.9.tar.gz" \
+            | sha256sum --check
+
           docker run --rm \
             -e RELEASE_TAG \
             -v "${GITHUB_WORKSPACE}:/src" \
             -w /src \
-            rockylinux:8 \
+            "${MANYLINUX_IMAGE}" \
             bash -euxo pipefail -c '
-              dnf install -y epel-release
-              dnf install -y \
-                gcc gcc-c++ make cmake binutils zlib-devel libdeflate-devel \
-                python3 gzip bzip2 tar
+              python_bin=/opt/python/cp39-cp39/bin/python3
+              test -x "${python_bin}"
+              export PATH="$(dirname "${python_bin}"):${PATH}"
+              command -v \
+                gcc g++ make cmake readelf strings file python3 gzip bzip2 tar
+
+              rm -rf /tmp/libdeflate-1.9 /opt/rabbitma-deps
+              tar -xzf /src/release-deps/libdeflate-v1.9.tar.gz -C /tmp
+              make -C /tmp/libdeflate-1.9 -j2 \
+                PREFIX=/opt/rabbitma-deps
+              make -C /tmp/libdeflate-1.9 install \
+                PREFIX=/opt/rabbitma-deps
+              install -d /opt/rabbitma-deps/libgomp-static
+              printf "%s\\n" \
+                "GROUP ( /opt/rh/devtoolset-10/root/usr/lib/gcc/x86_64-redhat-linux/10/libgomp.a -ldl )" \
+                > /opt/rabbitma-deps/libgomp-static/libgomp.so
 
               package_name="RabbitMA-${RELEASE_TAG}-linux-x86_64"
               package_dir="/src/dist/${package_name}"
@@ -68,11 +89,13 @@ jobs:
               cd /src/release-build
 
               cmake \
+                -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX=/ \
                 -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib \
-                -DZLIB_LIBRARY=/usr/lib64/libz.so \
-                -DZLIB_INCLUDE_DIR=/usr/include \
+                -DCMAKE_EXE_LINKER_FLAGS=-L/opt/rabbitma-deps/libgomp-static \
+                -DLIBDEFLATE_INCLUDE_DIR=/opt/rabbitma-deps/include \
+                -DLIBDEFLATE_LIBRARY=/opt/rabbitma-deps/lib/libdeflate.so \
                 ..
               cmake --build . -- -j2
               DESTDIR="${package_dir}" cmake --build . --target install
@@ -85,11 +108,20 @@ jobs:
               cmake -E create_symlink bin/megahit "${package_dir}/megahit"
 
               install -d "${package_dir}/lib"
-              install -m 755 /usr/lib64/libdeflate.so.0 "${package_dir}/lib/"
-              install -m 755 /usr/lib64/libz.so.1 "${package_dir}/lib/"
-              install -m 755 /usr/lib64/libstdc++.so.6 "${package_dir}/lib/"
-              install -m 755 /usr/lib64/libgcc_s.so.1 "${package_dir}/lib/"
-              install -m 755 /usr/lib64/libgomp.so.1 "${package_dir}/lib/"
+              for library in \
+                libdeflate.so.0 libz.so.1 libstdc++.so.6 \
+                libgcc_s.so.1
+              do
+                resolved="$(LD_LIBRARY_PATH=/opt/rabbitma-deps/lib:${LD_LIBRARY_PATH:-} \
+                  ldd "${package_dir}/bin/megahit_core" | \
+                  awk -v name="${library}" '$1 == name { print $3; exit }')"
+                if test -z "${resolved}" || ! test -f "${resolved}"; then
+                  echo "Cannot resolve ${library}" >&2
+                  exit 1
+                fi
+                install -m 755 "$(readlink -f "${resolved}")" \
+                  "${package_dir}/lib/${library}"
+              done
 
               install -m 644 \
                 /src/.release-package-docs/README.md \
@@ -97,35 +129,31 @@ jobs:
                 /src/LICENSE /src/NOTICE \
                 "${package_dir}/"
               install -d "${package_dir}/share/licenses"
-              cp -a /usr/share/licenses/libdeflate \
-                "${package_dir}/share/licenses/libdeflate"
-              cp -a /usr/share/licenses/zlib \
-                "${package_dir}/share/licenses/zlib"
-              cp -a /usr/share/licenses/libgcc \
-                "${package_dir}/share/licenses/gcc-runtime"
+              install -d "${package_dir}/share/licenses/libdeflate"
+              install -m 644 /tmp/libdeflate-1.9/COPYING \
+                "${package_dir}/share/licenses/libdeflate/"
+              install -d "${package_dir}/share/licenses/zlib"
+              install -m 644 /usr/share/doc/zlib-*/README \
+                "${package_dir}/share/licenses/zlib/"
+              install -d "${package_dir}/share/licenses/gcc-runtime"
+              install -m 644 \
+                /opt/rh/devtoolset-10/root/usr/share/doc/devtoolset-10-gcc-*/COPYING3 \
+                /opt/rh/devtoolset-10/root/usr/share/doc/devtoolset-10-gcc-*/COPYING.RUNTIME \
+                "${package_dir}/share/licenses/gcc-runtime/"
 
               {
                 echo "RabbitMA ${RELEASE_TAG}"
-                echo "Platform: Linux x86_64, glibc 2.28 or newer"
+                echo "Platform: Linux x86_64, glibc 2.17 or newer"
+                echo "Build baseline: manylinux2014 (CentOS 7 ABI)"
                 gcc --version | head -n 1
                 cmake --version | head -n 1
                 echo
                 echo "Bundled runtime libraries:"
                 ls -1 "${package_dir}/lib"
                 echo
-                echo "Dynamic-link audit:"
-                for core in \
-                  megahit_core megahit_core_popcnt megahit_core_no_hw_accel
-                do
-                  echo "[${core}]"
-                  ldd "${package_dir}/bin/${core}"
-                done
+                echo "ELF compatibility audit:"
               } > "${package_dir}/BUILD_INFO.txt"
 
-              if grep -q "not found" "${package_dir}/BUILD_INFO.txt"; then
-                echo "Unresolved dynamic dependency" >&2
-                exit 1
-              fi
               if test -e "${package_dir}/bin/rabbitma"; then
                 echo "Unexpected rabbitma CLI in the release package" >&2
                 exit 1
@@ -137,20 +165,42 @@ jobs:
               for core in \
                 megahit_core megahit_core_popcnt megahit_core_no_hw_accel
               do
-                if readelf -d "${package_dir}/bin/${core}" | \
-                    grep -q "/usr/local"
+                if env -u LD_LIBRARY_PATH ldd "${package_dir}/bin/${core}" | \
+                    grep -q "not found"
                 then
-                  echo "Non-portable /usr/local runtime path in ${core}" >&2
+                  echo "Unresolved dynamic dependency in ${core}" >&2
                   exit 1
                 fi
               done
-              if grep -q "/usr/local" "${package_dir}/BUILD_INFO.txt"; then
-                echo "Non-portable /usr/local dynamic dependency" >&2
-                exit 1
-              fi
+
+              while IFS= read -r -d "" elf; do
+                if ! file "${elf}" | grep -q "ELF"; then
+                  continue
+                fi
+                max_glibc="$(readelf --version-info "${elf}" 2>/dev/null | \
+                  grep -oE "GLIBC_[0-9.]+" | sort -Vu | tail -n 1 || true)"
+                if test -n "${max_glibc}" && \
+                    test "$(printf "%s\\n" GLIBC_2.17 "${max_glibc}" | \
+                      sort -V | tail -n 1)" != GLIBC_2.17
+                then
+                  echo "${elf} requires ${max_glibc}; baseline is GLIBC_2.17" >&2
+                  exit 1
+                fi
+                printf "%s: max GLIBC %s\\n" \
+                  "${elf#${package_dir}/}" "${max_glibc:-none}" \
+                  >> "${package_dir}/BUILD_INFO.txt"
+                if strings "${elf}" | \
+                    grep -Eq "/home/|/usr/local|/opt/rabbitma-deps"
+                then
+                  echo "Machine-local path embedded in ${elf}" >&2
+                  exit 1
+                fi
+              done < <(find "${package_dir}/bin" "${package_dir}/lib" \
+                -type f -print0)
 
               mkdir -p /tmp/megahit-release-smoke
               cd /tmp/megahit-release-smoke
+              unset LD_LIBRARY_PATH
               "${package_dir}/megahit" --version
               "${package_dir}/megahit" --test -t 2
 
@@ -159,6 +209,26 @@ jobs:
                 -czf "${package_name}.tar.gz" "${package_name}"
               sha256sum "${package_name}.tar.gz" \
                 > "${package_name}.tar.gz.sha256"
+            '
+
+      - name: Test on the glibc 2.17 runtime baseline
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          package_dir="${GITHUB_WORKSPACE}/dist/RabbitMA-${RELEASE_TAG}-linux-x86_64"
+          docker run --rm \
+            -v "${package_dir}:/opt/RabbitMA:ro" \
+            "${MANYLINUX_IMAGE}" \
+            bash -euxo pipefail -c '
+              python_bin=/opt/python/cp39-cp39/bin/python3
+              test -x "${python_bin}"
+              export PATH="$(dirname "${python_bin}"):${PATH}"
+              unset LD_LIBRARY_PATH
+              cd /tmp
+              /opt/RabbitMA/megahit --version
+              /opt/RabbitMA/megahit --test -t 2
+              /opt/RabbitMA/megahit --test --no-hw-accel -t 2
             '
 
       - name: Create release and upload package

@@ -1,2 +1,2 @@
 v0.1.0
-# Refresh the package with current documentation and a direct ./megahit entry.
+# Rebuild on the glibc 2.17 ABI baseline and audit every bundled ELF.
