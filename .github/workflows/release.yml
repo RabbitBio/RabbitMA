@@ -33,6 +33,9 @@ jobs:
             > .release-package-docs/README.md
           git show "${GITHUB_SHA}:BENCHMARKS.md" \
             > .release-package-docs/BENCHMARKS.md
+          git show "${GITHUB_SHA}:.github/scripts/audit-release-package.sh" \
+            > .release-package-docs/audit-release-package.sh
+          chmod 755 .release-package-docs/audit-release-package.sh
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
@@ -80,7 +83,8 @@ jobs:
               test -x "${python_bin}"
               export PATH="$(dirname "${python_bin}"):${PATH}"
               command -v \
-                gcc g++ make cmake readelf strings file python3 gzip bzip2 tar
+                gcc g++ make cmake objdump readelf strings file python3 \
+                gzip bzip2 tar
 
               rm -rf /tmp/libdeflate-1.9 /opt/rabbitma-deps
               tar -xzf /src/release-deps/libdeflate-v1.9.tar.gz -C /tmp
@@ -209,6 +213,9 @@ jobs:
                 fi
               done < <(find "${package_dir}/bin" "${package_dir}/lib" \
                 -type f -print0)
+
+              /src/.release-package-docs/audit-release-package.sh \
+                "${package_dir}"
 
               mkdir -p /tmp/megahit-release-smoke
               cd /tmp/megahit-release-smoke

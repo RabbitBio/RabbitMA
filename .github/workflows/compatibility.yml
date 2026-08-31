@@ -1,0 +1,192 @@
+name: Compatibility audit
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - "Publish release"
+    types:
+      - completed
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/compatibility.yml"
+      - ".github/scripts/audit-release-package.sh"
+      - ".github/scripts/test-release-runtime.sh"
+      - ".github/compatibility-test-target"
+
+permissions:
+  contents: read
+
+env:
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:42116048e6568c83796535fc1698beb9d7dc328c2ae3b3d098678ea595845b8d
+
+jobs:
+  package-audit:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the public release package
+        id: package
+        shell: bash
+        run: |
+          release_tag=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+            .github/release-build-target)
+          asset="RabbitMA-${release_tag}-linux-x86_64.tar.gz"
+          download_dir="${RUNNER_TEMP}/download"
+          extract_dir="${RUNNER_TEMP}/release path with spaces"
+          mkdir -p "${download_dir}" "${extract_dir}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${download_dir}/${asset}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}?run=${GITHUB_RUN_ID}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${download_dir}/${asset}.sha256" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}.sha256?run=${GITHUB_RUN_ID}"
+          (
+            cd "${download_dir}"
+            sha256sum --check "${asset}.sha256"
+          )
+          tar -xzf "${download_dir}/${asset}" -C "${extract_dir}"
+          package_dir="${extract_dir}/RabbitMA-${release_tag}-linux-x86_64"
+          test -d "${package_dir}"
+          echo "dir=${package_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Audit ELF ABI, dependencies and package structure
+        run: .github/scripts/audit-release-package.sh "${{ steps.package.outputs.dir }}"
+
+      - name: Test a read-only install in a clean environment
+        run: |
+          chmod -R a-w "${{ steps.package.outputs.dir }}"
+          .github/scripts/test-release-runtime.sh "${{ steps.package.outputs.dir }}"
+
+  runtime-matrix:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc-2.17-python-3.5
+            image: manylinux2014
+            family: manylinux
+          - name: rocky-linux-8
+            image: rockylinux:8
+            family: rpm
+          - name: rocky-linux-9
+            image: rockylinux:9
+            family: rpm
+          - name: ubuntu-20.04
+            image: ubuntu:20.04
+            family: deb
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
+            family: deb
+          - name: debian-11
+            image: debian:11
+            family: deb
+          - name: debian-12
+            image: debian:12
+            family: deb
+    name: Runtime / ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and extract the public release
+        id: package
+        shell: bash
+        run: |
+          release_tag=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+            .github/release-build-target)
+          asset="RabbitMA-${release_tag}-linux-x86_64.tar.gz"
+          extract_dir="${RUNNER_TEMP}/RabbitMA package"
+          mkdir -p "${extract_dir}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}?run=${GITHUB_RUN_ID}"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${extract_dir}"
+          package_dir="${extract_dir}/RabbitMA-${release_tag}-linux-x86_64"
+          test -d "${package_dir}"
+          echo "dir=${package_dir}" >> "${GITHUB_OUTPUT}"
+
+      - name: Pull runtime image
+        shell: bash
+        run: |
+          if [[ "${{ matrix.family }}" == manylinux ]]; then
+            docker pull "${MANYLINUX_IMAGE}"
+          else
+            docker pull "${{ matrix.image }}"
+          fi
+
+      - name: Run package tests in the runtime image
+        shell: bash
+        run: |
+          if [[ "${{ matrix.family }}" == manylinux ]]; then
+            image="${MANYLINUX_IMAGE}"
+          else
+            image="${{ matrix.image }}"
+          fi
+          docker run --rm \
+            --memory 1g \
+            --cpus 2 \
+            -v "${{ steps.package.outputs.dir }}:/opt/RabbitMA install:ro" \
+            -v "${GITHUB_WORKSPACE}/.github/scripts:/compat:ro" \
+            -e RABBITMA_FAMILY="${{ matrix.family }}" \
+            "${image}" \
+            bash -euxo pipefail -c '
+              if [[ "${RABBITMA_FAMILY}" == deb ]]; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends \
+                  bzip2 ca-certificates gzip libc-bin python3
+                rm -rf /var/lib/apt/lists/*
+                export RABBITMA_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              elif [[ "${RABBITMA_FAMILY}" == rpm ]]; then
+                dnf install -y bzip2 gzip python3
+                dnf clean all
+                export RABBITMA_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              else
+                test -x /opt/python/cp35-cp35m/bin/python3
+                command -v bzip2 gzip ldd
+                export RABBITMA_RUNTIME_PATH=/opt/python/cp35-cp35m/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              fi
+              PATH="${RABBITMA_RUNTIME_PATH}" bash /compat/test-release-runtime.sh "/opt/RabbitMA install"
+            '
+
+  cgroup-memory-diagnostic:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the default memory budget inside a constrained container
+        shell: bash
+        run: |
+          release_tag=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+            .github/release-build-target)
+          asset="RabbitMA-${release_tag}-linux-x86_64.tar.gz"
+          package_root="${RUNNER_TEMP}/cgroup package"
+          mkdir -p "${package_root}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}?run=${GITHUB_RUN_ID}"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${package_root}"
+          package_dir="${package_root}/RabbitMA-${release_tag}-linux-x86_64"
+          docker run --rm --memory 768m --cpus 2 \
+            -v "${package_dir}:/opt/RabbitMA:ro" \
+            "${MANYLINUX_IMAGE}" bash -euo pipefail -c '
+              export PATH=/opt/python/cp39-cp39/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              log=/tmp/cgroup.log
+              /opt/RabbitMA/megahit --test -t 2 2>&1 | tee "${log}"
+              reported=$(sed -n "s/^.*Memory used: \([0-9][0-9]*\).*$/\1/p" "${log}" | tail -n 1)
+              if [[ -r /sys/fs/cgroup/memory.max ]]; then
+                limit=$(cat /sys/fs/cgroup/memory.max)
+              else
+                limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+              fi
+              echo "cgroup limit=${limit}; RabbitMA budget=${reported}"
+              [[ "${limit}" == max || "${reported}" -le "${limit}" ]]
+            '
