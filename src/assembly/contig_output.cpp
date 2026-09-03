@@ -144,15 +144,11 @@ void OutputContigs(UnitigGraph &graph, ContigWriter *contig_writer,
       if (adapter.IsPalindrome()) {
         FoldPalindrome(ascii_contig, graph.k(), adapter.IsLoop());
         flag = contig_flag::kStandalone;
-      } else if (!change_only) {
-        // change_only output is k*.addi.fa, which is consumed as sequence
-        // evidence by the next k round.  Unlike the main contig input,
-        // seq2sdbg does not extend circular addi records from the previous k
-        // to the new k.  Rotating such a record here therefore changes the
-        // linear windows visible at the circular cut and can create or remove
-        // ordinary edges in the next graph.  Preserve the deterministic
-        // legacy-owner cut for this semantic intermediate; canonicalization
-        // remains appropriate for regular/user-visible contig output.
+      } else {
+        // A loop has no biological origin or preferred strand.  This also
+        // canonicalizes change-only k*.addi.fa records; seq2sdbg extends their
+        // old k-base circular overlap to the target k before consuming them,
+        // so changing the linearized cut cannot remove graph evidence.
         CanonicalizeLoop(ascii_contig, graph.k());
       }
 
