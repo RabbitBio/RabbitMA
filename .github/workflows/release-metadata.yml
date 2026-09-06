@@ -1,0 +1,82 @@
+name: Repair release metadata
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/release-metadata-target"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  source-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fill package source provenance and preserve every binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          release_tag=$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+            .github/release-metadata-target)
+          [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          source_commit=$(git rev-parse "refs/tags/${release_tag}^{commit}")
+          asset="RabbitMA-${release_tag}-linux-x86_64.tar.gz"
+          directory="${RUNNER_TEMP}/release-metadata"
+          mkdir -p "$directory"
+          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset" --pattern "${asset}.sha256" --dir "$directory"
+          cd "$directory"
+          sha256sum --check "${asset}.sha256"
+          python3 - "$asset" "$source_commit" <<'PY'
+          import hashlib
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          archive, commit = sys.argv[1:]
+          root = Path(archive.removesuffix('.tar.gz'))
+          with tarfile.open(archive) as stream:
+              stream.extractall('.', filter='data')
+
+          def contents():
+              return {str(path.relative_to(root)):
+                      ('link', str(path.readlink())) if path.is_symlink()
+                      else ('sha256', hashlib.sha256(path.read_bytes()).hexdigest())
+                      for path in root.rglob('*') if path.is_file() or path.is_symlink()}
+
+          before = contents()
+          info = root / 'BUILD_INFO.txt'
+          text = info.read_text()
+          lines = text.splitlines()
+          values = [line.removeprefix('Source commit:').strip()
+                    for line in lines if line.startswith('Source commit:')]
+          assert len(values) == 1 and values[0] in ('', commit), values
+          info.write_text('\n'.join('Source commit: ' + commit
+                                    if line.startswith('Source commit:') else line
+                                    for line in lines) + '\n')
+          after = contents()
+          before.pop('BUILD_INFO.txt')
+          after.pop('BUILD_INFO.txt')
+          assert before == after, 'A payload other than BUILD_INFO.txt changed'
+          print('Verified unchanged binaries, libraries, documentation and symlinks')
+          print('Source commit:', commit)
+          PY
+          package_dir="${directory}/${asset%.tar.gz}"
+          "${GITHUB_WORKSPACE}/.github/scripts/audit-release-package.sh" "$package_dir"
+          tar --owner=0 --group=0 --numeric-owner \
+            -czf "$asset" "${asset%.tar.gz}"
+          sha256sum "$asset" > "${asset}.sha256"
+          gh release upload "$release_tag" "$asset" "${asset}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
