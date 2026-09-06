@@ -81,7 +81,9 @@ class SequenceLibCollection {
   explicit SequenceLibCollection(const std::string &path) : path_(path) {}
 
   static void Build(const std::string &lib_file, const std::string &out_prefix,
-                    unsigned num_threads = 1);
+                    unsigned num_threads = 1,
+                    unsigned anchor_len = 0,
+                    unsigned window_len = 0);
 
   void SetPath(const std::string &path) { path_ = path; }
   std::pair<int64_t, int64_t> GetSize() const;

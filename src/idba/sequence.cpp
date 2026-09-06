@@ -94,6 +94,7 @@ bool Sequence::IsValid() const {
 }
 
 bool Sequence::IsPalindrome() const {
+  if ((bases_.size() & 1u) != 0) return false;
   unsigned half = (bases_.size() + 1) / 2;
   for (unsigned i = 0; i < half; ++i) {
     if (bases_[i] + bases_[bases_.size() - 1 - i] != 3) return false;

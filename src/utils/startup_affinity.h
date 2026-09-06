@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Runtime NUMA information restricted to the CPUs and memory nodes available
@@ -16,10 +17,28 @@ struct NumaTopology {
   std::vector<unsigned> physical_core_counts;
   std::vector<uint64_t> last_level_cache_bytes;
   std::vector<int> cpu_to_domain;
+  // Sum of unique last-level cache instances intersecting the process CPU
+  // affinity.  This is kept separately from the per-NUMA fallback above:
+  // neither "one LLC per socket" nor "one LLC per NUMA node" is portable.
+  uint64_t unique_last_level_cache_bytes{0};
 
   size_t domain_count() const { return node_ids.empty() ? 1 : node_ids.size(); }
   uint64_t total_last_level_cache_bytes() const;
   unsigned total_physical_core_count() const;
+};
+
+// Resource sharing is an explicit scheduling fact, not something a process
+// can infer reliably from instantaneous load.  The launcher publishes these
+// values for every core subprocess.  Direct megahit_core users can set the
+// same MEGAHIT_JOBS_PER_NODE and MEGAHIT_MEMORY_BUDGET_PER_JOB environment
+// variables.  With the defaults below every policy decision is identical to
+// the exclusive path.
+struct RuntimeResourcePolicy {
+  unsigned jobs_per_node{1};
+  uint64_t memory_budget_per_job{0};
+
+  bool shared_node() const { return jobs_per_node > 1u; }
+  uint64_t last_level_cache_budget_bytes() const;
 };
 
 /**
@@ -32,10 +51,22 @@ struct NumaTopology {
  */
 void ResetThreadAffinityToStartupMask();
 
+// If the launcher supplied MEGAHIT_NUMA_NODE, install a strict MPOL_BIND
+// policy for all future private allocations in this core process. CPU
+// affinity is narrowed by the launcher and inherited across exec. Returning
+// false is fatal for explicit NUMA mode: silently continuing would violate
+// the user's resource-isolation request. With no requested node this is a
+// no-op that returns true.
+bool ConfigureProcessNumaMemoryPolicy(std::string *error_message);
+
 // The returned object is discovered once and remains valid for the process
 // lifetime.  On non-Linux systems, or when topology files are unavailable, it
 // describes one portable fallback domain.
 const NumaTopology &GetNumaTopology();
+
+// Parsed once from the launcher-provided resource contract.  Invalid or
+// absent values conservatively select the existing exclusive policy.
+const RuntimeResourcePolicy &GetRuntimeResourcePolicy();
 
 // Dense domain index of the calling worker.  Returns zero for the portable
 // fallback domain or when the current CPU cannot be mapped.

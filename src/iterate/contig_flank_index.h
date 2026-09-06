@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <omp.h>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 #include <sdbg/sdbg_def.h>
 #include <utils/utils.h>
@@ -131,6 +133,99 @@ class ContigFlankIndex {
     size_t word_mask_{0};
  };
 
+  // A short oriented prefix is a necessary (but deliberately not sufficient)
+  // condition for a read-side (k+1)-mer to match a stored flank.  Checking it
+  // before canonicalizing the full multiword k-mer avoids the k-dependent
+  // comparison and full-key Bloom hash at the overwhelming majority of read
+  // positions.  Bloom false positives merely fall through to the original
+  // exact lookup; all stored oriented prefixes are inserted, so false
+  // negatives and result changes are impossible.
+  class OrientedPrefixFilter {
+   public:
+    void Build(const std::vector<HashShard> &shards, size_t index_size,
+               unsigned kmer_length) {
+      prefix_len_ = std::min(19u, kmer_length);
+      if (index_size == 0 || prefix_len_ == 0 ||
+          std::getenv("MEGAHIT_DISABLE_PREFIX_FLANK_FILTER") != nullptr) {
+        words_.clear();
+        word_mask_ = 0;
+        return;
+      }
+
+      // There are at most two oriented prefixes per canonical flank.  Use the
+      // same eight-bit/key target as the full-key filter and power-of-two
+      // blocked layout, derived solely from the live index cardinality.
+      const size_t oriented_keys =
+          index_size > std::numeric_limits<size_t>::max() / 2u
+              ? std::numeric_limits<size_t>::max()
+              : index_size * 2u;
+      const size_t target_words = DivCeiling(oriented_keys, size_t{8});
+      size_t num_words = 1;
+      while (num_words < target_words) {
+        if (num_words > std::numeric_limits<size_t>::max() / 2u) {
+          throw std::length_error("oriented prefix filter is too large");
+        }
+        num_words *= 2u;
+      }
+      words_.assign(num_words, 0);
+      word_mask_ = num_words - 1u;
+
+      for (const HashShard &shard : shards) {
+        for (const auto &entry : shard.primary) {
+          Add(PrefixOf(entry.first, prefix_len_));
+          KmerType reverse = entry.first;
+          reverse.ReverseComplement(kmer_length);
+          Add(PrefixOf(reverse, prefix_len_));
+        }
+      }
+    }
+
+    bool MayContain(uint64_t prefix) const {
+      if (words_.empty()) {
+        return true;
+      }
+      const uint64_t hash = Hash(prefix);
+      const uint64_t mask = BitMask(hash);
+      return (words_[hash & word_mask_] & mask) == mask;
+    }
+
+    unsigned prefix_len() const { return prefix_len_; }
+    size_t byte_size() const { return words_.size() * sizeof(uint64_t); }
+
+   private:
+    static uint64_t PrefixOf(const KmerType &kmer, unsigned length) {
+      uint64_t prefix = 0;
+      for (unsigned i = 0; i < length; ++i) {
+        prefix = (prefix << 2u) | kmer.GetBase(i);
+      }
+      return prefix;
+    }
+
+    static uint64_t Hash(uint64_t value) {
+      value ^= value >> 30u;
+      value *= UINT64_C(0xbf58476d1ce4e5b9);
+      value ^= value >> 27u;
+      value *= UINT64_C(0x94d049bb133111eb);
+      return value ^ (value >> 31u);
+    }
+
+    static uint64_t BitMask(uint64_t hash) {
+      return (uint64_t{1} << ((hash >> 32u) & 63u)) |
+             (uint64_t{1} << ((hash >> 40u) & 63u)) |
+             (uint64_t{1} << ((hash >> 48u) & 63u)) |
+             (uint64_t{1} << ((hash >> 56u) & 63u));
+    }
+
+    void Add(uint64_t prefix) {
+      const uint64_t hash = Hash(prefix);
+      words_[hash & word_mask_] |= BitMask(hash);
+    }
+
+    std::vector<uint64_t> words_;
+    size_t word_mask_{0};
+    unsigned prefix_len_{0};
+  };
+
  public:
   ContigFlankIndex(unsigned k, unsigned step) : k_(k), step_(step) {
     const size_t workers =
@@ -147,10 +242,33 @@ class ContigFlankIndex {
   }
   size_t size() const { return index_size_; }
 
+  template <class Visitor>
+  void ForEachCanonicalKmer(const Visitor &visitor) const {
+    for (const HashShard &shard : hash_shards_) {
+      for (const auto &entry : shard.primary) {
+        visitor(entry.first);
+      }
+    }
+  }
+
+  template <class Visitor>
+  void ForEachCanonicalKmerParallel(const Visitor &visitor) const {
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t shard = 0; shard < hash_shards_.size(); ++shard) {
+      for (const auto &entry : hash_shards_[shard].primary) {
+        visitor(entry.first);
+      }
+    }
+  }
+
   void Finalize() {
     flank_filter_.Build(hash_shards_, index_size_);
+    oriented_prefix_filter_.Build(hash_shards_, index_size_, k_ + 1u);
     xinfo("Flank membership filter: {} bytes for {} canonical k-mers\n",
           flank_filter_.byte_size(), index_size_);
+    xinfo("Oriented {}-mer prefix filter: {} bytes\n",
+          oriented_prefix_filter_.prefix_len(),
+          oriented_prefix_filter_.byte_size());
   }
 
   void FeedBatchContigs(SeqPackage &seq_pkg, const std::vector<float> &mul) {
@@ -263,181 +381,470 @@ class ContigFlankIndex {
     index_size_ = total_size;
   }
 
+  // Run the original exact state machine for one arbitrary packed-read view.
+  // Keeping this primitive independent of SeqPackage lets the persistent
+  // index builder fuse its read scan with first-round iterative edge
+  // generation without copying or decoding each read into a second owner.
+  template <class ReadViewType, class CollectorType>
+  bool FindNextKmersFromRead(
+      const ReadViewType &seq_view, CollectorType *out,
+      std::vector<uint32_t> *state_scratch = nullptr,
+      uint64_t *num_generated_edges_out = nullptr,
+      const std::vector<uint32_t> *candidate_positions = nullptr) const {
+    const size_t length = seq_view.length();
+    if (length < k_ + step_ + 1) return false;
+
+    std::vector<uint32_t> local_state;
+    std::vector<uint32_t> &kmer_state =
+        state_scratch == nullptr ? local_state : *state_scratch;
+    kmer_state.assign(length, 0u);
+    uint64_t num_generated_edges = 0;
+    bool success = false;
+
+    Flank flank, rflank;
+    auto &kmer = flank.kmer;
+    auto &rkmer = rflank.kmer;
+
+    const unsigned prefix_len = oriented_prefix_filter_.prefix_len();
+    const uint64_t prefix_mask =
+        prefix_len == 32u
+            ? std::numeric_limits<uint64_t>::max()
+            : (uint64_t{1} << (2u * prefix_len)) - 1u;
+    uint64_t oriented_prefix = 0;
+    if (candidate_positions == nullptr) {
+      for (unsigned j = 0; j < prefix_len; ++j) {
+        oriented_prefix =
+            (oriented_prefix << 2u) | seq_view.base_at(j);
+      }
+    }
+
+    for (unsigned j = 0; j < k_ + 1; ++j) {
+      kmer.ShiftAppend(seq_view.base_at(j), k_ + 1);
+    }
+    rkmer = kmer;
+    rkmer.ReverseComplement(k_ + 1);
+
+    unsigned cur_pos = 0;
+    size_t candidate_index = 0;
+    while (cur_pos + k_ + 1 <= length) {
+      unsigned next_pos = cur_pos + 1;
+      bool may_match = false;
+      if (candidate_positions == nullptr) {
+        may_match = oriented_prefix_filter_.MayContain(oriented_prefix);
+      } else {
+        while (candidate_index < candidate_positions->size() &&
+               (*candidate_positions)[candidate_index] < cur_pos) {
+          ++candidate_index;
+        }
+        may_match = candidate_index < candidate_positions->size() &&
+                    (*candidate_positions)[candidate_index] == cur_pos;
+      }
+
+      if (kmer_state[cur_pos] == 0 && may_match) {
+        const bool query_is_reverse = rkmer < kmer;
+        const KmerType &canonical = query_is_reverse ? rkmer : kmer;
+        const unsigned forward_orientation = query_is_reverse ? 1u : 0u;
+        FlankInfo forward_info{};
+        FlankInfo reverse_info{};
+        bool has_forward = false;
+        bool has_reverse = false;
+        if (flank_filter_.MayContain(FilterHash(canonical))) {
+          // Only Bloom positives need phmap's exact pre-mixed XXH3 value.
+          const size_t canonical_hash = MixedHash(canonical);
+          const HashShard &shard =
+              hash_shards_[canonical_hash & shard_mask_];
+          auto iter = shard.primary.find(canonical, canonical_hash);
+          if (iter != shard.primary.end()) {
+            const StoredFlankInfo &stored = iter->second;
+            FlankInfo primary{stored.ext_seq, stored.ext_len, stored.mul};
+            if (stored.orientation == forward_orientation) {
+              forward_info = primary;
+              has_forward = true;
+            } else {
+              reverse_info = primary;
+              has_reverse = true;
+            }
+            if (stored.has_secondary) {
+              auto secondary =
+                  shard.secondary.find(canonical, canonical_hash);
+              assert(secondary != shard.secondary.end());
+              if (stored.orientation == forward_orientation) {
+                reverse_info = secondary->second;
+                has_reverse = true;
+              } else {
+                forward_info = secondary->second;
+                has_forward = true;
+              }
+            }
+          }
+        }
+        if (has_forward) {
+          const FlankInfo &info = forward_info;
+          const uint64_t ext_seq = info.ext_seq;
+          const unsigned ext_len = info.ext_len;
+          const float mul = info.mul;
+          kmer_state[cur_pos] = EncodeMultiplicity(mul);
+
+          for (unsigned j = 0;
+               j < ext_len && cur_pos + k_ + 1 + j < length;
+               ++j, ++next_pos) {
+            if (seq_view.base_at(cur_pos + k_ + 1 + j) ==
+                ((ext_seq >> j * 2u) & 3u)) {
+              kmer_state[cur_pos + j + 1] = EncodeMultiplicity(mul);
+            } else {
+              break;
+            }
+          }
+        }
+        if (has_reverse) {
+          const FlankInfo &info = reverse_info;
+          const uint64_t ext_seq = info.ext_seq;
+          const unsigned ext_len = info.ext_len;
+          const float mul = info.mul;
+          kmer_state[cur_pos] =
+              kmer_state[cur_pos] != 0
+                  ? EncodeMultiplicity(
+                        (DecodeMultiplicity(kmer_state[cur_pos]) + mul) / 2)
+                  : EncodeMultiplicity(mul);
+
+          for (unsigned j = 0; j < ext_len && cur_pos >= j + 1; ++j) {
+            if ((3u ^ seq_view.base_at(cur_pos - 1 - j)) ==
+                ((ext_seq >> j * 2u) & 3u)) {
+              uint32_t &state = kmer_state[cur_pos - 1 - j];
+              state = state != 0
+                          ? EncodeMultiplicity(
+                                (DecodeMultiplicity(state) + mul) / 2)
+                          : EncodeMultiplicity(mul);
+            } else {
+              break;
+            }
+          }
+        }
+      }
+
+      if (next_pos + k_ + 1 <= length) {
+        while (cur_pos < next_pos) {
+          ++cur_pos;
+          const uint8_t c = seq_view.base_at(cur_pos + k_);
+          kmer.ShiftAppend(c, k_ + 1);
+          rkmer.ShiftPreappend(3u ^ c, k_ + 1);
+          if (candidate_positions == nullptr) {
+            oriented_prefix =
+                ((oriented_prefix << 2u) |
+                 seq_view.base_at(cur_pos + prefix_len - 1u)) &
+                prefix_mask;
+          }
+        }
+      } else {
+        break;
+      }
+    }
+
+    typename CollectorType::kmer_type new_kmer, new_rkmer;
+    float prefix_mul = 0;
+    for (unsigned accumulated_len = 0, j = 0, end_pos = 0;
+         j + k_ < length; ++j) {
+      const bool kmer_exists = kmer_state[j] != 0;
+      if (kmer_exists) prefix_mul += DecodeMultiplicity(kmer_state[j]);
+      // Earlier positions are no longer queried for membership, so reuse the
+      // same compact array for the prefix sums consumed by later windows.
+      kmer_state[j] = FloatBits(prefix_mul);
+      accumulated_len = kmer_exists ? accumulated_len + 1 : 0;
+      if (accumulated_len < step_ + 1) continue;
+
+      const unsigned target_end = j + k_ + 1;
+      static const bool direct_edge_windows =
+          std::getenv("MEGAHIT_EXPERIMENTAL_DIRECT_ITERATE_WINDOWS") != nullptr;
+      if (direct_edge_windows) {
+        const unsigned next_length = k_ + step_ + 1u;
+        if (end_pos == 0u || target_end - end_pos > 8u) {
+          InitReadKmer(seq_view, target_end - next_length, next_length,
+                       &new_kmer);
+          new_rkmer = new_kmer;
+          new_rkmer.ReverseComplement(next_length);
+          end_pos = target_end;
+        } else {
+          while (end_pos < target_end) {
+            const auto base = seq_view.base_at(end_pos++);
+            new_kmer.ShiftAppend(base, next_length);
+            new_rkmer.ShiftPreappend(3u ^ base, next_length);
+          }
+        }
+      } else if (end_pos + 8 < target_end) {
+        while (end_pos < target_end) {
+          const auto c = seq_view.base_at(end_pos++);
+          new_kmer.ShiftAppend(c, k_ + step_ + 1);
+          new_rkmer.ShiftPreappend(3u ^ c, k_ + step_ + 1);
+        }
+      } else {
+        if (end_pos + k_ + step_ + 1 < target_end) {
+          end_pos = target_end - (k_ + step_ + 1);
+        }
+        while (end_pos < target_end) {
+          new_kmer.ShiftAppend(seq_view.base_at(end_pos++),
+                               k_ + step_ + 1);
+        }
+        new_rkmer = new_kmer;
+        new_rkmer.ReverseComplement(k_ + step_ + 1);
+      }
+      const float previous_prefix =
+          j >= step_ + 1 ? BitsFloat(kmer_state[j - (step_ + 1)]) : 0;
+      const float mul = (prefix_mul - previous_prefix) / (step_ + 1);
+      assert(mul <= kMaxMul + 1);
+      out->Insert(new_kmer < new_rkmer ? new_kmer : new_rkmer,
+                  static_cast<mul_t>(
+                      std::min(kMaxMul, static_cast<int>(mul + 0.5))));
+      ++num_generated_edges;
+      success = true;
+    }
+    if (num_generated_edges_out != nullptr) {
+      *num_generated_edges_out += num_generated_edges;
+    }
+    return success;
+  }
+
   template <class CollectorType>
-  size_t FindNextKmersFromReads(const SeqPackage &seq_pkg,
-                                CollectorType *out) const {
+  size_t FindNextKmersFromReads(
+      const SeqPackage &seq_pkg, CollectorType *out,
+      uint64_t *num_generated_edges_out = nullptr) const {
     std::vector<uint32_t> kmer_state;
     size_t num_aligned_reads = 0;
+    uint64_t num_generated_edges = 0;
 
-#pragma omp parallel for reduction(+ : num_aligned_reads) private(kmer_state)
+#pragma omp parallel for reduction(+ : num_aligned_reads, num_generated_edges) \
+    private(kmer_state)
     for (unsigned seq_id = 0; seq_id < seq_pkg.seq_count(); ++seq_id) {
-      auto seq_view = seq_pkg.GetSeqView(seq_id);
-      size_t length = seq_view.length();
-      if (length < k_ + step_ + 1) {
-        continue;
-      }
-
-      bool success = false;
-      kmer_state.clear();
-      kmer_state.resize(length, 0);
-
-      Flank flank, rflank;
-      auto &kmer = flank.kmer;
-      auto &rkmer = rflank.kmer;
-
-      for (unsigned j = 0; j < k_ + 1; ++j) {
-        kmer.ShiftAppend(seq_view.base_at(j), k_ + 1);
-      }
-      rkmer = kmer;
-      rkmer.ReverseComplement(k_ + 1);
-
-      unsigned cur_pos = 0;
-      while (cur_pos + k_ + 1 <= length) {
-        unsigned next_pos = cur_pos + 1;
-
-        if (kmer_state[cur_pos] == 0) {
-          const bool query_is_reverse = rkmer < kmer;
-          const KmerType &canonical = query_is_reverse ? rkmer : kmer;
-          const unsigned forward_orientation = query_is_reverse ? 1u : 0u;
-          FlankInfo forward_info{};
-          FlankInfo reverse_info{};
-          bool has_forward = false;
-          bool has_reverse = false;
-          if (flank_filter_.MayContain(FilterHash(canonical))) {
-            // Only Bloom positives need phmap's exact pre-mixed XXH3 value.
-            const size_t canonical_hash = MixedHash(canonical);
-            const HashShard &shard =
-                hash_shards_[canonical_hash & shard_mask_];
-            auto iter = shard.primary.find(canonical, canonical_hash);
-            if (iter != shard.primary.end()) {
-              const StoredFlankInfo &stored = iter->second;
-              FlankInfo primary{stored.ext_seq, stored.ext_len, stored.mul};
-              if (stored.orientation == forward_orientation) {
-                forward_info = primary;
-                has_forward = true;
-              } else {
-                reverse_info = primary;
-                has_reverse = true;
-              }
-              if (stored.has_secondary) {
-                auto secondary =
-                    shard.secondary.find(canonical, canonical_hash);
-                assert(secondary != shard.secondary.end());
-                if (stored.orientation == forward_orientation) {
-                  reverse_info = secondary->second;
-                  has_reverse = true;
-                } else {
-                  forward_info = secondary->second;
-                  has_forward = true;
-                }
-              }
-            }
-          }
-          if (has_forward) {
-            const FlankInfo &info = forward_info;
-            uint64_t ext_seq = info.ext_seq;
-            unsigned ext_len = info.ext_len;
-            float mul = info.mul;
-            kmer_state[cur_pos] = EncodeMultiplicity(mul);
-
-            for (unsigned j = 0; j < ext_len && cur_pos + k_ + 1 + j < length;
-                 ++j, ++next_pos) {
-              if (seq_view.base_at(cur_pos + k_ + 1 + j) ==
-                  ((ext_seq >> j * 2u) & 3u)) {
-                kmer_state[cur_pos + j + 1] = EncodeMultiplicity(mul);
-              } else {
-                break;
-              }
-            }
-          }
-          if (has_reverse) {
-            const FlankInfo &info = reverse_info;
-            uint64_t ext_seq = info.ext_seq;
-            unsigned ext_len = info.ext_len;
-            float mul = info.mul;
-            kmer_state[cur_pos] =
-                kmer_state[cur_pos] != 0
-                    ? EncodeMultiplicity(
-                          (DecodeMultiplicity(kmer_state[cur_pos]) + mul) / 2)
-                    : EncodeMultiplicity(mul);
-
-            for (unsigned j = 0; j < ext_len && cur_pos >= j + 1; ++j) {
-              if ((3u ^ seq_view.base_at(cur_pos - 1 - j)) ==
-                  ((ext_seq >> j * 2u) & 3u)) {
-                uint32_t &state = kmer_state[cur_pos - 1 - j];
-                state = state != 0
-                            ? EncodeMultiplicity(
-                                  (DecodeMultiplicity(state) + mul) / 2)
-                            : EncodeMultiplicity(mul);
-              } else {
-                break;
-              }
-            }
-          }
-        }
-
-        if (next_pos + k_ + 1 <= length) {
-          while (cur_pos < next_pos) {
-            ++cur_pos;
-            uint8_t c = seq_view.base_at(cur_pos + k_);
-            kmer.ShiftAppend(c, k_ + 1);
-            rkmer.ShiftPreappend(3u ^ c, k_ + 1);
-          }
-        } else {
-          break;
-        }
-      }
-
-      typename CollectorType::kmer_type new_kmer, new_rkmer;
-
-      float prefix_mul = 0;
-      for (unsigned accumulated_len = 0, j = 0, end_pos = 0; j + k_ < length;
-           ++j) {
-        const bool kmer_exists = kmer_state[j] != 0;
-        if (kmer_exists) {
-          prefix_mul += DecodeMultiplicity(kmer_state[j]);
-        }
-        // Earlier positions are no longer queried for membership, so reuse the
-        // same compact array for the prefix sums consumed by later windows.
-        kmer_state[j] = FloatBits(prefix_mul);
-        accumulated_len = kmer_exists ? accumulated_len + 1 : 0;
-        if (accumulated_len >= step_ + 1) {
-          unsigned target_end = j + k_ + 1;
-          if (end_pos + 8 < target_end) {
-            while (end_pos < target_end) {
-              auto c = seq_view.base_at(end_pos);
-              new_kmer.ShiftAppend(c, k_ + step_ + 1);
-              new_rkmer.ShiftPreappend(3u ^ c, k_ + step_ + 1);
-              end_pos++;
-            }
-          } else {
-            if (end_pos + k_ + step_ + 1 < target_end) {
-              end_pos = target_end - (k_ + step_ + 1);
-            }
-            while (end_pos < target_end) {
-              auto c = seq_view.base_at(end_pos);
-              new_kmer.ShiftAppend(c, k_ + step_ + 1);
-              end_pos++;
-            }
-            new_rkmer = new_kmer;
-            new_rkmer.ReverseComplement(k_ + step_ + 1);
-          }
-          const float previous_prefix =
-              j >= step_ + 1 ? BitsFloat(kmer_state[j - (step_ + 1)]) : 0;
-          float mul = (prefix_mul - previous_prefix) / (step_ + 1);
-          assert(mul <= kMaxMul + 1);
-          out->Insert(new_kmer < new_rkmer ? new_kmer : new_rkmer,
-                      static_cast<mul_t>(
-                          std::min(kMaxMul, static_cast<int>(mul + 0.5))));
-          success = true;
-        }
-      }
-      num_aligned_reads += success;
+      uint64_t read_generated_edges = 0;
+      num_aligned_reads += FindNextKmersFromRead(
+          seq_pkg.GetSeqView(seq_id), out, &kmer_state,
+          &read_generated_edges);
+      num_generated_edges += read_generated_edges;
+    }
+    if (num_generated_edges_out != nullptr) {
+      *num_generated_edges_out += num_generated_edges;
     }
     return num_aligned_reads;
   }
 
+  // Replay the original per-read state machine from an exact, complete set of
+  // candidate starts supplied in increasing order.  Candidate generation may
+  // use a persistent short-seed occurrence index, but every candidate still
+  // performs the original full (k+1)-mer lookup and all multiplicity/
+  // extension updates occur in the same left-to-right order.  Consequently a
+  // false-positive candidate only costs work; it cannot alter the output.
+  template <class ReadViewType, class CollectorType>
+  bool FindNextKmersFromReadCandidates(
+      const ReadViewType &seq_view,
+      const std::vector<uint32_t> &candidate_positions,
+      CollectorType *out,
+      std::vector<uint32_t> *state_scratch = nullptr) const {
+    const size_t length = seq_view.length();
+    if (length < k_ + step_ + 1) {
+      return false;
+    }
+    std::vector<uint32_t> local_state;
+    std::vector<uint32_t> &kmer_state =
+        state_scratch == nullptr ? local_state : *state_scratch;
+    kmer_state.assign(length, 0u);
+    uint32_t previous_position = std::numeric_limits<uint32_t>::max();
+
+    for (uint32_t cur_pos : candidate_positions) {
+      if (cur_pos == previous_position) continue;
+      previous_position = cur_pos;
+      if (cur_pos + k_ + 1 > length || kmer_state[cur_pos] != 0) continue;
+
+      KmerType kmer;
+      InitCandidateKmer(seq_view, cur_pos, &kmer);
+      KmerType rkmer = kmer;
+      rkmer.ReverseComplement(k_ + 1);
+      const bool query_is_reverse = rkmer < kmer;
+      const KmerType &canonical = query_is_reverse ? rkmer : kmer;
+      const unsigned forward_orientation = query_is_reverse ? 1u : 0u;
+      FlankInfo forward_info{};
+      FlankInfo reverse_info{};
+      bool has_forward = false;
+      bool has_reverse = false;
+
+      if (flank_filter_.MayContain(FilterHash(canonical))) {
+        const size_t canonical_hash = MixedHash(canonical);
+        const HashShard &shard =
+            hash_shards_[canonical_hash & shard_mask_];
+        auto iterator = shard.primary.find(canonical, canonical_hash);
+        if (iterator != shard.primary.end()) {
+          const StoredFlankInfo &stored = iterator->second;
+          const FlankInfo primary{stored.ext_seq, stored.ext_len, stored.mul};
+          if (stored.orientation == forward_orientation) {
+            forward_info = primary;
+            has_forward = true;
+          } else {
+            reverse_info = primary;
+            has_reverse = true;
+          }
+          if (stored.has_secondary) {
+            auto secondary = shard.secondary.find(canonical, canonical_hash);
+            assert(secondary != shard.secondary.end());
+            if (stored.orientation == forward_orientation) {
+              reverse_info = secondary->second;
+              has_reverse = true;
+            } else {
+              forward_info = secondary->second;
+              has_forward = true;
+            }
+          }
+        }
+      }
+
+      if (has_forward) {
+        const FlankInfo &info = forward_info;
+        kmer_state[cur_pos] = EncodeMultiplicity(info.mul);
+        for (unsigned j = 0;
+             j < info.ext_len && cur_pos + k_ + 1 + j < length; ++j) {
+          if (seq_view.base_at(cur_pos + k_ + 1 + j) !=
+              ((info.ext_seq >> (j * 2u)) & 3u)) {
+            break;
+          }
+          kmer_state[cur_pos + j + 1u] = EncodeMultiplicity(info.mul);
+        }
+      }
+      if (has_reverse) {
+        const FlankInfo &info = reverse_info;
+        kmer_state[cur_pos] =
+            kmer_state[cur_pos] != 0
+                ? EncodeMultiplicity(
+                      (DecodeMultiplicity(kmer_state[cur_pos]) + info.mul) / 2)
+                : EncodeMultiplicity(info.mul);
+        for (unsigned j = 0; j < info.ext_len && cur_pos >= j + 1u; ++j) {
+          if ((3u ^ seq_view.base_at(cur_pos - 1u - j)) !=
+              ((info.ext_seq >> (j * 2u)) & 3u)) {
+            break;
+          }
+          uint32_t &state = kmer_state[cur_pos - 1u - j];
+          state = state != 0
+                      ? EncodeMultiplicity(
+                            (DecodeMultiplicity(state) + info.mul) / 2)
+                      : EncodeMultiplicity(info.mul);
+        }
+      }
+    }
+
+    typename CollectorType::kmer_type new_kmer, new_rkmer;
+    float prefix_mul = 0;
+    bool success = false;
+    for (unsigned accumulated_len = 0, j = 0, end_pos = 0;
+         j + k_ < length; ++j) {
+      const bool kmer_exists = kmer_state[j] != 0;
+      if (kmer_exists) prefix_mul += DecodeMultiplicity(kmer_state[j]);
+      kmer_state[j] = FloatBits(prefix_mul);
+      accumulated_len = kmer_exists ? accumulated_len + 1u : 0u;
+      if (accumulated_len < step_ + 1u) continue;
+
+      const unsigned target_end = j + k_ + 1u;
+      static const bool direct_edge_windows =
+          std::getenv("MEGAHIT_EXPERIMENTAL_DIRECT_ITERATE_WINDOWS") != nullptr;
+      if (direct_edge_windows) {
+        const unsigned next_length = k_ + step_ + 1u;
+        if (end_pos == 0u || target_end - end_pos > 8u) {
+          InitReadKmer(seq_view, target_end - next_length, next_length,
+                       &new_kmer);
+          new_rkmer = new_kmer;
+          new_rkmer.ReverseComplement(next_length);
+          end_pos = target_end;
+        } else {
+          while (end_pos < target_end) {
+            const auto base = seq_view.base_at(end_pos++);
+            new_kmer.ShiftAppend(base, next_length);
+            new_rkmer.ShiftPreappend(3u ^ base, next_length);
+          }
+        }
+      } else if (end_pos + 8u < target_end) {
+        while (end_pos < target_end) {
+          const auto c = seq_view.base_at(end_pos++);
+          new_kmer.ShiftAppend(c, k_ + step_ + 1u);
+          new_rkmer.ShiftPreappend(3u ^ c, k_ + step_ + 1u);
+        }
+      } else {
+        if (end_pos + k_ + step_ + 1u < target_end) {
+          end_pos = target_end - (k_ + step_ + 1u);
+        }
+        while (end_pos < target_end) {
+          new_kmer.ShiftAppend(seq_view.base_at(end_pos++),
+                               k_ + step_ + 1u);
+        }
+        new_rkmer = new_kmer;
+        new_rkmer.ReverseComplement(k_ + step_ + 1u);
+      }
+      const float previous_prefix =
+          j >= step_ + 1u ? BitsFloat(kmer_state[j - (step_ + 1u)]) : 0;
+      const float mul = (prefix_mul - previous_prefix) / (step_ + 1u);
+      out->Insert(new_kmer < new_rkmer ? new_kmer : new_rkmer,
+                  static_cast<mul_t>(
+                      std::min(kMaxMul, static_cast<int>(mul + 0.5))));
+      success = true;
+    }
+    return success;
+  }
+
  private:
+  template <class ReadViewType>
+  void InitCandidateKmer(const ReadViewType &seq_view, unsigned position,
+                         KmerType *kmer) const {
+    InitReadKmer(seq_view, position, k_ + 1u, kmer);
+  }
+
+  template <class ReadViewType, class TargetKmer>
+  void InitReadKmer(const ReadViewType &seq_view, unsigned position,
+                    unsigned length, TargetKmer *kmer) const {
+    InitReadKmerImpl(seq_view, position, length, kmer,
+        std::integral_constant<bool,
+            std::is_same<typename TargetKmer::word_type,
+                         typename ReadViewType::word_type>::value>());
+  }
+
+  template <class ReadViewType, class TargetKmer>
+  void InitReadKmerImpl(const ReadViewType &seq_view, unsigned position,
+                        unsigned length, TargetKmer *kmer,
+                        std::true_type) const {
+    const auto raw = seq_view.raw_address();
+    kmer->InitFromPtr(raw.first, raw.second + position, length);
+  }
+
+  template <class ReadViewType, class TargetKmer>
+  void InitReadKmerImpl(const ReadViewType &seq_view, unsigned position,
+                        unsigned length, TargetKmer *kmer,
+                        std::false_type) const {
+    InitReadKmerCrossWords(seq_view, position, length, kmer,
+        std::integral_constant<bool,
+            sizeof(typename ReadViewType::word_type) == 4u &&
+            sizeof(typename TargetKmer::word_type) == 8u>());
+  }
+
+  template <class ReadViewType, class TargetKmer>
+  void InitReadKmerCrossWords(const ReadViewType &seq_view,
+                              unsigned position, unsigned length,
+                              TargetKmer *kmer, std::true_type) const {
+    // The uint32 loader checks whether the final source word is needed.
+    // Join its exact, zero-padded output into uint64 lanes without reading
+    // beyond a packed read at the end of the mapped file.
+    const auto raw = seq_view.raw_address();
+    Kmer<TargetKmer::kNumWords * 2u, uint32_t> narrow;
+    narrow.InitFromPtr(raw.first, raw.second + position, length);
+    uint64_t packed[TargetKmer::kNumWords];
+    for (unsigned word = 0; word < TargetKmer::kNumWords; ++word) {
+      packed[word] = (uint64_t(narrow.data()[word * 2u]) << 32u) |
+                     narrow.data()[word * 2u + 1u];
+    }
+    kmer->InitFromPtr(packed, 0u, length);
+  }
+
+  template <class ReadViewType, class TargetKmer>
+  void InitReadKmerCrossWords(const ReadViewType &seq_view,
+                              unsigned position, unsigned length,
+                              TargetKmer *kmer, std::false_type) const {
+    for (unsigned base = 0; base < length; ++base) {
+      kmer->ShiftAppend(seq_view.base_at(position + base), length);
+    }
+  }
+
   static size_t MixedHash(const KmerType &kmer) {
     return phmap::phmap_mix<sizeof(size_t)>()(KmerHash{}(kmer));
   }
@@ -466,6 +873,7 @@ class ContigFlankIndex {
 
   std::vector<HashShard> hash_shards_;
   BlockedBloomFilter flank_filter_;
+  OrientedPrefixFilter oriented_prefix_filter_;
   size_t num_shards_{0};
   size_t shard_mask_{0};
   size_t index_size_{0};

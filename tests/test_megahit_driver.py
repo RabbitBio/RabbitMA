@@ -90,5 +90,80 @@ class CgroupMemoryTest(unittest.TestCase):
             os.path.join(self.temp_dir, 'sys/fs/cgroup/memory')))
 
 
+class SharedNodeMemoryPolicyTest(unittest.TestCase):
+
+    def test_exclusive_policy_preserves_budget(self):
+        self.assertEqual(DRIVER.resolve_job_memory_budget(900, 1), 900)
+
+    def test_shared_policy_divides_default_budget(self):
+        self.assertEqual(DRIVER.resolve_job_memory_budget(901, 3), 300)
+
+    def test_explicit_per_job_budget_overrides_equal_share(self):
+        self.assertEqual(
+            DRIVER.resolve_job_memory_budget(900, 3, 400), 400)
+
+    def test_explicit_budget_cannot_widen_memory_limit(self):
+        self.assertEqual(
+            DRIVER.resolve_job_memory_budget(900, 3, 1200), 900)
+
+
+class NumaPolicyTest(unittest.TestCase):
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix='rabbitma-numa-test-')
+        self.node_root = os.path.join(self.temp_dir, 'sys/devices/system/node')
+        self.status_path = os.path.join(self.temp_dir, 'proc/self/status')
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def write(self, path, value):
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(path, 'w') as output:
+            output.write(value)
+
+    def add_node(self, node, cpus, memory_kb=1024):
+        directory = os.path.join(self.node_root, 'node%d' % node)
+        self.write(os.path.join(directory, 'cpulist'), cpus + '\n')
+        self.write(os.path.join(directory, 'meminfo'),
+                   'Node %d MemTotal: %d kB\n' % (node, memory_kb))
+
+    def test_linux_index_list_round_trip(self):
+        parsed = DRIVER.parse_linux_index_list('0-3,8,10-11\n')
+        self.assertEqual(parsed, {0, 1, 2, 3, 8, 10, 11})
+        self.assertEqual(DRIVER.format_linux_index_list(parsed),
+                         '0-3,8,10-11')
+
+    def test_discovery_intersects_cpu_and_memory_allowances(self):
+        self.add_node(0, '0-3')
+        self.add_node(2, '4-7')
+        self.write(self.status_path,
+                   'Name:\tpython\nMems_allowed_list:\t0,2\n')
+        self.assertEqual(
+            DRIVER.discover_numa_cpu_sets(
+                self.node_root, self.status_path, {2, 3, 4, 9}),
+            {0: {2, 3}, 2: {4}})
+
+        self.write(self.status_path,
+                   'Name:\tpython\nMems_allowed_list:\t2\n')
+        self.assertEqual(
+            DRIVER.discover_numa_cpu_sets(
+                self.node_root, self.status_path, {2, 3, 4, 9}),
+            {2: {4}})
+
+    def test_detect_numa_node_memory(self):
+        self.add_node(3, '8-9', memory_kb=12345)
+        self.assertEqual(
+            DRIVER.detect_numa_node_memory(3, self.node_root),
+            12345 * 1024)
+
+    def test_auto_node_requires_one_scheduler_visible_domain(self):
+        self.assertEqual(DRIVER.resolve_numa_node('auto', {3: {8, 9}}), 3)
+        with self.assertRaises(ValueError):
+            DRIVER.resolve_numa_node('auto', {0: {0}, 1: {1}})
+
+
 if __name__ == '__main__':
     unittest.main()

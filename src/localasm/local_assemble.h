@@ -41,6 +41,7 @@ struct LocalAsmOption {
 
   uint32_t num_threads{0};
   std::string output_file;
+  std::string candidate_file;
 };
 
 void RunLocalAssembly(const LocalAsmOption &opt);

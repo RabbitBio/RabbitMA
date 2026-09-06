@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-#include <deque>
+#include <vector>
 
 #include "idba/contig_builder.h"
 #include "idba/contig_graph_vertex.h"
@@ -76,16 +76,34 @@ class ContigGraphPath {
   }
 
   void Assemble(Sequence &contig, ContigInfo &contig_info) {
-    ContigBuilder contig_builder;
+    const bool materialize_position_counts =
+        !vertices_.empty() && !vertices_[0].stored_counts().empty();
+    ContigBuilder contig_builder(materialize_position_counts);
 
     if (vertices_.size() > 0) {
+      size_t count_size = 0;
+      if (materialize_position_counts) {
+        count_size = vertices_[0].stored_counts().size();
+        for (size_t i = 1; i < vertices_.size(); ++i) {
+          const int d = distances_[i - 1u];
+          const size_t source_size = vertices_[i].stored_counts().size();
+          if (d <= 0) {
+            const size_t start = std::min<size_t>(
+                static_cast<size_t>(-d - int(vertices_[i].kmer_size()) + 1),
+                source_size);
+            count_size += source_size - start;
+          } else {
+            count_size += static_cast<size_t>(d) + source_size;
+          }
+        }
+      }
+      contig_builder.Reserve(size(), count_size);
       contig_builder.Append(vertices_[0], 0);
       for (unsigned i = 1; i < vertices_.size(); ++i)
         contig_builder.Append(vertices_[i], distances_[i - 1]);
     }
 
-    contig = contig_builder.contig();
-    contig_info = contig_builder.contig_info();
+    contig_builder.Release(contig, contig_info);
   }
 
   void swap(ContigGraphPath &path) {
@@ -132,12 +150,15 @@ class ContigGraphPath {
     distances_.clear();
   }
 
-  std::deque<int> &distances() { return distances_; }
-  const std::deque<int> &distances() const { return distances_; }
+  std::vector<int> &distances() { return distances_; }
+  const std::vector<int> &distances() const { return distances_; }
 
  private:
-  std::deque<ContigGraphVertexAdaptor> vertices_;
-  std::deque<int> distances_;
+  // Paths are traversed, copied and reversed far more often than they are
+  // extended.  A contiguous representation avoids two deque maps and their
+  // block allocations for the overwhelmingly short endpoint-local paths.
+  std::vector<ContigGraphVertexAdaptor> vertices_;
+  std::vector<int> distances_;
 };
 
 namespace std {

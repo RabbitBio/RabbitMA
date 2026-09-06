@@ -31,6 +31,10 @@ class EdgeMultiplicityRecorder {
     ++counters_[thread_id][std::min(static_cast<T>(kMaxMul), multiplicity)];
   }
 
+  void AddSingletons(uint64_t num_edges, unsigned thread_id) {
+    counters_[thread_id][1] += num_edges;
+  }
+
   int64_t GetNumSolidEdges(int solid_threshold) const {
     int64_t sum = 0;
     for (const auto &counter : counters_) {

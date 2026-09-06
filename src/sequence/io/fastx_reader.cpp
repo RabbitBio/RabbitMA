@@ -28,6 +28,129 @@
 
 #include "utils/startup_affinity.h"
 
+/**
+ * Decode exactly one byte range containing one complete gzip member.
+ *
+ * Concatenated gzip files are often produced by `cat`-ing independently
+ * compressed inputs.  Once buildlib has found and validated candidate member
+ * boundaries, using one inflater per range restores that natural coarse
+ * scheduling level.  zlib verifies the member trailer (CRC32 and ISIZE), and
+ * requiring the inflater to consume the range exactly prevents a guessed
+ * header inside compressed payload from being accepted as a boundary.
+ */
+class RangeGzipReader {
+ private:
+  static const size_t kInputBytes = 256u << 10u;
+
+ public:
+  RangeGzipReader(const std::string &path, uint64_t begin, uint64_t end)
+      : begin_(begin), end_(end), input_offset_(begin), input_(kInputBytes) {
+    if (end <= begin) {
+      throw std::invalid_argument("empty gzip member range");
+    }
+    fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) {
+      throw std::runtime_error("cannot open gzip member source " + path);
+    }
+    std::memset(&stream_, 0, sizeof(stream_));
+    const int status = inflateInit2(&stream_, 15 + 16);
+    if (status != Z_OK) {
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("cannot initialize gzip member inflater");
+    }
+    initialized_ = true;
+  }
+
+  ~RangeGzipReader() {
+    if (initialized_) inflateEnd(&stream_);
+    if (fd_ >= 0) close(fd_);
+  }
+
+  int Read(void *destination, unsigned length, std::string *error) {
+    if (failed_) {
+      if (error != nullptr) *error = failure_;
+      return -1;
+    }
+    if (done_ || length == 0u) return 0;
+
+    stream_.next_out = static_cast<Bytef *>(destination);
+    stream_.avail_out = length;
+    while (stream_.avail_out != 0u && !done_ && !failed_) {
+      if (stream_.avail_in == 0u) {
+        if (!Refill()) {
+          Fail("truncated gzip member range");
+          break;
+        }
+      }
+
+      const uInt input_before = stream_.avail_in;
+      const uInt output_before = stream_.avail_out;
+      const int status = inflate(&stream_, Z_NO_FLUSH);
+      if (status == Z_STREAM_END) {
+        const uint64_t consumed = input_offset_ - stream_.avail_in;
+        if (consumed != end_) {
+          Fail("gzip member did not end at the candidate boundary");
+        } else {
+          done_ = true;
+        }
+        break;
+      }
+      if (status != Z_OK) {
+        Fail(stream_.msg == nullptr ? "invalid gzip member"
+                                    : std::string(stream_.msg));
+        break;
+      }
+      if (input_before == stream_.avail_in &&
+          output_before == stream_.avail_out) {
+        Fail("gzip member inflater made no progress");
+        break;
+      }
+    }
+
+    const unsigned produced = length - stream_.avail_out;
+    if (produced != 0u) return static_cast<int>(produced);
+    if (failed_) {
+      if (error != nullptr) *error = failure_;
+      return -1;
+    }
+    return done_ ? 0 : -1;
+  }
+
+ private:
+  bool Refill() {
+    while (input_offset_ < end_) {
+      const size_t requested = static_cast<size_t>(
+          std::min<uint64_t>(input_.size(), end_ - input_offset_));
+      const ssize_t got = pread(fd_, input_.data(), requested,
+                                static_cast<off_t>(input_offset_));
+      if (got < 0 && errno == EINTR) continue;
+      if (got <= 0) return false;
+      input_offset_ += static_cast<uint64_t>(got);
+      stream_.next_in = input_.data();
+      stream_.avail_in = static_cast<uInt>(got);
+      return true;
+    }
+    return false;
+  }
+
+  void Fail(const std::string &message) {
+    failed_ = true;
+    failure_ = message;
+  }
+
+  int fd_{-1};
+  uint64_t begin_{0};
+  uint64_t end_{0};
+  uint64_t input_offset_{0};
+  std::vector<Bytef> input_;
+  z_stream stream_{};
+  std::string failure_;
+  bool initialized_{false};
+  bool done_{false};
+  bool failed_{false};
+};
+
 class AsyncGzipReader {
  private:
   static const size_t kChunkBytes = 256u << 10u;
@@ -273,8 +396,20 @@ bool LoadWholeGzip(const char *path, std::vector<char> *out) {
 }  // namespace
 
 mgzFile mgz_open(const std::string &file_name, bool allow_whole_gzip,
-                 unsigned gzip_threads) {
+                 unsigned gzip_threads, uint64_t compressed_begin,
+                 uint64_t compressed_end) {
   auto *s = new MgzStream();
+  if (compressed_end > compressed_begin) {
+    try {
+      s->range.reset(
+          new RangeGzipReader(file_name, compressed_begin, compressed_end));
+      return s;
+    } catch (const std::exception &e) {
+      s->error = e.what();
+      delete s;
+      return nullptr;
+    }
+  }
 #ifdef MEGAHIT_HAVE_LIBDEFLATE
   if (allow_whole_gzip && file_name != "-" &&
       std::getenv("MEGAHIT_DISABLE_LIBDEFLATE") == nullptr &&
@@ -323,6 +458,9 @@ mgzFile mgz_open(const std::string &file_name, bool allow_whole_gzip,
 }
 
 int mgz_read(mgzFile f, void *buf, unsigned len) {
+  if (f->range) {
+    return f->range->Read(buf, len, &f->error);
+  }
 #ifdef MEGAHIT_HAVE_RAPIDGZIP
   if (f->rapid != nullptr) {
     return MegahitRapidGzipRead(f->rapid, buf, len, &f->error);
@@ -362,8 +500,11 @@ void mgz_close(mgzFile f) {
 }
 
 FastxReader::FastxReader(const std::string &file_name,
-                         bool allow_whole_gzip, unsigned gzip_threads) {
-  fp_ = mgz_open(file_name, allow_whole_gzip, gzip_threads);
+                         bool allow_whole_gzip, unsigned gzip_threads,
+                         uint64_t compressed_begin,
+                         uint64_t compressed_end) {
+  fp_ = mgz_open(file_name, allow_whole_gzip, gzip_threads,
+                 compressed_begin, compressed_end);
   if (fp_ == nullptr) {
     throw std::invalid_argument("Cannot open file " + file_name);
   }

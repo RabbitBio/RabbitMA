@@ -29,7 +29,11 @@
 
 #ifndef KSEQ_INITED
 #define KSEQ_INITED
+// Keep the zlib-specific parser types distinct from the mgz parser in
+// fastx_reader.h when the executable is optimized across translation units.
+namespace {
 KSEQ_INIT(gzFile, gzread)
+}
 #endif
 
 int main_read_stat(int argc, char **argv) {

@@ -4,15 +4,15 @@
 #include <pthread.h>
 #include <sched.h>
 
-#include <array>
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <set>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -122,9 +122,15 @@ uint64_t ParseCacheSize(const std::string &text) {
              : static_cast<uint64_t>(value) * multiplier;
 }
 
-uint64_t LastLevelCacheForCpu(int cpu) {
+struct CacheDescription {
+  unsigned level{0};
+  uint64_t bytes{0};
+  std::string identity;
+};
+
+CacheDescription LastLevelCacheForCpu(int cpu) {
+  CacheDescription result;
 #ifdef __linux__
-  uint64_t largest = 0;
   // Cache indices are a dense, very small sysfs namespace.  Stop at the first
   // missing entry instead of assuming a particular number of cache levels.
   for (unsigned index = 0;; ++index) {
@@ -141,15 +147,61 @@ uint64_t LastLevelCacheForCpu(int cpu) {
         !ReadTextFile(prefix + "size", &size)) {
       continue;
     }
-    if (type == "Unified" || type == "Data") {
-      largest = std::max(largest, ParseCacheSize(size));
+    if (type != "Unified" && type != "Data") {
+      continue;
     }
+    char *level_end = nullptr;
+    const unsigned long parsed_level =
+        std::strtoul(level.c_str(), &level_end, 10);
+    const uint64_t parsed_size = ParseCacheSize(size);
+    if (level_end == level.c_str() || *level_end != '\0' ||
+        parsed_level > std::numeric_limits<unsigned>::max() ||
+        parsed_size == 0 ||
+        (parsed_level < result.level ||
+         (parsed_level == result.level && parsed_size <= result.bytes))) {
+      continue;
+    }
+
+    std::string shared_cpus;
+    std::string cache_id;
+    // shared_cpu_list identifies the physical cache instance across arbitrary
+    // CPU numbering, chiplet and sub-NUMA topologies.  The kernel cache ID is
+    // the next-best identity on systems that omit that list.
+    if (ReadTextFile(prefix + "shared_cpu_list", &shared_cpus)) {
+      result.identity = "L" + std::to_string(parsed_level) + ":" +
+                        type + ":cpus=" + shared_cpus;
+    } else if (ReadTextFile(prefix + "id", &cache_id)) {
+      result.identity = "L" + std::to_string(parsed_level) + ":" +
+                        type + ":id=" + cache_id;
+    } else {
+      result.identity.clear();
+    }
+    result.level = static_cast<unsigned>(parsed_level);
+    result.bytes = parsed_size;
   }
-  return largest;
 #else
   (void)cpu;
-  return 0;
 #endif
+  return result;
+}
+
+uint64_t UniqueLastLevelCacheBytes(const std::vector<int> &cpus) {
+  std::map<std::string, uint64_t> caches;
+  for (int cpu : cpus) {
+    const CacheDescription cache = LastLevelCacheForCpu(cpu);
+    if (cache.bytes == 0 || cache.identity.empty()) {
+      return 0;  // use the portable per-domain fallback
+    }
+    caches[cache.identity] = cache.bytes;
+  }
+  uint64_t total = 0;
+  for (const auto &cache : caches) {
+    if (cache.second > std::numeric_limits<uint64_t>::max() - total) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    total += cache.second;
+  }
+  return total;
 }
 
 unsigned PhysicalCoreCountForCpus(const std::vector<int> &cpus) {
@@ -207,6 +259,12 @@ NumaTopology DiscoverNumaTopology() {
   NumaTopology topology;
   topology.cpu_to_domain.assign(CPU_SETSIZE, -1);
   const cpu_set_t allowed_cpus = ComputeWideMask();
+  std::vector<int> all_usable_cpus;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &allowed_cpus)) all_usable_cpus.push_back(cpu);
+  }
+  topology.unique_last_level_cache_bytes =
+      UniqueLastLevelCacheBytes(all_usable_cpus);
 
 #ifdef __linux__
   std::string online_text;
@@ -242,7 +300,7 @@ NumaTopology DiscoverNumaTopology() {
       topology.physical_core_counts.push_back(
           PhysicalCoreCountForCpus(usable_cpus));
       topology.last_level_cache_bytes.push_back(
-          LastLevelCacheForCpu(usable_cpus.front()));
+          LastLevelCacheForCpu(usable_cpus.front()).bytes);
       for (int cpu : usable_cpus) {
         topology.cpu_to_domain[cpu] = static_cast<int>(domain);
       }
@@ -274,9 +332,33 @@ NumaTopology DiscoverNumaTopology() {
     topology.physical_core_counts.push_back(
         std::max(1u, PhysicalCoreCountForCpus(usable_cpus)));
     topology.last_level_cache_bytes.push_back(
-        first_cpu < 0 ? 0 : LastLevelCacheForCpu(first_cpu));
+        first_cpu < 0 ? 0 : LastLevelCacheForCpu(first_cpu).bytes);
   }
   return topology;
+}
+
+unsigned ParsePositiveUnsignedEnvironment(const char *name,
+                                          unsigned fallback) {
+  const char *text = std::getenv(name);
+  if (text == nullptr || *text == '\0') return fallback;
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long parsed = std::strtoul(text, &end, 10);
+  return errno == 0 && end != text && *end == '\0' && parsed > 0 &&
+                 parsed <= std::numeric_limits<unsigned>::max()
+             ? static_cast<unsigned>(parsed)
+             : fallback;
+}
+
+uint64_t ParsePositiveUint64Environment(const char *name) {
+  const char *text = std::getenv(name);
+  if (text == nullptr || *text == '\0') return 0;
+  char *end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(text, &end, 10);
+  return errno == 0 && end != text && *end == '\0' && parsed > 0
+             ? static_cast<uint64_t>(parsed)
+             : 0;
 }
 
 #ifdef __linux__
@@ -310,6 +392,9 @@ bool PageInterior(void *address, size_t bytes, void **aligned_address,
 }  // namespace
 
 uint64_t NumaTopology::total_last_level_cache_bytes() const {
+  if (unique_last_level_cache_bytes != 0) {
+    return unique_last_level_cache_bytes;
+  }
   uint64_t total = 0;
   for (uint64_t bytes : last_level_cache_bytes) {
     if (bytes > std::numeric_limits<uint64_t>::max() - total) {
@@ -339,6 +424,78 @@ const NumaTopology &GetNumaTopology() {
   return topology;
 }
 
+bool ConfigureProcessNumaMemoryPolicy(std::string *error_message) {
+  const char *text = std::getenv("MEGAHIT_NUMA_NODE");
+  if (text == nullptr || *text == '\0') {
+    return true;
+  }
+
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+  char *end = nullptr;
+  errno = 0;
+  const long parsed = std::strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    if (error_message != nullptr) {
+      *error_message = "invalid MEGAHIT_NUMA_NODE value '" +
+                       std::string(text) + "'";
+    }
+    return false;
+  }
+
+  const int selected_node = static_cast<int>(parsed);
+  const NumaTopology &topology = GetNumaTopology();
+  if (std::find(topology.node_ids.begin(), topology.node_ids.end(),
+                selected_node) == topology.node_ids.end()) {
+    if (error_message != nullptr) {
+      *error_message = "NUMA node " + std::to_string(selected_node) +
+                       " is outside this process's CPU/memory allocation";
+    }
+    return false;
+  }
+
+  constexpr unsigned kBitsPerWord = sizeof(unsigned long) * 8u;
+  const unsigned node = static_cast<unsigned>(selected_node);
+  const unsigned num_words = node / kBitsPerWord + 1u;
+  std::vector<unsigned long> mask(num_words, 0);
+  mask[node / kBitsPerWord] |= 1ul << (node % kBitsPerWord);
+  if (::syscall(SYS_set_mempolicy, MPOL_BIND, mask.data(),
+                num_words * kBitsPerWord) == 0) {
+    return true;
+  }
+  const int saved_errno = errno;
+  if (error_message != nullptr) {
+    *error_message = "set_mempolicy(MPOL_BIND, node " +
+                     std::to_string(selected_node) + ") failed: " +
+                     std::strerror(saved_errno);
+  }
+  return false;
+#else
+  if (error_message != nullptr) {
+    *error_message =
+        "explicit NUMA memory binding is unavailable on this platform";
+  }
+  return false;
+#endif
+}
+
+const RuntimeResourcePolicy &GetRuntimeResourcePolicy() {
+  static const RuntimeResourcePolicy policy = [] {
+    RuntimeResourcePolicy value;
+    value.jobs_per_node =
+        ParsePositiveUnsignedEnvironment("MEGAHIT_JOBS_PER_NODE", 1u);
+    value.memory_budget_per_job = ParsePositiveUint64Environment(
+        "MEGAHIT_MEMORY_BUDGET_PER_JOB");
+    return value;
+  }();
+  return policy;
+}
+
+uint64_t RuntimeResourcePolicy::last_level_cache_budget_bytes() const {
+  const uint64_t total = GetNumaTopology().total_last_level_cache_bytes();
+  return total == 0 ? 0 : std::max<uint64_t>(1u, total / jobs_per_node);
+}
+
 unsigned CurrentNumaDomain() {
 #ifdef __linux__
   const int cpu = sched_getcpu();
@@ -359,23 +516,31 @@ bool InterleaveMemoryPages(void *address, size_t bytes) {
     return false;
   }
 
-  constexpr unsigned kMaxNodes = 1024;
   constexpr unsigned kBitsPerWord = sizeof(unsigned long) * 8u;
-  std::array<unsigned long, kMaxNodes / kBitsPerWord> allowed{};
-  int current_mode = 0;
-  if (::syscall(SYS_get_mempolicy, &current_mode, allowed.data(), kMaxNodes,
-                nullptr, MPOL_F_MEMS_ALLOWED) != 0) {
+  const NumaTopology &topology = GetNumaTopology();
+  int max_node = -1;
+  unsigned selected_nodes = 0;
+  for (int node : topology.node_ids) {
+    if (node >= 0) {
+      max_node = std::max(max_node, node);
+      ++selected_nodes;
+    }
+  }
+  if (selected_nodes < 2u || max_node < 0) {
     return false;
   }
-  unsigned allowed_nodes = 0;
-  for (unsigned long word : allowed) {
-    allowed_nodes += static_cast<unsigned>(__builtin_popcountl(word));
+  const unsigned num_words =
+      (static_cast<unsigned>(max_node) + kBitsPerWord) / kBitsPerWord;
+  std::vector<unsigned long> selected(num_words, 0);
+  for (int node : topology.node_ids) {
+    if (node >= 0) {
+      selected[static_cast<unsigned>(node) / kBitsPerWord] |=
+          1ul << (static_cast<unsigned>(node) % kBitsPerWord);
+    }
   }
-  if (allowed_nodes < 2) {
-    return false;
-  }
+  const unsigned maxnode_bits = num_words * kBitsPerWord;
   return ::syscall(SYS_mbind, aligned_address, aligned_bytes, MPOL_INTERLEAVE,
-                   allowed.data(), kMaxNodes, 0) == 0;
+                   selected.data(), maxnode_bits, 0) == 0;
 #else
   (void)address;
   (void)bytes;

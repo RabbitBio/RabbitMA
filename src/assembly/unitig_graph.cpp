@@ -23,9 +23,43 @@
 
 #include "kmlib/kmbitvector.h"
 #include "utils/mutex.h"
+#include "utils/startup_affinity.h"
 #include "utils/utils.h"
 
 namespace {
+
+unsigned SelectUnitigTraversalStreamWidth(size_t start_count,
+                                          int num_threads) {
+  unsigned stream_width = static_cast<unsigned>(std::min<size_t>(
+      32u, std::max<size_t>(1u, DivCeiling(
+                                start_count,
+                                static_cast<size_t>(std::max(1, num_threads))))));
+  if (const char *value = std::getenv("MEGAHIT_UNITIG_MLP_WIDTH")) {
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno == 0 && end != value && *end == '\0' && parsed >= 1u &&
+        parsed <= 64u) {
+      stream_width = static_cast<unsigned>(parsed);
+    }
+  }
+  return stream_width;
+}
+
+bool UseNumaLocalUnitigScheduling() {
+  if (!GetRuntimeResourcePolicy().shared_node() ||
+      GetNumaTopology().domain_count() <= 1u ||
+      std::getenv("MEGAHIT_DISABLE_NUMA_UNITIG_QUEUES") != nullptr) {
+    return false;
+  }
+#if defined(_OPENMP) && _OPENMP >= 201307
+  // A domain captured in one parallel region is meaningful in the next only
+  // when the OpenMP runtime keeps workers bound.  The launcher supplies a
+  // binding default, but respect users who explicitly disable it.
+  if (omp_get_proc_bind() == omp_proc_bind_false) return false;
+#endif
+  return true;
+}
 
 #ifdef __linux__
 bool ReadMemAvailable(uint64_t *available_bytes) {
@@ -676,7 +710,9 @@ size_t AssembleForwardNonLoopPathsMultistream(
     SDBG *sdbg, AtomicBitVector *locks,
     std::vector<std::vector<UnitigGraphVertex>> *thread_vertices,
     const std::vector<uint64_t> &start_ids, int num_threads,
-    const ForwardAccessor &neighbors, unsigned stream_width) {
+    const ForwardAccessor &neighbors, unsigned stream_width,
+    const std::vector<size_t> &owner_offsets,
+    const std::vector<unsigned> &owner_domains) {
   struct PathState {
     bool active{false};
     bool reverse_phase{false};
@@ -698,6 +734,35 @@ size_t AssembleForwardNonLoopPathsMultistream(
                      static_cast<size_t>(std::max(1, num_threads)) *
                          chunks_per_worker));
   std::atomic<size_t> next_chunk{0};
+  struct WorkRange {
+    size_t begin;
+    size_t end;
+  };
+  const size_t domain_count = GetNumaTopology().domain_count();
+  const bool numa_local_scheduling =
+      UseNumaLocalUnitigScheduling() &&
+      owner_offsets.size() == static_cast<size_t>(num_threads) + 1u &&
+      owner_domains.size() == static_cast<size_t>(num_threads);
+  std::vector<std::vector<WorkRange>> domain_chunks(
+      numa_local_scheduling ? domain_count : 0u);
+  std::unique_ptr<std::atomic<size_t>[]> next_domain_chunk;
+  if (numa_local_scheduling) {
+    for (int owner = 0; owner < num_threads; ++owner) {
+      const unsigned domain =
+          owner_domains[owner] < domain_count ? owner_domains[owner] : 0u;
+      for (size_t begin = owner_offsets[owner];
+           begin < owner_offsets[owner + 1]; begin += chunk_size) {
+        domain_chunks[domain].push_back(
+            {begin, std::min(owner_offsets[owner + 1], begin + chunk_size)});
+      }
+    }
+    next_domain_chunk.reset(new std::atomic<size_t>[domain_count]);
+    for (size_t domain = 0; domain < domain_count; ++domain) {
+      next_domain_chunk[domain].store(0, std::memory_order_relaxed);
+    }
+    xinfo("Unitig work scheduling: {} NUMA-local queues with tail stealing\n",
+          domain_count);
+  }
   size_t count_palindrome = 0;
 
 #pragma omp parallel num_threads(num_threads) reduction(+ : count_palindrome)
@@ -707,16 +772,37 @@ size_t AssembleForwardNonLoopPathsMultistream(
     size_t local_next = 0;
     size_t local_end = 0;
     bool input_exhausted = false;
+    const unsigned home_domain =
+        numa_local_scheduling ? CurrentNumaDomain() : 0u;
+
+    auto take_domain_chunk = [&](unsigned domain) {
+      const size_t chunk = next_domain_chunk[domain].fetch_add(
+          1u, std::memory_order_relaxed);
+      if (chunk >= domain_chunks[domain].size()) return false;
+      local_next = domain_chunks[domain][chunk].begin;
+      local_end = domain_chunks[domain][chunk].end;
+      return true;
+    };
 
     auto take_start = [&](uint64_t *start) {
       while (local_next == local_end) {
-        const size_t begin =
-            next_chunk.fetch_add(chunk_size, std::memory_order_relaxed);
-        if (begin >= start_ids.size()) {
-          return false;
+        if (numa_local_scheduling) {
+          bool found = take_domain_chunk(home_domain);
+          for (size_t offset = 1u; !found && offset < domain_count;
+               ++offset) {
+            found = take_domain_chunk(
+                static_cast<unsigned>((home_domain + offset) % domain_count));
+          }
+          if (!found) return false;
+        } else {
+          const size_t begin =
+              next_chunk.fetch_add(chunk_size, std::memory_order_relaxed);
+          if (begin >= start_ids.size()) {
+            return false;
+          }
+          local_next = begin;
+          local_end = std::min(start_ids.size(), begin + chunk_size);
         }
-        local_next = begin;
-        local_end = std::min(start_ids.size(), begin + chunk_size);
       }
       *start = start_ids[local_next++];
       return true;
@@ -860,7 +946,7 @@ size_t AssembleUncachedNonLoopPaths(
 
 }  // namespace
 
-UnitigGraph::UnitigGraph(SDBG *sdbg)
+UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
     : sdbg_(sdbg), adapter_impl_(this), sudo_adapter_impl_(this) {
   id_map_.clear();
   dense_id_map_.clear();
@@ -919,6 +1005,7 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
   };
   SimpleNeighborMode simple_neighbor_mode = SimpleNeighborMode::kOff;
   bool auto_select_mode = true;
+  bool auto_retain_forward_simple_next = false;
   const char *requested_mode =
       std::getenv("MEGAHIT_SIMPLE_NEIGHBOR_MODE");
   if (std::getenv("MEGAHIT_DISABLE_SIMPLE_NEIGHBOR_CACHE") != nullptr) {
@@ -977,10 +1064,23 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
     // cache has already paid for a uint32 Forward array; reuse that storage in
     // place.  The normal/default path never allocates a new four-byte-per-edge
     // table merely because a large-memory host happens to be available.
+    const bool dense_reuse_tier =
+        std::getenv("MEGAHIT_DISABLE_DENSE_REUSE_TIER") == nullptr &&
+        compact_edge_ids && sdbg_->HasDenseBackwardTopologyCache() &&
+        host_budget != 0u && forward_neighbor_bytes <= host_budget / 16u &&
+        (!found_available_memory ||
+         forward_neighbor_bytes <= available_bytes / 4u);
     if (sdbg_->HasSimplePathSnapshot()) {
       simple_neighbor_mode = SimpleNeighborMode::kBlock;
     } else if (sdbg_->HasReusableForwardTopologyCache()) {
       simple_neighbor_mode = SimpleNeighborMode::kForward;
+    } else if (dense_reuse_tier) {
+      // In the high-memory tier, a direct successor array is useful twice:
+      // first for dependency-chain construction and later for sequence
+      // materialization and bubble comparison.  Its lifetime is extended
+      // below rather than rebuilding or discarding the same dataflow.
+      simple_neighbor_mode = SimpleNeighborMode::kForward;
+      auto_retain_forward_simple_next = true;
     } else if (compact_edge_ids && found_available_memory &&
                block_neighbor_bytes <= available_bytes / 4u) {
       // One byte per edge plus a small block directory removes the dependent
@@ -1149,6 +1249,11 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
   size_t count_palindrome = 0;
   const int num_threads = omp_get_max_threads();
   std::vector<std::vector<UnitigGraphVertex>> thread_vertices(num_threads);
+  std::vector<unsigned> worker_numa_domains(num_threads, 0u);
+  if (UseNumaLocalUnitigScheduling()) {
+#pragma omp parallel num_threads(num_threads)
+    worker_numa_domains[omp_get_thread_num()] = CurrentNumaDomain();
+  }
   std::vector<uint64_t> terminal_ids;
   std::vector<size_t> terminal_thread_offsets;
   std::vector<std::vector<uint64_t>> thread_terminals;
@@ -1246,7 +1351,11 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
     uint64_t overflow_count = 0;
 
     if (reusing_simple_path_snapshot) {
-#pragma omp parallel num_threads(num_threads)
+      const bool finalize_simple_snapshot =
+          std::getenv("MEGAHIT_DISABLE_FINAL_SIMPLE_SNAPSHOT") == nullptr;
+      uint64_t final_overflow_count = 0;
+#pragma omp parallel num_threads(num_threads) \
+    reduction(+ : final_overflow_count)
       {
         const int tid = omp_get_thread_num();
         auto &local_terminals = thread_terminals[tid];
@@ -1257,9 +1366,19 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
 
 #pragma omp for schedule(static)
         for (uint64_t edge_idx = 0; edge_idx < num_edges; ++edge_idx) {
-          if (!sdbg_->IsValidEdge(edge_idx)) continue;
+          if (!sdbg_->IsValidEdge(edge_idx)) {
+            if (finalize_simple_snapshot) {
+              sdbg_->RewriteFinalSimplePathSnapshotEdge(
+                  edge_idx, SDBG::kNullID);
+            }
+            continue;
+          }
           const uint64_t next =
               sdbg_->CachedOrLiveNextSimplePathEdge(edge_idx);
+          if (finalize_simple_snapshot) {
+            final_overflow_count +=
+                sdbg_->RewriteFinalSimplePathSnapshotEdge(edge_idx, next);
+          }
           if (next == SDBG::kNullID) {
             local_terminals.push_back(edge_idx);
           } else {
@@ -1275,7 +1394,12 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
           }
         }
       }
-      xinfo("Reused pre-pruning simple-path snapshot; {} original overflow "
+      if (finalize_simple_snapshot) {
+        sdbg_->FinishFinalSimplePathSnapshot(final_overflow_count);
+        xinfo("Finalized simple-path snapshot; {} links use live topology\n",
+              final_overflow_count);
+      }
+      xinfo("Reused pre-pruning simple-path snapshot; {} current overflow "
             "edges use live topology\n",
             sdbg_->SimplePathSnapshotOverflowCount());
     } else {
@@ -1461,6 +1585,13 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
           terminal_thread_offsets[tid] + thread_terminals[tid].size();
     }
     terminal_ids.resize(terminal_thread_offsets.back());
+    if (UseNumaLocalUnitigScheduling() && !terminal_ids.empty()) {
+      // resize() first-touches trivial vector elements on the caller.  Drop
+      // the aligned interior before the parallel copy so each owner segment
+      // is faulted on the NUMA domain that produced it.
+      DiscardMemoryPages(terminal_ids.data(),
+                         terminal_ids.size() * sizeof(terminal_ids[0]));
+    }
 #pragma omp parallel for schedule(static) num_threads(num_threads)
     for (int tid = 0; tid < num_threads; ++tid) {
       std::copy(thread_terminals[tid].begin(), thread_terminals[tid].end(),
@@ -1490,59 +1621,41 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
       // flight; the state is only a few KiB per worker and the width remains
       // bounded when millions of starts are available.  The environment
       // override remains useful for unusual memory systems.
-      unsigned stream_width = static_cast<unsigned>(std::min<size_t>(
-          32u, std::max<size_t>(1u, DivCeiling(
-                                    terminal_ids.size(),
-                                    static_cast<size_t>(num_threads)))));
-      if (const char *value = std::getenv("MEGAHIT_UNITIG_MLP_WIDTH")) {
-        char *end = nullptr;
-        const unsigned long parsed = std::strtoul(value, &end, 10);
-        if (end != value && *end == '\0' && parsed >= 1 && parsed <= 64) {
-          stream_width = static_cast<unsigned>(parsed);
-        }
-      }
+      const unsigned stream_width = SelectUnitigTraversalStreamWidth(
+          terminal_ids.size(), num_threads);
       xinfo("Unitig chain traversal: {} interleaved paths per worker\n",
             stream_width);
       count_palindrome = AssembleForwardNonLoopPathsMultistream(
           sdbg_, &locks, &thread_vertices, terminal_ids, num_threads, neighbors,
-          stream_width);
+          stream_width, terminal_thread_offsets, worker_numa_domains);
     }
   } else if (simple_neighbor_mode == SimpleNeighborMode::kOffset) {
     const OffsetNeighborAccessor neighbors{sdbg_, simple_offsets.get()};
-    unsigned stream_width = static_cast<unsigned>(std::min<size_t>(
-        32u, std::max<size_t>(1u, DivCeiling(
-                                  terminal_ids.size(),
-                                  static_cast<size_t>(num_threads)))));
-    if (const char *value = std::getenv("MEGAHIT_UNITIG_MLP_WIDTH")) {
-      char *end = nullptr;
-      const unsigned long parsed = std::strtoul(value, &end, 10);
-      if (end != value && *end == '\0' && parsed >= 1 && parsed <= 64) {
-        stream_width = static_cast<unsigned>(parsed);
-      }
-    }
+    const unsigned stream_width = SelectUnitigTraversalStreamWidth(
+        terminal_ids.size(), num_threads);
     xinfo("Unitig chain traversal: {} interleaved paths per worker\n",
           stream_width);
     count_palindrome = AssembleForwardNonLoopPathsMultistream(
         sdbg_, &locks, &thread_vertices, terminal_ids, num_threads, neighbors,
-        stream_width);
+        stream_width, terminal_thread_offsets, worker_numa_domains);
   } else if (simple_neighbor_mode == SimpleNeighborMode::kBlock) {
-    unsigned stream_width = static_cast<unsigned>(std::min<size_t>(
-        32u, std::max<size_t>(1u, DivCeiling(
-                                  terminal_ids.size(),
-                                  static_cast<size_t>(num_threads)))));
+    const unsigned stream_width = SelectUnitigTraversalStreamWidth(
+        terminal_ids.size(), num_threads);
     xinfo("Unitig chain traversal: {} interleaved paths per worker\n",
           stream_width);
     if (reusing_simple_path_snapshot) {
       const SharedSnapshotNeighborAccessor neighbors{sdbg_};
       count_palindrome = AssembleForwardNonLoopPathsMultistream(
           sdbg_, &locks, &thread_vertices, terminal_ids, num_threads,
-          neighbors, stream_width);
+          neighbors, stream_width, terminal_thread_offsets,
+          worker_numa_domains);
     } else {
       const BlockNeighborAccessor neighbors{
           sdbg_, block_simple_codes.get(), block_simple_bases.get()};
       count_palindrome = AssembleForwardNonLoopPathsMultistream(
           sdbg_, &locks, &thread_vertices, terminal_ids, num_threads,
-          neighbors, stream_width);
+          neighbors, stream_width, terminal_thread_offsets,
+          worker_numa_domains);
     }
   } else if (simple_neighbor_mode == SimpleNeighborMode::kDouble) {
     if (compact_simple_neighbors) {
@@ -1605,7 +1718,18 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
     sdbg_->RestoreBorrowedForwardTopologyCache();
     reusing_forward_topology = false;
   }
-  owned_simple_next.reset();
+  if (simple_neighbor_mode == SimpleNeighborMode::kForward &&
+      !reusing_forward_topology && owned_simple_next &&
+      (auto_retain_forward_simple_next ||
+       std::getenv("MEGAHIT_RETAIN_FORWARD_SIMPLE_NEXT") != nullptr)) {
+    materialization_simple_next_ = std::move(owned_simple_next);
+    materialization_simple_edge_count_ = num_edges;
+    xinfo("Retained direct simple-successor table: {.2} MiB\n",
+          static_cast<double>(num_edges * sizeof(uint32_t)) /
+              (1u << 20u));
+  } else {
+    owned_simple_next.reset();
+  }
   simple_next = nullptr;
   simple_prev.reset();
   compact_simple_neighbors.reset();
@@ -1724,7 +1848,7 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
   double endpoint_release_time = 0;
   double endpoint_allocate_time = 0;
   double endpoint_insert_time = 0;
-  sdbg_->FreeMultiplicity();
+  if (!retain_sdbg_multiplicity) sdbg_->FreeMultiplicity();
   endpoint_release_time = omp_get_wtime() - endpoint_stage_begin;
   const uint64_t num_endpoints = vertices_.size() * 2 - count_palindrome;
 
@@ -1836,12 +1960,177 @@ UnitigGraph::UnitigGraph(SDBG *sdbg)
         unitig_stage_timer.elapsed());
 }
 
+int UnitigGraph::RawOutgoingEdges(uint64_t edge, uint64_t *out) const {
+  const int degree = sdbg_->OutgoingEdges(edge, out);
+  if (degree == 0 && bridges_ && sdbg_->IsValidEdge(edge)) {
+    if (const auto *gap = bridges_->Next(edge)) {
+      if (sdbg_->IsValidEdge(gap->target)) { if (out) out[0] = gap->target; return 1; }
+    }
+  }
+  return degree;
+}
+
+uint64_t UnitigGraph::RawNextEdge(uint64_t edge) const {
+  const uint64_t next = sdbg_->NextSimplePathEdge(edge);
+  if (next == SDBG::kNullID && bridges_ && sdbg_->IsValidEdge(edge)) {
+    if (const auto *gap = bridges_->Next(edge))
+      if (sdbg_->IsValidEdge(gap->target)) return gap->target;
+  }
+  return next;
+}
+
+uint64_t UnitigGraph::RawPreviousEdge(uint64_t edge) const {
+  const uint64_t previous = sdbg_->PrevSimplePathEdge(edge);
+  if (previous == SDBG::kNullID && bridges_ && sdbg_->IsValidEdge(edge)) {
+    const uint64_t from = bridges_->Previous(edge);
+    if (from != SDBG::kNullID && sdbg_->IsValidEdge(from)) return from;
+  }
+  return previous;
+}
+
+uint64_t UnitigGraph::RawUniquePreviousEdge(uint64_t edge) const {
+  const uint64_t previous = sdbg_->UniquePrevEdge(edge);
+  if (previous == SDBG::kNullID && bridges_ && sdbg_->IsValidEdge(edge)) {
+    const uint64_t from = bridges_->Previous(edge);
+    if (from != SDBG::kNullID && sdbg_->IsValidEdge(from)) return from;
+  }
+  return previous;
+}
+
+void UnitigGraph::AddBridgeSpan(uint64_t from, uint64_t to, uint32_t *length,
+                               uint64_t *depth) const {
+  if (!bridges_) return;
+  if (const auto *gap = bridges_->Next(from)) {
+    if (gap->target != to) xfatal("Invalid unitig bridge transition\n");
+    const uint32_t extra = bridges_->Length(*gap);
+    if (extra > std::numeric_limits<uint32_t>::max() - *length) xfatal("Bridge path too long\n");
+    *length += extra;
+    *depth += bridges_->Depth(*gap);
+  }
+}
+
+UnitigGraph::LoopMeasurement UnitigGraph::MeasureBridgedLoop(VertexAdapter adapter) const {
+  const auto measure = [&](uint64_t start) {
+    LoopMeasurement value;
+    uint64_t edge = start;
+    uint64_t offset = 0;
+    while (offset < adapter.GetLength()) {
+      if (edge == SDBG::kNullID || !sdbg_->IsValidEdge(edge)) xfatal("Invalid bridged loop\n");
+      value.total += sdbg_->EdgeMultiplicity(edge);
+      value.minimum.physical = std::min(value.minimum.physical, edge);
+      ++offset;
+      if (const auto *gap = bridges_->Next(edge)) {
+        offset += bridges_->Length(*gap);
+        value.total += bridges_->Depth(*gap);
+        bridges_->IncludeGapMinimum(&value.minimum, gap);
+        value.has_gap = true;
+        edge = gap->target;
+      } else edge = sdbg_->NextSimplePathEdge(edge);
+    }
+    if (offset != adapter.GetLength() || edge != start) xfatal("Bridged loop length mismatch\n");
+    value.minimum = bridges_->NormalizeMinimum(value.minimum, *sdbg_);
+    return value;
+  };
+  auto selected = measure(adapter.b());
+  if (adapter.rb() != adapter.b()) {
+    const auto reverse = measure(adapter.rb());
+    if (bridges_->MinimumLess(reverse.minimum, selected.minimum, *sdbg_)) selected = reverse;
+  }
+  return selected;
+}
+
+void UnitigGraph::AttachBridges(std::shared_ptr<ContigBridges> bridges) {
+  if (!bridges || bridges->empty()) return;
+  bridges_ = std::move(bridges);
+  Refresh(false);
+  // Capture the original terminal order after complete paths have been
+  // reconstructed, before cleaning can move any physical endpoint.
+#pragma omp parallel for schedule(dynamic, 16)
+  for (size_t i = 0; i < active_ids_.size(); ++i) {
+    const size_type id = active_ids_[i];
+    auto adapter = MakeSudoAdapter(id);
+    if (adapter.IsLoop()) {
+      const auto measured = MeasureBridgedLoop(MakeVertexAdapter(id));
+      if (measured.has_gap) {
+        const std::string origin = bridges_->PalindromeOrigin(measured.minimum, *sdbg_);
+        adapter.SetPalindrome(!origin.empty());
+        if (!origin.empty()) {
+#pragma omp critical(megahit_bridge_loop_origin)
+          initial_bridge_loop_origins_.emplace(id, origin);
+        }
+      }
+    } else adapter.SetPalindrome(adapter.b() == adapter.rb());
+    legacy_order_keys_[id] = vertices_[id].TerminalOrderKey() |
+        (adapter.IsLoop() ? uint64_t{1} << 63u : 0u);
+  }
+}
+
+void UnitigGraph::FinalizeInitialTipCompression() {
+  if (bridges_) {
+#pragma omp parallel for schedule(dynamic, 16)
+    for (size_t i = 0; i < active_ids_.size(); ++i) {
+      const size_type id = active_ids_[i];
+      auto adapter = MakeSudoAdapter(id);
+      if (!adapter.IsLoop()) continue;
+      const auto measured = MeasureBridgedLoop(MakeVertexAdapter(id));
+      adapter.SetTotalDepth(measured.total + bridges_->MinimumCoverage(measured.minimum, *sdbg_));
+    }
+    sdbg_->FreeMultiplicity();
+    return;
+  }
+  struct LoopDepth {
+    uint64_t total{0};
+    uint64_t minimum_edge{SDBG::kNullID};
+  };
+
+#pragma omp parallel for schedule(dynamic, 16)
+  for (size_type active_index = 0; active_index < active_ids_.size();
+       ++active_index) {
+    const size_type id = active_ids_[active_index];
+    auto adapter = MakeSudoAdapter(id);
+    if (!adapter.IsLoop()) continue;
+
+    const uint32_t length = adapter.GetLength();
+    const auto measure = [&](uint64_t start) {
+      LoopDepth depth;
+      uint64_t edge = start;
+      for (uint32_t offset = 0; offset < length; ++offset) {
+        if (edge == SDBG::kNullID || !sdbg_->IsValidEdge(edge)) {
+          xfatal("Invalid initial loop while normalizing unitig {}\n", id);
+        }
+        depth.total += sdbg_->EdgeMultiplicity(edge);
+        depth.minimum_edge = std::min(depth.minimum_edge, edge);
+        edge = sdbg_->NextSimplePathEdge(edge);
+      }
+      if (edge != start) {
+        xfatal("Initial loop length mismatch while normalizing unitig {}\n",
+               id);
+      }
+      return depth;
+    };
+
+    LoopDepth selected = measure(adapter.b());
+    if (adapter.rb() != adapter.b()) {
+      const LoopDepth reverse = measure(adapter.rb());
+      if (reverse.minimum_edge < selected.minimum_edge) selected = reverse;
+    }
+    // UnitigGraph's historical raw-loop constructor initializes depth with
+    // the seed multiplicity and then visits the seed again in its do/while
+    // traversal.  Downstream thresholds therefore depend on this deliberate
+    // extra term.  The first globally visited edge is the lowest edge ID in
+    // either orientation of the component.
+    selected.total += sdbg_->EdgeMultiplicity(selected.minimum_edge);
+    adapter.SetTotalDepth(selected.total);
+  }
+  sdbg_->FreeMultiplicity();
+}
+
 void UnitigGraph::BuildDirectAdjacency(size_type id) {
   DirectAdjacency &adjacency = direct_adjacency_[id];
   for (unsigned strand = 0; strand < 2; ++strand) {
     VertexAdapter source(vertices_[id], strand, id);
     uint64_t next_starts[4];
-    const int degree = sdbg_->OutgoingEdges(source.e(), next_starts);
+    const int degree = RawOutgoingEdges(source.e(), next_starts);
     if (degree < 0 || degree > 4) {
       xfatal("Invalid SDBG degree {} while caching unitig {}:{}\n", degree,
              id, strand);
@@ -2010,8 +2299,8 @@ void UnitigGraph::RefreshDisconnected(
     uint64_t new_start, new_end, new_rc_start, new_rc_end;
 
     if (to_disconnect) {
-      new_start = sdbg_->NextSimplePathEdge(old_start);
-      new_rc_end = sdbg_->PrevSimplePathEdge(old_rc_end);
+      new_start = RawNextEdge(old_start);
+      new_rc_end = RawPreviousEdge(old_rc_end);
       assert(new_start != SDBG::kNullID && new_rc_end != SDBG::kNullID);
       sdbg_->SetInvalidEdge(old_start);
       sdbg_->SetInvalidEdge(old_rc_end);
@@ -2021,8 +2310,8 @@ void UnitigGraph::RefreshDisconnected(
     }
 
     if (rc_to_disconnect) {
-      new_rc_start = sdbg_->NextSimplePathEdge(old_rc_start);
-      new_end = sdbg_->PrevSimplePathEdge(old_end);
+      new_rc_start = RawNextEdge(old_rc_start);
+      new_end = RawPreviousEdge(old_end);
       assert(new_rc_start != SDBG::kNullID && new_end != SDBG::kNullID);
       sdbg_->SetInvalidEdge(old_rc_start);
       sdbg_->SetInvalidEdge(old_end);
@@ -2083,8 +2372,8 @@ void UnitigGraph::RefreshDelta(bool set_changed,
     for (int strand = 0; strand < 2;
          ++strand, adapter.ReverseComplement()) {
       uint64_t cur_edge = adapter.e();
-      for (size_t j = 1; j < adapter.GetLength(); ++j) {
-        const uint64_t prev = sdbg_->UniquePrevEdge(cur_edge);
+      while (cur_edge != adapter.b()) {
+        const uint64_t prev = RawUniquePreviousEdge(cur_edge);
         sdbg_->SetInvalidEdge(cur_edge);
         cur_edge = prev;
         assert(cur_edge != SDBG::kNullID);
@@ -2239,7 +2528,10 @@ void UnitigGraph::RefreshDelta(bool set_changed,
     uint32_t new_length = adapter.GetLength();
     uint64_t new_total_depth = adapter.GetTotalDepth();
     adapter.SetFlag(kVisited);
+    uint64_t previous_end = adapter.e();
     for (auto &vertex : linear_path) {
+      AddBridgeSpan(previous_end, vertex.b(), &new_length, &new_total_depth);
+      previous_end = vertex.e();
       new_length += vertex.GetLength();
       new_total_depth += vertex.GetTotalDepth();
       if (vertex.canonical_id() != adapter.canonical_id()) {
@@ -2275,8 +2567,10 @@ void UnitigGraph::RefreshDelta(bool set_changed,
     uint64_t total_depth = adapter.GetTotalDepth();
     SudoVertexAdapter next_adapter = adapter;
     while (true) {
+      const uint64_t previous_end = next_adapter.e();
       next_adapter = NextSimplePathAdapter(next_adapter);
       assert(next_adapter.IsValid());
+      AddBridgeSpan(previous_end, next_adapter.b(), &length, &total_depth);
       if (next_adapter.b() == adapter.b()) {
         break;
       }
@@ -2294,9 +2588,9 @@ void UnitigGraph::RefreshDelta(bool set_changed,
     }
 
     const uint64_t new_start = adapter.b();
-    const uint64_t new_end = sdbg_->PrevSimplePathEdge(new_start);
+    const uint64_t new_end = RawPreviousEdge(new_start);
     const uint64_t new_rc_end = adapter.re();
-    const uint64_t new_rc_start = sdbg_->NextSimplePathEdge(new_rc_end);
+    const uint64_t new_rc_start = RawNextEdge(new_rc_end);
     assert(new_start == sdbg_->EdgeReverseComplement(new_rc_end));
     assert(new_end == sdbg_->EdgeReverseComplement(new_rc_start));
     adapter.SetBeginEnd(new_start, new_end, new_rc_start, new_rc_end);
@@ -2501,8 +2795,8 @@ void UnitigGraph::Refresh(bool set_changed) {
     }
     for (int strand = 0; strand < 2; ++strand, adapter.ReverseComplement()) {
       uint64_t cur_edge = adapter.e();
-      for (size_t j = 1; j < adapter.GetLength(); ++j) {
-        auto prev = sdbg_->UniquePrevEdge(cur_edge);
+      while (cur_edge != adapter.b()) {
+        auto prev = RawUniquePreviousEdge(cur_edge);
         sdbg_->SetInvalidEdge(cur_edge);
         cur_edge = prev;
         assert(cur_edge != SDBG::kNullID);
@@ -2563,7 +2857,10 @@ void UnitigGraph::Refresh(bool set_changed) {
       auto new_total_depth = adapter.GetTotalDepth();
       adapter.SetFlag(kVisited);
 
+      uint64_t previous_end = adapter.e();
       for (auto &v : linear_path) {
+        AddBridgeSpan(previous_end, v.b(), &new_length, &new_total_depth);
+        previous_end = v.e();
         new_length += v.GetLength();
         new_total_depth += v.GetTotalDepth();
         if (v.canonical_id() != adapter.canonical_id()) v.SetFlag(kDeleted);
@@ -2637,8 +2934,10 @@ void UnitigGraph::Refresh(bool set_changed) {
       uint64_t total_depth = adapter.GetTotalDepth();
       SudoVertexAdapter next_adapter = adapter;
       while (true) {
+        const uint64_t previous_end = next_adapter.e();
         next_adapter = NextSimplePathAdapter(next_adapter);
         assert(next_adapter.IsValid());
+        AddBridgeSpan(previous_end, next_adapter.b(), &length, &total_depth);
         if (next_adapter.b() == adapter.b()) {
           break;
         }
@@ -2652,9 +2951,9 @@ void UnitigGraph::Refresh(bool set_changed) {
       }
 
       auto new_start = adapter.b();
-      auto new_end = sdbg_->PrevSimplePathEdge(new_start);
+      auto new_end = RawPreviousEdge(new_start);
       auto new_rc_end = adapter.re();
-      auto new_rc_start = sdbg_->NextSimplePathEdge(new_rc_end);
+      auto new_rc_start = RawNextEdge(new_rc_end);
       assert(new_start == sdbg_->EdgeReverseComplement(new_rc_end));
       assert(new_end == sdbg_->EdgeReverseComplement(new_rc_start));
 
@@ -2783,7 +3082,22 @@ std::string UnitigGraph::VertexToDNAString(VertexAdapter v) {
         "ACGT"[cur_char > 4 ? (cur_char - 5) : (cur_char - 1)];
 
     if (i + 1 < vertex_length) {
-      cur_edge = SimpleNextForMaterialization(cur_edge);
+      const ContigBridges::Link *gap = nullptr;
+      const uint64_t next_edge = SimpleNextForMaterialization(cur_edge, &gap);
+      if (gap) {
+        const uint32_t extra = bridges_->Length(*gap);
+        if (extra > vertex_length - i - 1u) xfatal("Bridge exceeds unitig length\n");
+        bridges_->WriteGap(*gap, &label[sdbg_->k() + i + 1u]);
+        i += extra;
+        // A circular unitig can choose the first suffix stub as its origin,
+        // leaving the final omitted span immediately before that origin.
+        if (i + 1u == vertex_length) {
+          if (!v.IsLoop() || next_edge != v.b() || cur_edge != v.e())
+            xfatal("Invalid terminal bridge span\n");
+          break;
+        }
+      }
+      cur_edge = next_edge;
       if (cur_edge == SDBG::kNullID) {
         xfatal("{}, {}, {}, {}, ({}, {}), {}, {}\n", v.b(), v.e(), v.rb(),
                v.re(), sdbg_->EdgeReverseComplement(v.e()),
@@ -2798,12 +3112,37 @@ std::string UnitigGraph::VertexToDNAString(VertexAdapter v) {
            sdbg_->EdgeReverseComplement(v.b()), v.GetLength());
   }
 
+  if (v.IsLoop() && v.IsPalindrome() && bridges_) {
+    const auto origin = initial_bridge_loop_origins_.find(v.UnitigId());
+    if (origin != initial_bridge_loop_origins_.end()) {
+      const size_t offset = label.find(origin->second);
+      if (offset >= vertex_length) xfatal("Cannot restore palindrome loop origin\n");
+      const std::string core = label.substr(0, vertex_length);
+      for (size_t i = 0; i < label.size(); ++i) label[i] = core[(offset + i) % core.size()];
+    }
+  }
   return label;
 }
 
-uint64_t UnitigGraph::SimpleNextForMaterialization(uint64_t edge) const {
+uint64_t UnitigGraph::SimpleNextForMaterialization(uint64_t edge,
+                                                 const ContigBridges::Link **gap) const {
+  if (gap) *gap = nullptr;
+  if (materialization_simple_next_ &&
+      edge < materialization_simple_edge_count_) {
+    const uint32_t next = materialization_simple_next_[edge];
+    // A retained vertex contains no invalid interior edge: deletion removes
+    // a whole raw unitig and disconnect trims only an endpoint.  Refresh may
+    // expose a new link between raw unitigs, represented by the null entry and
+    // handled by the exact fallback below.  Rechecking the immutable direct
+    // link's target bitmap at every emitted base only adds a second unrelated
+    // random load; the caller's length/end assertion remains the full-path
+    // invariant check.
+    if (next != kNoSimpleNeighbor) {
+      return static_cast<uint64_t>(next);
+    }
+  }
   uint64_t shared_next = SDBG::kNullID;
-  if (sdbg_->TryCachedNextSimplePathEdge(edge, &shared_next)) {
+  if (sdbg_->TryCachedNextSimplePathEdge(edge, &shared_next) && shared_next != SDBG::kNullID) {
     return shared_next;
   }
   if (materialization_simple_codes_ &&
@@ -2831,5 +3170,14 @@ uint64_t UnitigGraph::SimpleNextForMaterialization(uint64_t edge) const {
       }
     }
   }
-  return sdbg_->UniqueNextEdge(edge);
+  const uint64_t next = sdbg_->UniqueNextEdge(edge);
+  if (next == SDBG::kNullID && bridges_ && sdbg_->IsValidEdge(edge)) {
+    if (const auto *link = bridges_->Next(edge)) {
+      if (sdbg_->IsValidEdge(link->target)) {
+        if (gap) *gap = link;
+        return link->target;
+      }
+    }
+  }
+  return next;
 }

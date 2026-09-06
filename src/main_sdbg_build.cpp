@@ -99,6 +99,7 @@ int main_kmer_count(int argc, char **argv) {
     exit(1);
   }
 
+  omp_set_num_threads(opt.n_threads);
   KmerCounter runner(opt);
   runner.Run();
 
@@ -152,6 +153,7 @@ int main_read2sdbg(int argc, char **argv) {
     exit(1);
   }
 
+  omp_set_num_threads(opt.n_threads);
   SeqPkgWithSolidMarker pkg;
 
   {
@@ -193,6 +195,10 @@ int main_seq2sdbg(int argc, char **argv) {
                  "additional contigs from previous k");
   desc.AddOption("local_contig", "", opt.local_contig,
                  "local contigs from previous k");
+  desc.AddOption("carry_stable_contigs", "", opt.carry_stable_contigs,
+                 "carry certified isolated paths directly to assemble");
+  desc.AddOption("bridge_contigs", "", opt.bridge_contigs,
+                 "experimental exact compression of long path interiors");
   desc.AddOption(
       "input_prefix", "", opt.input_prefix,
       "files input_prefix.edges.* output by count module, can be gzip'ed.");
@@ -234,6 +240,7 @@ int main_seq2sdbg(int argc, char **argv) {
     exit(1);
   }
 
+  omp_set_num_threads(opt.n_threads);
   SeqToSdbg runner(opt);
   runner.Run();
   return 0;

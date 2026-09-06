@@ -23,11 +23,13 @@ a second full edge collection. These policies derive their budgets from the
 run-time memory allowance and workload histograms rather than the CAMI input
 size or a fixed machine topology.
 
-The measured run contains the bounded-memory and deterministic traversal work
-used by this source line. Subsequent correctness-only fixes for single-end
-local-mapping compatibility, circular-contig semantics, and path handling do
-not change this paired CAMI workload's allocation policy; a full retiming of
-the exact public commit remains useful for release-grade reproducibility.
+This table describes the earlier bounded-memory reference build. The current
+source also includes later reusable read-index, graph and local-assembly
+optimizations, plus automatic NUMA placement for cooperating jobs. The table
+is not a timing of this updated revision. Full-pipeline timing of the exact
+public commit and its resource configuration remains necessary for a current
+release comparison; component tests or timings with experimental switches
+should not be presented as default end-to-end performance.
 
 The measured workload can be reproduced with a command of this form:
 
@@ -40,6 +42,39 @@ megahit \
 Performance depends on read composition, k-mer schedule, storage, compiler,
 memory topology, and CPU. RabbitMA discovers the available CPU/NUMA topology at
 run time and does not encode the CAMI input size or a particular socket layout.
+
+## v0.2.0 NUMA experiment and synchronization checks
+
+Two concurrent jobs each assembled the same merged 20-sample CAMI III input
+on a machine with two NUMA domains and 32 physical cores per domain. Each job
+used `-t 32`. The comparison held the validated computation core fixed and
+changed the launcher's resource placement and memory-budget policy.
+
+| Placement policy | Job A (seconds) | Job B (seconds) | Pair makespan (seconds) |
+| --- | ---: | ---: | ---: |
+| Previous placement | 4282.94 | 4323.84 | 4324.07 |
+| Automatic per-domain reservations | 2353.85 | 2340.24 | 2354.42 |
+
+Node throughput improved **1.8366x** and pair completion time decreased
+45.55%. All 240 final/intermediate output checks passed. This includes the
+benefits of removing overlapping CPU placement, preferring local memory and
+adjusting per-job memory budgets; it does not isolate remote-memory latency
+or measure a universal speedup over v0.1.0. Performance on a single exclusive
+job or a different topology can differ.
+
+After synchronizing that computation implementation into RabbitMA, all three
+CPU variants passed 87 regression tests each (261 runs). Eight complete toy
+pipelines and a full merged CAMI III k39 assembly comparison passed 142 exact
+output checks. These checks retained complete sequence orientation, k, flags
+and floating coverage and ignored only record IDs and order, including
+records stored in packed intermediate sidecars. The k39 paired ABBA means
+were 74.0976 seconds for the validated core and 74.0274 seconds for the
+synchronized core, within run-to-run variation. These are synchronization
+checks, not new full-pipeline measurements of the public release binary.
+
+Experimental `MEGAHIT_EXPERIMENTAL_*` paths remain opt-in; timings using them
+must be labeled with their enabled flags. NUMA graph replicas and native/LTO
+builds that did not improve measured performance are not enabled by default.
 
 ## Correctness work included in this source
 

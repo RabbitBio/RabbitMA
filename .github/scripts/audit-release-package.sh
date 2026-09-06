@@ -34,10 +34,12 @@ for command in file ldd objdump readelf readlink sort strings; do
 done
 
 for path in \
-  README.md BENCHMARKS.md BUILD_INFO.txt LICENSE NOTICE \
+  README.md BENCHMARKS.md RELEASE_NOTES.md BUILD_INFO.txt LICENSE NOTICE \
   bin/megahit bin/megahit_core bin/megahit_core_popcnt \
   bin/megahit_core_no_hw_accel \
-  lib/libdeflate.so.0 lib/libgcc_s.so.1 lib/libstdc++.so.6 lib/libz.so.1
+  lib/libdeflate.so.0 lib/libgcc_s.so.1 lib/libstdc++.so.6 lib/libz.so.1 \
+  lib/libnuma.so.1 share/licenses/libnuma/LICENSE.LGPL2.1 \
+  share/licenses/libnuma/numactl-2.0.19.tar.gz
 do
   require_file "$path"
 done
@@ -66,7 +68,7 @@ while IFS= read -r -d '' link; do
   esac
 done < <(find "$package_dir" -type l -print0)
 
-bundled_libraries='libz.so.1 libdeflate.so.0 libstdc++.so.6 libgcc_s.so.1'
+bundled_libraries='libz.so.1 libdeflate.so.0 libstdc++.so.6 libgcc_s.so.1 libnuma.so.1'
 
 while IFS= read -r -d '' elf; do
   readelf -h "$elf" >/dev/null 2>&1 || continue
@@ -78,7 +80,7 @@ while IFS= read -r -d '' elf; do
   while IFS= read -r needed; do
     case "$needed" in
       libc.so.6|libdl.so.2|libm.so.6|libpthread.so.0|ld-linux-x86-64.so.2) ;;
-      libz.so.1|libdeflate.so.0|libstdc++.so.6|libgcc_s.so.1)
+      libz.so.1|libdeflate.so.0|libstdc++.so.6|libgcc_s.so.1|libnuma.so.1)
         [[ -f "$package_dir/lib/$needed" ]] ||
           fail "$relative needs an unbundled library: $needed"
         ;;

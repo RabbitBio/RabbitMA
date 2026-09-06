@@ -1168,8 +1168,23 @@ class SequencePackage {
   }
 
   uint64_t GetSeqID(size_t full_offset) const {
-    assert(sparse_gap_block_begin_.empty() && read_gap16_.empty() &&
-           read_gap32_.empty());
+    if (!sparse_gap_block_begin_.empty() || !read_gap16_.empty() ||
+        !read_gap32_.empty()) {
+      const size_t look_up_entry = full_offset / kLookupStep;
+      size_t l = pos_to_id_[look_up_entry];
+      size_t r = pos_to_id_[look_up_entry + 1];
+      while (l < r) {
+        const size_t mid = (l + r) / 2;
+        if (StartPos(mid) > full_offset) {
+          r = mid - 1;
+        } else if (StartPos(mid + 1) <= full_offset) {
+          l = mid + 1;
+        } else {
+          return mid;
+        }
+      }
+      return l;
+    }
     if (full_offset < num_fixed_len_ * fixed_len_) {
       return full_offset / fixed_len_;
     } else {
@@ -1206,13 +1221,17 @@ class SequencePackage {
 
   /** Append a possibly word-unaligned view without decoding its bases. */
   void AppendSequenceView(const SeqView &view) {
-    unsigned len = view.length();
+    AppendSequenceSpan(view, 0, view.length());
+  }
+
+  void AppendSequenceSpan(const SeqView &view, unsigned start, unsigned len) {
+    assert(start <= view.length() && len <= view.length() - start);
     if (len == 0) {
       TWord fake_sequence = 0;
       return AppendCompactSequence(&fake_sequence, 1, false);
     }
     UpdateLength(len);
-    auto address = view.raw_address();
+    auto address = view.raw_address(start);
     const TWord *ptr = address.first;
     unsigned offset = address.second;
     if (offset != 0) {
@@ -1256,14 +1275,31 @@ class SequencePackage {
   }
 
   void BuildIndex() {
-    assert(sparse_gap_block_begin_.empty() && read_gap16_.empty() &&
-           read_gap32_.empty());
     pos_to_id_.clear();
-    pos_to_id_.reserve(start_pos_.back() / kLookupStep + 4);
+    const size_t total_bases = base_count();
+    pos_to_id_.reserve(total_bases / kLookupStep + 4);
+
+    if (!sparse_gap_block_begin_.empty() || !read_gap16_.empty() ||
+        !read_gap32_.empty()) {
+      size_t abs_offset = 0;
+      size_t cur_id = 0;
+      while (abs_offset <= total_bases) {
+        while (cur_id < seq_count() &&
+               StartPos(cur_id + 1) <= abs_offset) {
+          ++cur_id;
+        }
+        pos_to_id_.push_back(cur_id);
+        abs_offset += kLookupStep;
+      }
+      pos_to_id_.push_back(seq_count());
+      pos_to_id_.push_back(seq_count());
+      return;
+    }
+
     size_t abs_offset = num_fixed_len_ * fixed_len_;
     size_t cur_id = num_fixed_len_;
 
-    while (abs_offset <= start_pos_.back()) {
+    while (abs_offset <= total_bases) {
       while (cur_id < seq_count() &&
              start_pos_[cur_id - num_fixed_len_ + 1] <= abs_offset) {
         ++cur_id;

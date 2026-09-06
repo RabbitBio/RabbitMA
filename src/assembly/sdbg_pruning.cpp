@@ -56,6 +56,12 @@ inline uint64_t BitWordIndex(uint64_t bit_index) {
   return bit_index / AtomicBitVector::bits_per_word();
 }
 
+bool UseBackwardSimplePathSnapshot() {
+  static const bool enabled =
+      std::getenv("MEGAHIT_DISABLE_BACKWARD_SIMPLE_SNAPSHOT") == nullptr;
+  return enabled;
+}
+
 inline void TrackRemovedWord(uint64_t edge_id,
                              AtomicBitVector *remove_word_seen) {
   if (remove_word_seen != nullptr) {
@@ -103,18 +109,34 @@ bool MarkBackwardTip(SDBG &dbg, int len, AtomicBitVector &ignored,
 
   for (int i = 1; i < len; ++i) {
     if (combined_degree_query) {
-      const int indegree = dbg.UniqueIncomingEdge(cur, &prev);
-      if (indegree != 1) {
-        // UniquePrevEdge followed by EdgeIndegreeZero performs the same
-        // BOSS backward/rank-select walk twice for zero- and branch-degree
-        // vertices.  One complete degree query distinguishes both cases.
-        is_tip = indegree == 0;
-        prev = SDBG::kNullID;
-        break;
-      }
-      if (dbg.UniqueNextEdge(prev) == SDBG::kNullID) {
-        is_tip = true;
-        break;
+      const bool known_simple_successor =
+          UseBackwardSimplePathSnapshot() &&
+          dbg.TryCachedPrevSimplePathEdge(cur, &prev);
+      if (!known_simple_successor) {
+        const int indegree = dbg.UniqueIncomingEdge(cur, &prev);
+        if (indegree != 1) {
+          // UniquePrevEdge followed by EdgeIndegreeZero performs the same
+          // BOSS backward/rank-select walk twice for zero- and branch-degree
+          // vertices.  One complete degree query distinguishes both cases.
+          is_tip = indegree == 0;
+          prev = SDBG::kNullID;
+          break;
+        }
+        uint64_t cached_next = SDBG::kNullID;
+        // The pre-pruning snapshot is an exact certificate for an unchanged
+        // simple edge.  If it still names cur, prev necessarily has one live
+        // outgoing edge and the second rank/select degree query is redundant.
+        // A missing, overflow, removed, or newly exposed entry falls back to
+        // the historical live query below.
+        const bool known_simple_predecessor =
+            UseBackwardSimplePathSnapshot() &&
+            dbg.TryCachedNextSimplePathEdge(prev, &cached_next) &&
+            cached_next == cur;
+        if (!known_simple_predecessor &&
+            dbg.UniqueNextEdge(prev) == SDBG::kNullID) {
+          is_tip = true;
+          break;
+        }
       }
     } else {
       prev = dbg.UniquePrevEdge(cur);
@@ -478,6 +500,13 @@ int64_t TrimDirectedEdgeFrontier(
     std::vector<uint32_t> &forward_edges, bool combined_degree_query) {
   int64_t number_tips = 0;
   const int max_threads = omp_get_max_threads();
+  const bool profile =
+      std::getenv("MEGAHIT_PROFILE_TIP_FRONTIER") != nullptr;
+  double phase_begin = profile ? omp_get_wtime() : 0.0;
+  double backward_time = 0.0;
+  double backward_publish_time = 0.0;
+  double forward_time = 0.0;
+  double invalidate_time = 0.0;
   std::vector<std::vector<uint32_t>> backward_exposed(max_threads);
   std::vector<std::vector<uint32_t>> forward_exposed(max_threads);
 
@@ -497,6 +526,10 @@ int64_t TrimDirectedEdgeFrontier(
       }
     }
   }
+  if (profile) {
+    backward_time = omp_get_wtime() - phase_begin;
+    phase_begin = omp_get_wtime();
+  }
 
   // Preserve the historical barrier semantics: a branch exposed by the
   // backward pass is allowed to participate in the current forward pass if
@@ -510,6 +543,10 @@ int64_t TrimDirectedEdgeFrontier(
     }
   }
   MergeExposedEdges(forward_edges, backward_source);
+  if (profile) {
+    backward_publish_time = omp_get_wtime() - phase_begin;
+    phase_begin = omp_get_wtime();
+  }
 
 #pragma omp parallel reduction(+ : number_tips)
   {
@@ -527,8 +564,16 @@ int64_t TrimDirectedEdgeFrontier(
       }
     }
   }
+  if (profile) {
+    forward_time = omp_get_wtime() - phase_begin;
+    phase_begin = omp_get_wtime();
+  }
 
   InvalidateTrackedEdges(dbg, to_remove, remove_word_seen);
+  if (profile) {
+    invalidate_time = omp_get_wtime() - phase_begin;
+    phase_begin = omp_get_wtime();
+  }
 
   // Topology changes become visible only after the legacy two directional
   // passes.  Classify the small delta now and merge it into the retained,
@@ -543,6 +588,15 @@ int64_t TrimDirectedEdgeFrontier(
   MergeExposedEdges(forward_edges, local_forward);
   FilterActiveEdges(ignored, backward_edges);
   FilterActiveEdges(ignored, forward_edges);
+  if (profile) {
+    xinfo(
+        "Directional tip profile at length {}: backward={.4}, "
+        "backward-publish={.4}, forward={.4}, invalidate={.4}, "
+        "classify/filter={.4}\n",
+        len, backward_time, backward_publish_time, forward_time,
+        invalidate_time, omp_get_wtime() - phase_begin);
+  }
+  dbg.ReleaseInverseSimplePathSnapshot();
   return number_tips;
 }
 
@@ -669,7 +723,7 @@ int64_t TrimEdgeFrontier(SDBG &dbg, int len, AtomicBitVector &ignored,
 
 }  // namespace
 
-double InferMinDepth(SDBG &dbg) {
+double InferMinDepth(SDBG &dbg, const std::vector<uint64_t> &extra_counts) {
   Histgram<mul_t> hist;
   const int num_threads = omp_get_max_threads();
   std::vector<std::vector<uint64_t>> local_counts(
@@ -683,7 +737,8 @@ double InferMinDepth(SDBG &dbg) {
   }
 
   for (int multiplicity = 0; multiplicity <= kMaxMul; ++multiplicity) {
-    uint64_t count = 0;
+    uint64_t count = static_cast<size_t>(multiplicity) < extra_counts.size()
+                         ? extra_counts[multiplicity] : 0;
     for (int tid = 0; tid < num_threads; ++tid) {
       count += local_counts[tid][multiplicity];
     }
@@ -821,6 +876,11 @@ uint64_t RemoveTips(SDBG &dbg, int max_tip_len) {
           "built in {.4}s\n",
           dbg.SimplePathSnapshotBytes(),
           dbg.SimplePathSnapshotOverflowCount(), timer.elapsed());
+    if (dbg.HasInverseSimplePathSnapshot()) {
+      xinfo("Inverse simple-path snapshot: {} bytes, {} overflow edges\n",
+            dbg.InverseSimplePathSnapshotBytes(),
+            dbg.InverseSimplePathSnapshotOverflowCount());
+    }
   } else {
     timer.stop();
   }

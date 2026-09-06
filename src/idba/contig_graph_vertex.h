@@ -26,27 +26,38 @@
  */
 class ContigGraphVertex {
  public:
+  enum : uint32_t {
+    kNoCachedNeighbor = UINT32_MAX,
+    kUncacheableNeighbor = UINT32_MAX - 1u
+  };
+
   explicit ContigGraphVertex(const Sequence &contig = Sequence(),
                              const ContigInfo &contig_info = ContigInfo())
-      : contig_(contig), contig_info_(contig_info) {}
+      : contig_(contig),
+        contig_info_(contig_info),
+        next_neighbor_{kNoCachedNeighbor, kNoCachedNeighbor} {}
 
   ContigGraphVertex(const ContigGraphVertex &x)
       : contig_(x.contig_),
         id_(x.id_),
         status_(x.status_),
-        contig_info_(x.contig_info_) {}
+        contig_info_(x.contig_info_),
+        next_neighbor_{x.next_neighbor_[0], x.next_neighbor_[1]} {}
 
   const ContigGraphVertex &operator=(const ContigGraphVertex &x) {
     if (this != &x) {
       contig_ = x.contig_;
       id_ = x.id_;
       contig_info_ = x.contig_info_;
+      next_neighbor_[0] = x.next_neighbor_[0];
+      next_neighbor_[1] = x.next_neighbor_[1];
     }
     return *this;
   }
 
   const Sequence &contig() const { return contig_; }
   void set_contig(const Sequence &contig) { contig_ = contig; }
+  void take_contig(Sequence &contig) { contig_.swap(contig); }
 
   uint32_t contig_size() const { return contig_.size(); }
   uint32_t num_kmer() const { return contig_.size() - kmer_size() + 1; }
@@ -54,6 +65,17 @@ class ContigGraphVertex {
   const ContigInfo &contig_info() const { return contig_info_; }
   void set_contig_info(const ContigInfo &contig_info) {
     contig_info_ = contig_info;
+  }
+  void take_contig_info(ContigInfo &contig_info) {
+    contig_info_.swap(contig_info);
+  }
+
+  // Move the biological payload while leaving the source's traversal status,
+  // stable id and temporary neighbor-map slots intact.  MergeSimplePaths uses
+  // those control fields until every component has been discovered/remapped.
+  void take_payload(ContigGraphVertex &source) {
+    contig_.swap(source.contig_);
+    contig_info_.swap(source.contig_info_);
   }
 
   uint64_t kmer_count() const { return contig_info_.kmer_count(); }
@@ -77,6 +99,13 @@ class ContigGraphVertex {
 
   BitEdges &out_edges() { return contig_info_.out_edges(); }
   const BitEdges &out_edges() const { return contig_info_.out_edges(); }
+
+  uint32_t &next_neighbor(bool is_reverse) {
+    return next_neighbor_[is_reverse ? 1 : 0];
+  }
+  uint32_t next_neighbor(bool is_reverse) const {
+    return next_neighbor_[is_reverse ? 1 : 0];
+  }
 
   IdbaKmer begin_kmer(int kmer_size) const {
     return contig_.GetIdbaKmer(0, kmer_size);
@@ -106,6 +135,8 @@ class ContigGraphVertex {
       std::swap(id_, x.id_);
       status_.swap(x.status_);
       contig_info_.swap(x.contig_info_);
+      std::swap(next_neighbor_[0], x.next_neighbor_[0]);
+      std::swap(next_neighbor_[1], x.next_neighbor_[1]);
     }
   }
 
@@ -114,6 +145,8 @@ class ContigGraphVertex {
     id_ = 0;
     status_.clear();
     contig_info_.clear();
+    next_neighbor_[0] = kNoCachedNeighbor;
+    next_neighbor_[1] = kNoCachedNeighbor;
   }
 
  private:
@@ -122,6 +155,7 @@ class ContigGraphVertex {
   uint32_t id_;
   VertexStatus status_;
   ContigInfo contig_info_;
+  uint32_t next_neighbor_[2];
 };
 
 /**
@@ -215,6 +249,13 @@ class ContigGraphVertexAdaptor {
     return !is_reverse_ ? vertex_->out_edges() : vertex_->in_edges();
   }
 
+  uint32_t &next_neighbor() {
+    return vertex_->next_neighbor(is_reverse_);
+  }
+  uint32_t next_neighbor() const {
+    return vertex_->next_neighbor(is_reverse_);
+  }
+
   SequenceCount counts() {
     if (!is_reverse_)
       return vertex_->counts();
@@ -249,6 +290,12 @@ class ContigGraphVertexAdaptor {
   double coverage() const { return vertex_->coverage(); }
 
   bool is_reverse() const { return is_reverse_; }
+
+  // Physical storage views are intentionally exposed separately from the
+  // oriented value-returning accessors.  Builders can stream either strand
+  // directly and avoid allocating a temporary Sequence/SequenceCount.
+  const Sequence &stored_contig() const { return vertex_->contig(); }
+  const SequenceCount &stored_counts() const { return vertex_->counts(); }
 
   void swap(ContigGraphVertexAdaptor &x) {
     if (this != &x) {

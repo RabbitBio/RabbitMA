@@ -209,6 +209,19 @@ class MappingResultCollector {
 
   size_t size() const { return values_.size(); }
 
+  unsigned MaxReferencedMappedReadLength(const uint32_t *words,
+                                          size_t total_words) const {
+    assert(finalized_);
+    unsigned maximum = 0;
+#pragma omp parallel for schedule(static) reduction(max : maximum)
+    for (int64_t i = 0; i < static_cast<int64_t>(values_.size()); ++i) {
+      const uint64_t offset = GetReadId(values_[i]);
+      if (offset >= total_words) xfatal("Invalid mapped local read offset\n");
+      maximum = std::max(maximum, words[offset]);
+    }
+    return maximum;
+  }
+
   /**
    * Replace the original library read ids in every retained mapping with a
    * dense, order-preserving id and return the corresponding original ids.

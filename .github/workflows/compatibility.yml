@@ -7,14 +7,6 @@ on:
       - "Publish release"
     types:
       - completed
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/compatibility.yml"
-      - ".github/scripts/audit-release-package.sh"
-      - ".github/scripts/test-release-runtime.sh"
-      - ".github/compatibility-test-target"
 
 permissions:
   contents: read
@@ -30,7 +22,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Test launcher resource discovery
-        run: python3 tests/test_megahit_driver.py
+        run: |
+          python3 -B tests/test_megahit_driver.py -v
+          python3 -B tests/test_auto_numa.py -v
 
       - name: Download the public release package
         id: package
@@ -179,9 +173,7 @@ jobs:
           package_dir="${package_root}/RabbitMA-${release_tag}-linux-x86_64"
 
           check_budget() {
-            local expect_aware=$1
             docker run --rm --memory 2g --cpus 2 \
-              -e EXPECT_CGROUP_AWARE="${expect_aware}" \
               -v "${package_dir}:/opt/RabbitMA:ro" \
               "${MANYLINUX_IMAGE}" bash -euo pipefail -c '
                 export PATH=/opt/python/cp39-cp39/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -194,18 +186,15 @@ jobs:
                   limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
                 fi
                 echo "cgroup limit=${limit}; RabbitMA budget=${reported}"
+                test -n "${reported}"
                 if [[ "${limit}" != max && "${reported}" -gt "${limit}" ]]; then
-                  if [[ "${EXPECT_CGROUP_AWARE}" == 1 ]]; then
-                    exit 1
-                  fi
-                  echo "::warning::The current v0.1.0 package needs an explicit -m inside memory-limited cgroups; the main-branch launcher fixes this."
+                  echo "Memory budget exceeds the cgroup limit" >&2
+                  exit 1
                 fi
               '
           }
 
-          check_budget 0
-          install -m 755 src/megahit "${package_dir}/bin/megahit"
-          check_budget 1
+          check_budget
 
   source-build-cmake-2-8:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'

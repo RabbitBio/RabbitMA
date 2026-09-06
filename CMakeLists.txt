@@ -18,12 +18,16 @@ FILE(GLOB_RECURSE SDBG_SOURCE "src/sdbg/*.cpp")
 FILE(GLOB_RECURSE CX1_SOURCE "src/sorting/*.cpp")
 FILE(GLOB_RECURSE SEQ_SOURCE "src/sequence/*.cpp")
 FILE(GLOB_RECURSE TOOLKIT_SOURCE "src/tools/*.cpp")
+# The comparison diagnostic has its own main and is not part of the core.
+LIST(REMOVE_ITEM TOOLKIT_SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/compare_contig_sequences.cpp")
 
 LIST(APPEND OTHER_SOURCE
         src/main.cpp
         src/main_assemble.cpp
         src/main_buildlib.cpp
         src/main_iterate.cpp
+        src/main_read_index.cpp
         src/main_local_assemble.cpp
         src/main_sdbg_build.cpp
         src/utils/options_description.cpp
@@ -164,6 +168,27 @@ add_custom_target(
 
 add_custom_target(megahit_toolkit ALL
         COMMAND ${CMAKE_COMMAND} -E create_symlink megahit_core_no_hw_accel megahit_toolkit)
+
+add_executable(test_stream_store EXCLUDE_FROM_ALL tests/stream_store.cpp)
+add_executable(test_stream_store_fallback EXCLUDE_FROM_ALL tests/stream_store.cpp)
+target_compile_definitions(test_stream_store_fallback PRIVATE
+        MEGAHIT_DISABLE_STREAM_STORE_INTRINSICS)
+add_custom_target(check_stream_stores
+        COMMAND $<TARGET_FILE:test_stream_store>
+        COMMAND $<TARGET_FILE:test_stream_store_fallback>
+        DEPENDS test_stream_store test_stream_store_fallback)
+
+add_executable(test_local_minimizer_gate EXCLUDE_FROM_ALL
+        tests/local_minimizer_gate.cpp
+        src/localasm/hash_mapper.cpp
+        src/utils/startup_affinity.cpp
+        ${SEQ_SOURCE})
+target_link_libraries(test_local_minimizer_gate ${ZLIB_LIBRARIES}
+        ${LIBDEFLATE_LIBRARY} ${MEGAHIT_RAPIDGZIP_LIBRARY})
+add_custom_target(check_local_minimizer_gate
+        COMMAND $<TARGET_FILE:test_local_minimizer_gate>
+                "${CMAKE_CURRENT_BINARY_DIR}/test-local-minimizer.fa"
+        DEPENDS test_local_minimizer_gate)
 
 set(TEST_DATA ${CMAKE_SOURCE_DIR}/test_data)
 

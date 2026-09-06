@@ -28,10 +28,12 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 
 #include "assembly/all_algo.h"
 #include "assembly/contig_output.h"
 #include "assembly/contig_stat.h"
+#include "sequence/io/contig/contig_reader.h"
 #include "utils/histgram.h"
 #include "utils/options_description.h"
 #include "utils/utils.h"
@@ -66,6 +68,24 @@ struct LocalAsmOption {
   string addi_contig_file() { return output_prefix + ".addi.fa"; }
   string bubble_file() { return output_prefix + ".bubble_seq.fa"; }
 } opt;
+
+bool PreferUnitigFirstInitialTips(const SDBG &dbg, uint64_t max_tip_len) {
+  if (max_tip_len == 0 || dbg.size() == 0) return true;
+
+  // Edge-first trimming performs bounded walks from the endpoint frontier at
+  // every geometric threshold, then unitig construction traverses the
+  // surviving graph again.  Unitig-first traverses the graph once and runs
+  // the same mark/delete/contract thresholds on the much smaller unitig
+  // graph.  It wins when the conservative endpoint-walk upper bound is small
+  // relative to one full edge stream.  On tip-dense early graphs, retain the
+  // edge-first path because pruning before compression materially shrinks the
+  // expensive raw-unitig construction.
+  //
+  // Write the comparison as division rather than sentinel_count * length so
+  // it remains exact for arbitrarily large graph metadata without overflow.
+  const uint64_t quarter_graph = dbg.size() / 4u;
+  return dbg.TipSentinelCount() <= quarter_graph / max_tip_len;
+}
 
 void ParseAsmOption(int argc, char *argv[]) {
   OptionsDescription desc;
@@ -147,12 +167,43 @@ int main_assemble(int argc, char **argv) {
           static_cast<double>(std::numeric_limits<uint64_t>::max())) {
     topology_memory_budget = static_cast<uint64_t>(opt.host_mem);
   }
-  if (dbg.BuildTopologyCache(topology_memory_budget)) {
+  const uint64_t expected_tip_walk_length =
+      opt.max_tip_len < 0
+          ? uint64_t{2} * dbg.k()
+          : static_cast<uint64_t>(std::max(0, opt.max_tip_len));
+  if (dbg.BuildTopologyCache(topology_memory_budget,
+                             expected_tip_walk_length)) {
     xinfo("SDBG topology cache: {} bytes\n", dbg.TopologyCacheBytes());
   }
   timer.stop();
   xinfoc("Done. Time elapsed: {}\n", timer.elapsed());
   xinfo("Number of Edges: {}; K value: {}\n", dbg.size(), dbg.k());
+
+  SeqPackage isolated;
+  std::vector<mul_t> isolated_multi;
+  std::vector<uint64_t> isolated_depth_counts;
+  const string isolated_path = opt.sdbg_name + ".isolated.fa";
+  struct stat isolated_stat {};
+  if (::stat(packed_contig::Path(isolated_path).c_str(), &isolated_stat) == 0) {
+    ContigReader reader(isolated_path);
+    reader.ReadAllWithMultiplicity(&isolated, &isolated_multi, false);
+    isolated_depth_counts.assign(kMaxMul + 1u, 0);
+    for (size_t i = 0; i < isolated.seq_count(); ++i) {
+      const uint64_t length = isolated.GetSeqView(i).length();
+      if (length <= dbg.k()) xfatal("Invalid isolated path length\n");
+      isolated_depth_counts[isolated_multi[i]] += 2u * (length - dbg.k());
+    }
+    xinfo("Restoring certified isolated paths: {} contigs / {} bases\n",
+          isolated.seq_count(), isolated.base_count());
+  }
+  auto bridges = std::make_shared<ContigBridges>();
+  bridges->Load(opt.sdbg_name, dbg);
+  if (!bridges->empty()) {
+    if (bridges->margin() < static_cast<unsigned>(std::max(0, opt.cleaning_rounds)))
+      xfatal("Bridge endpoint margin is smaller than cleaning-round count\n");
+    bridges->AddHistogram(&isolated_depth_counts);
+    xinfo("Restoring {} compressed path interiors\n", bridges->size());
+  }
 
   // set cpu threads
   xinfo("Number of CPU threads: {}\n", opt.num_cpu_threads);
@@ -163,7 +214,7 @@ int main_assemble(int argc, char **argv) {
   }
   // set min depth
   if (opt.min_depth <= 0) {
-    opt.min_depth = sdbg_pruning::InferMinDepth(dbg);
+    opt.min_depth = sdbg_pruning::InferMinDepth(dbg, isolated_depth_counts);
     xinfo("min depth set to {.3}\n", opt.min_depth);
   }
 
@@ -173,21 +224,18 @@ int main_assemble(int argc, char **argv) {
       std::getenv("MEGAHIT_EXPERIMENTAL_UNITIG_FIRST_TIPS") != nullptr;
   const bool disable_unitig_first =
       std::getenv("MEGAHIT_DISABLE_UNITIG_FIRST_TIPS") != nullptr;
-  // Keep the historical SDBG-level initial-tip pass as the default.  Moving
-  // this pass after unitig compression changes when a tip exposed by one
-  // directional trim becomes visible to the opposite-direction trim.  That
-  // can change cleaning decisions in complex components even though the two
-  // formulations remove the same simple paths in isolation.  Unitig-first
-  // therefore remains available only as an explicitly requested experiment;
-  // it must never be selected by a data- or machine-dependent heuristic.
-  const bool unitig_first = !disable_unitig_first && force_unitig_first;
+  const bool structurally_sparse_tips = PreferUnitigFirstInitialTips(
+      dbg, static_cast<uint64_t>(std::max(0, opt.max_tip_len)));
+  const bool unitig_first =
+      !bridges->empty() || (!disable_unitig_first && (force_unitig_first || structurally_sparse_tips));
   if (unitig_first) {
     xinfo("Initial-tip plan: unitig-first ({} sentinels, {} edges, max "
           "length {})\n",
           dbg.TipSentinelCount(), dbg.size(), opt.max_tip_len);
     timer.reset();
     timer.start();
-    graph_storage.reset(new UnitigGraph(&dbg));
+    graph_storage.reset(new UnitigGraph(&dbg, true));
+    graph_storage->AttachBridges(bridges);
     timer.stop();
     xinfo("raw unitig graph size: {}, time for building: {.3}\n",
           graph_storage->size(), timer.elapsed());
@@ -202,6 +250,7 @@ int main_assemble(int argc, char **argv) {
             "{.3}\n",
             removed, timer.elapsed());
     }
+    graph_storage->FinalizeInitialTipCompression();
   } else {
     xinfo("Initial-tip plan: edge-frontier ({} sentinels, {} edges, max "
           "length {})\n",
@@ -226,7 +275,7 @@ int main_assemble(int argc, char **argv) {
   CalcAndPrintStat(graph);
 
   // set up bubble
-  ContigWriter bubble_writer(opt.bubble_file());
+  ContigWriter bubble_writer(opt.bubble_file(), !opt.is_final_round);
   NaiveBubbleRemover naiver_bubble_remover;
   ComplexBubbleRemover complex_bubble_remover;
   complex_bubble_remover.SetMergeSimilarity(opt.merge_similar)
@@ -309,7 +358,7 @@ int main_assemble(int argc, char **argv) {
   ContigStat stat = CalcAndPrintStat(graph);
 
   // output contigs
-  ContigWriter contig_writer(opt.contig_file());
+  ContigWriter contig_writer(opt.contig_file(), !opt.is_final_round);
   ContigWriter standalone_writer(opt.standalone_file());
 
   if (!(opt.is_final_round &&
@@ -327,7 +376,8 @@ int main_assemble(int argc, char **argv) {
 
   // remove local low depth & output as contigs
   if (opt.prune_level >= 1) {
-    ContigWriter addi_contig_writer(opt.addi_contig_file());
+    ContigWriter addi_contig_writer(opt.addi_contig_file(),
+                                    !opt.is_final_round);
 
     timer.reset();
     timer.start();
@@ -355,6 +405,35 @@ int main_assemble(int argc, char **argv) {
                     opt.min_standalone);
     }
 
+  }
+
+  // These are separate linear connected components with constant coverage.
+  // Only initial tip trimming and global low-depth pruning can remove them;
+  // bubbles, weak links and local-depth pruning require graph neighbours.
+  // Their full edge histogram above still participates in depth inference.
+  const double isolated_begin = omp_get_wtime();
+  uint64_t isolated_written = 0;
+#pragma omp parallel for schedule(dynamic, 64) reduction(+ : isolated_written)
+  for (int64_t i = 0; i < static_cast<int64_t>(isolated.seq_count()); ++i) {
+    const auto sequence = isolated.GetSeqView(i);
+    if (opt.max_tip_len > 0 && sequence.length() - dbg.k() <
+                                  static_cast<unsigned>(std::max(2, opt.max_tip_len))) continue;
+    if (opt.cleaning_rounds > 0 && opt.prune_level >= 3 &&
+        isolated_multi[i] < opt.min_depth) continue;
+    if (opt.output_standalone && sequence.length() <
+                                    static_cast<unsigned>(std::max(0, opt.min_standalone))) continue;
+    std::string ascii(sequence.length(), 'A');
+    for (unsigned j = 0; j < sequence.length(); ++j) ascii[j] = "ACGT"[sequence.base_at(j)];
+    auto &writer = opt.output_standalone ? standalone_writer : contig_writer;
+    writer.WriteContig(ascii, dbg.k(), static_cast<int64_t>(graph.size()) + i,
+                       contig_flag::kStandalone, isolated_multi[i]);
+    ++isolated_written;
+  }
+  if (isolated.seq_count()) {
+    contig_writer.Flush();
+    standalone_writer.Flush();
+    xinfo("Restored {} isolated contigs in {.4} s\n", isolated_written,
+          omp_get_wtime() - isolated_begin);
   }
 
   return 0;

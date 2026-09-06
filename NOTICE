@@ -15,3 +15,8 @@ your option) any later version. See LICENSE for the complete license text.
 
 Vendored third-party components retain their own notices and license files,
 including those under third_party/rapidgzip.
+
+Prebuilt Linux packages also contain libnuma from numactl 2.0.19, distributed
+under the GNU Lesser General Public License, version 2.1. Its notices,
+license and unmodified source archive are included under
+share/licenses/libnuma. Upstream: https://github.com/numactl/numactl

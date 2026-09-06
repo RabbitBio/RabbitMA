@@ -48,6 +48,10 @@ class SDBG {
     simple_path_bases_.reset();
     simple_path_edge_count_ = 0;
     simple_path_overflow_count_ = 0;
+    simple_path_snapshot_finalized_ = false;
+    inverse_simple_path_codes_.reset();
+    inverse_simple_path_edge_count_ = 0;
+    inverse_simple_path_overflow_count_ = 0;
     reverse_lookup_samples_.clear();
     reverse_lookup_sample_offsets_.clear();
     reverse_lookup_prefix_bases_ = 0;
@@ -126,9 +130,10 @@ class SDBG {
   // cleaning).  When the caller's memory budget permits, materialize the two
   // 32-bit transforms once and turn those repeated random walks into a single
   // dense load.  The cache is optional and never changes graph state.
-  bool BuildTopologyCache(uint64_t host_mem) {
+  bool BuildTopologyCache(uint64_t host_mem,
+                          uint64_t expected_tip_walk_length = 0u) {
     host_memory_budget_ = host_mem;
-    if (compact_topology_cache_ || (forward_cache_ && backward_cache_) ||
+    if (compact_topology_cache_ || backward_cache_ ||
         compact_backward_ready_) {
       BuildReverseLookupSamples(host_mem);
       return true;
@@ -155,8 +160,55 @@ class SDBG {
     // directory plus compact simple-neighbor blocks below.
     if (!use_compact_cache &&
         std::getenv("MEGAHIT_ENABLE_WIDE_SDBG_TOPOLOGY_CACHE") == nullptr) {
+      // Backward dominates reverse-label lookup and incoming-degree walks.
+      // A one-sided dense table costs half as much as the former wide pair
+      // and turns each transform into one independent 32-bit load.  Select it
+      // solely from the caller's explicit memory budget; shared-node jobs
+      // with a smaller per-job budget naturally keep the compact encoding.
+      // A dense transform pays one four-byte write for every graph row, even
+      // when only a small endpoint frontier will subsequently walk it.  The
+      // compact transform wins on those already-clean later-k graphs.  Select
+      // dense storage only when the graph's own sentinel frontier and the
+      // requested tip-walk length predict enough repeated Backward queries to
+      // amortize that full materialization.  This policy uses algorithmic
+      // dimensions only; it is independent of a named CPU or data set.
+      const uint64_t tip_length =
+          expected_tip_walk_length == 0u
+              ? std::max<uint64_t>(1u, uint64_t{k_} * 2u)
+              : expected_tip_walk_length;
+      const bool dense_query_reuse =
+          TipSentinelCount() != 0u &&
+          (TipSentinelCount() >
+               std::numeric_limits<uint64_t>::max() / tip_length ||
+           TipSentinelCount() * tip_length >= num_edges / 4u);
+      // When the explicit per-job budget can hold both a dense Backward
+      // transform and the equally sized simple-successor table while keeping
+      // their combined footprint below one eighth of that budget, prefer the
+      // reusable dense tier.  The successor table is selected later by
+      // UnitigGraph; reserving for it here prevents this phase from consuming
+      // memory that the cross-phase policy relies on.  Shared-node runs get a
+      // divided per-job budget from the launcher and therefore fall back to
+      // the compact representation automatically.
+      const uint64_t dense_bytes = num_edges * sizeof(uint32_t);
+      const bool dense_reuse_tier =
+          std::getenv("MEGAHIT_DISABLE_DENSE_REUSE_TIER") == nullptr &&
+          host_mem != 0u && dense_bytes <= host_mem / 16u;
+      const bool force_dense =
+          std::getenv("MEGAHIT_FORCE_DENSE_BACKWARD_TOPOLOGY_CACHE") !=
+          nullptr;
+      if ((dense_query_reuse || dense_reuse_tier || force_dense) &&
+          BuildDenseBackwardTopologyCache(host_mem)) {
+        BuildReverseLookupSamples(host_mem);
+        return true;
+      }
+      // Graphs beyond the 28-bit packed-transform range still benefit from
+      // an exact Elias-Fano Backward transform.  Select it from graph size
+      // and the caller's memory budget; no CPU/socket-specific tuning enters
+      // this decision.  It remains independently disableable for diagnostics
+      // and for exceptionally memory-constrained deployments.
+      BuildCompactBackwardTopologyCache(host_mem);
       BuildReverseLookupSamples(host_mem);
-      return !reverse_lookup_samples_.empty();
+      return compact_backward_ready_ || !reverse_lookup_samples_.empty();
     }
     const uint64_t cache_bytes =
         num_edges * (use_compact_cache ? kCompactTopologyBytesPerEdge
@@ -204,80 +256,7 @@ class SDBG {
       // write/read traffic.
       BuildForwardTopologyCacheLinear(num_edges, num_threads);
 
-      // Backward() is symmetric.  Last ranks advance monotonically over the
-      // worker's edge interval, so one select(W,c) cursor per character turns
-      // all remaining lookups into sequential scans of the packed W stream.
-      std::array<uint64_t, kAlphabetSize + 2> w_select_offset{};
-      for (uint8_t c = 0; c <= kAlphabetSize; ++c) {
-        // rank(size - 1) returns the precomputed full-word total.  For c=0
-        // that total also counts zero padding in the final packed word, which
-        // is correct for the generic representation but not for a dense
-        // edge-sized select array.  Compute the exact logical-length total.
-        const uint64_t exact_count =
-            num_edges == 1
-                ? static_cast<uint64_t>(GetW(0) == c)
-                : static_cast<uint64_t>(rs_w_.rank(c, num_edges - 2)) +
-                      static_cast<uint64_t>(GetW(num_edges - 1) == c);
-        w_select_offset[c + 1] =
-            w_select_offset[c] + exact_count;
-      }
-
-#pragma omp parallel num_threads(num_threads)
-      {
-        const uint64_t tid = static_cast<uint64_t>(omp_get_thread_num());
-        const uint64_t team = static_cast<uint64_t>(omp_get_num_threads());
-        const uint64_t begin = num_edges * tid / team;
-        const uint64_t end = num_edges * (tid + 1) / team;
-        int64_t last_rank =
-            begin == 0 ? 0 : rs_last_.rank(static_cast<int64_t>(begin - 1));
-        const int64_t kUninitializedRank =
-            std::numeric_limits<int64_t>::min();
-        std::array<int64_t, kAlphabetSize + 1> cursor_rank;
-        cursor_rank.fill(kUninitializedRank);
-        std::array<uint64_t, kAlphabetSize + 1> cursor_edge{};
-
-        auto select_w = [&](uint8_t c, int64_t target_rank) -> uint64_t {
-          const uint64_t char_count =
-              w_select_offset[c + 1] - w_select_offset[c];
-          (void)char_count;
-          assert(target_rank >= 0 &&
-                 static_cast<uint64_t>(target_rank) < char_count);
-          if (cursor_rank[c] == kUninitializedRank) {
-            cursor_edge[c] = rs_w_.select(c, target_rank);
-            cursor_rank[c] = target_rank;
-            return cursor_edge[c];
-          }
-          assert(target_rank >= cursor_rank[c]);
-          while (cursor_rank[c] < target_rank) {
-            do {
-              ++cursor_edge[c];
-            } while (cursor_edge[c] < num_edges &&
-                     GetW(cursor_edge[c]) != c);
-            assert(cursor_edge[c] < num_edges);
-            ++cursor_rank[c];
-          }
-          return cursor_edge[c];
-        };
-
-        for (uint64_t edge_id = begin; edge_id < end; ++edge_id) {
-          const uint8_t c = LastCharOf(edge_id);
-          const int64_t select_rank = last_rank - rank_f_[c];
-          const uint64_t char_count =
-              w_select_offset[c + 1] - w_select_offset[c];
-          uint64_t backward;
-          if (select_rank >= 0 &&
-              static_cast<uint64_t>(select_rank) < char_count) {
-            backward = select_w(c, select_rank);
-          } else if (select_rank >= 0 &&
-                     static_cast<uint64_t>(select_rank) == char_count) {
-            backward = num_edges;
-          } else {
-            backward = kNullID;
-          }
-          SetCachedBackward(edge_id, backward);
-          last_rank += IsLast(edge_id);
-        }
-      }
+      BuildBackwardTopologyCacheLinear(num_edges, num_threads);
     } else {
 #pragma omp parallel for schedule(static)
       for (uint64_t edge_id = 0; edge_id < num_edges; ++edge_id) {
@@ -302,10 +281,17 @@ class SDBG {
     if (forward_cache_) {
       return size() * 2 * sizeof(uint32_t) + lookup_bytes;
     }
+    if (backward_cache_) {
+      return size() * sizeof(uint32_t) + lookup_bytes;
+    }
     return CompactBackwardTopologyBytes() + lookup_bytes;
   }
 
   uint64_t HostMemoryBudget() const { return host_memory_budget_; }
+
+  bool HasDenseBackwardTopologyCache() const {
+    return backward_cache_ != nullptr;
+  }
 
   // Keep the simple-path topology in the same compact representation used by
   // UnitigGraph.  Initial SDBG tip walking and later unitig construction both
@@ -332,6 +318,50 @@ class SDBG {
   bool HasSimplePathSnapshot() const {
     return simple_path_codes_ && simple_path_bases_ &&
            simple_path_edge_count_ == size();
+  }
+
+  bool HasInverseSimplePathSnapshot() const {
+    return inverse_simple_path_codes_ &&
+           inverse_simple_path_edge_count_ == size();
+  }
+
+  uint64_t InverseSimplePathSnapshotBytes() const {
+    return HasInverseSimplePathSnapshot() ? inverse_simple_path_edge_count_
+                                          : 0u;
+  }
+
+  uint64_t InverseSimplePathSnapshotOverflowCount() const {
+    return inverse_simple_path_overflow_count_;
+  }
+
+  // Rewrite one entry after SDBG pruning has finished.  The per-block bases
+  // remain immutable, so workers can update disjoint code bytes in parallel.
+  // A newly exposed link that does not fit the old base is represented by the
+  // exact live-topology fallback (255) instead of changing the encoding.
+  bool RewriteFinalSimplePathSnapshotEdge(uint64_t edge, uint64_t next) {
+    assert(HasSimplePathSnapshot() && edge < simple_path_edge_count_);
+    if (next == kNullID) {
+      simple_path_codes_[edge] = 0u;
+      return false;
+    }
+    uint8_t c = GetW(edge);
+    if (c > kAlphabetSize) c -= kAlphabetSize;
+    const uint32_t base = simple_path_bases_[
+        (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c];
+    if (base != std::numeric_limits<uint32_t>::max() && next >= base &&
+        next - base < 254u) {
+      simple_path_codes_[edge] =
+          static_cast<uint8_t>(next - base + 1u);
+      return false;
+    }
+    simple_path_codes_[edge] = 255u;
+    return true;
+  }
+
+  void FinishFinalSimplePathSnapshot(uint64_t overflow_count) {
+    assert(HasSimplePathSnapshot());
+    simple_path_overflow_count_ = overflow_count;
+    simple_path_snapshot_finalized_ = true;
   }
 
   bool BuildSimplePathSnapshot(uint64_t host_mem) {
@@ -364,6 +394,14 @@ class SDBG {
       return false;
     }
 
+    // A fresh forward snapshot always describes the pre-pruning graph.  Clear
+    // any optional state from an earlier snapshot before publishing the new
+    // one, even if a future caller rebuilds without reloading the SDBG object.
+    simple_path_snapshot_finalized_ = false;
+    inverse_simple_path_codes_.reset();
+    inverse_simple_path_edge_count_ = 0u;
+    inverse_simple_path_overflow_count_ = 0u;
+
     std::unique_ptr<uint8_t[]> codes;
     std::unique_ptr<uint32_t[]> bases;
     try {
@@ -373,8 +411,29 @@ class SDBG {
       return false;
     }
 
+    std::unique_ptr<uint8_t[]> inverse_codes;
+    const bool inverse_requested =
+        std::getenv("MEGAHIT_DISABLE_INVERSE_SIMPLE_SNAPSHOT") == nullptr;
+    const bool inverse_within_budget =
+        host_mem == 0 ||
+        (bytes <= host_mem / 4u && num_edges <= host_mem / 4u - bytes);
+    if (inverse_requested && inverse_within_budget) {
+      try {
+        inverse_codes.reset(new uint8_t[num_edges]);
+      } catch (const std::bad_alloc &) {
+        inverse_codes.reset();
+      }
+    }
+    if (inverse_codes) {
+#pragma omp parallel for schedule(static)
+      for (uint64_t edge = 0; edge < num_edges; ++edge) {
+        inverse_codes[edge] = 0u;
+      }
+    }
+
     uint64_t overflow_count = 0;
-#pragma omp parallel reduction(+ : overflow_count)
+    uint64_t inverse_overflow_count = 0;
+#pragma omp parallel reduction(+ : overflow_count, inverse_overflow_count)
     {
       std::array<uint32_t, kSimplePathBlockEdges> local_next;
 #pragma omp for schedule(static)
@@ -394,6 +453,17 @@ class SDBG {
             const uint64_t next = NextSimplePathEdge(edge);
             if (next != kNullID) {
               next_id = static_cast<uint32_t>(next);
+              if (inverse_codes) {
+                const uint64_t first_incoming = Backward(next);
+                if (first_incoming <= edge &&
+                    edge - first_incoming < 254u) {
+                  inverse_codes[next] =
+                      static_cast<uint8_t>(edge - first_incoming + 1u);
+                } else {
+                  inverse_codes[next] = 255u;
+                  ++inverse_overflow_count;
+                }
+              }
               uint8_t c = GetW(edge);
               if (c > kAlphabetSize) c -= kAlphabetSize;
               block_bases[c] = std::min(block_bases[c], next_id);
@@ -425,6 +495,11 @@ class SDBG {
     simple_path_bases_ = std::move(bases);
     simple_path_edge_count_ = num_edges;
     simple_path_overflow_count_ = overflow_count;
+    if (inverse_codes) {
+      inverse_simple_path_codes_ = std::move(inverse_codes);
+      inverse_simple_path_edge_count_ = num_edges;
+      inverse_simple_path_overflow_count_ = inverse_overflow_count;
+    }
     return true;
   }
 
@@ -450,7 +525,50 @@ class SDBG {
     return true;
   }
 
+  // A simple predecessor is one of the few consecutive BOSS rows beginning
+  // at Backward(edge).  Store that topology-local offset instead of an
+  // absolute edge ID; deleted or newly exposed links retain the exact live
+  // fallback at the caller.
+  bool TryCachedPrevSimplePathEdge(uint64_t edge, uint64_t *prev) const {
+    if (!HasInverseSimplePathSnapshot() ||
+        edge >= inverse_simple_path_edge_count_ || !IsValidEdge(edge)) {
+      return false;
+    }
+    const uint8_t code = inverse_simple_path_codes_[edge];
+    if (code == 0u || code == 255u) return false;
+    const uint64_t first_incoming = Backward(edge);
+    const uint64_t cached = first_incoming + static_cast<uint64_t>(code - 1u);
+    if (cached >= inverse_simple_path_edge_count_ || !IsValidEdge(cached)) {
+      return false;
+    }
+    *prev = cached;
+    return true;
+  }
+
+  void ReleaseInverseSimplePathSnapshot() {
+    inverse_simple_path_codes_.reset();
+    inverse_simple_path_edge_count_ = 0u;
+    inverse_simple_path_overflow_count_ = 0u;
+  }
+
   uint64_t CachedOrLiveNextSimplePathEdge(uint64_t edge) const {
+    if (simple_path_snapshot_finalized_ && HasSimplePathSnapshot() &&
+        edge < simple_path_edge_count_) {
+      const uint8_t code = simple_path_codes_[edge];
+      if (code == 0u) return kNullID;
+      if (code != 255u) {
+        uint8_t c = GetW(edge);
+        if (c > kAlphabetSize) c -= kAlphabetSize;
+        const uint32_t base = simple_path_bases_[
+            (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c];
+        assert(base != std::numeric_limits<uint32_t>::max());
+        const uint64_t cached =
+            static_cast<uint64_t>(base) + static_cast<uint64_t>(code - 1u);
+        assert(cached < simple_path_edge_count_ && IsValidEdge(cached));
+        return cached;
+      }
+      return NextSimplePathEdge(edge);
+    }
     uint64_t next = kNullID;
     return TryCachedNextSimplePathEdge(edge, &next)
                ? next
@@ -1385,9 +1503,128 @@ class SDBG {
   static const uint32_t kCompactTopologyNull = (uint32_t{1} << 28u) - 1u;
   static const uint64_t kCompactTopologyBytesPerEdge = 7;
   static const uint32_t kCompactBackwardBlockSize = 512;
+  // Store the exact unary-bit position of every 64th value after the first
+  // one.  CompactCachedBackward can then begin select() at the nearest
+  // sample instead of rescanning the block-local bitmap from word zero.
+  // Seven 16-bit samples add at most 0.031 bytes per edge after structure
+  // alignment.  An unusually sparse block whose position does not fit falls
+  // back to scanning from bit zero, so this remains an exact encoding for
+  // every graph rather than relying on a dataset-specific gap bound.
+  static const uint32_t kCompactBackwardSelectSampleStride = 64;
+  static const uint16_t kCompactBackwardSelectSampleOverflow =
+      std::numeric_limits<uint16_t>::max();
   static const uint64_t kReverseLookupSampleStride = 128;
   static const unsigned kMaxReverseLookupKeyBases =
       sizeof(uint32_t) * 8u / kBitsPerChar;
+
+  void BuildBackwardTopologyCacheLinear(uint64_t num_edges,
+                                        int num_threads) {
+    // Backward() is monotone inside each first-character interval.  Last
+    // ranks also advance monotonically over a worker's static edge range, so
+    // one select(W,c) cursor per character turns the dense fill into
+    // sequential scans of the packed W stream.
+    std::array<uint64_t, kAlphabetSize + 2> w_select_offset{};
+    for (uint8_t c = 0; c <= kAlphabetSize; ++c) {
+      // rank(size - 1) includes zero padding in the final packed word for
+      // c=0.  Dense entries describe only logical edges, so compute the exact
+      // count explicitly.
+      const uint64_t exact_count =
+          num_edges == 1
+              ? static_cast<uint64_t>(GetW(0) == c)
+              : static_cast<uint64_t>(rs_w_.rank(c, num_edges - 2)) +
+                    static_cast<uint64_t>(GetW(num_edges - 1) == c);
+      w_select_offset[c + 1] = w_select_offset[c] + exact_count;
+    }
+
+#pragma omp parallel num_threads(num_threads)
+    {
+      const uint64_t tid = static_cast<uint64_t>(omp_get_thread_num());
+      const uint64_t team = static_cast<uint64_t>(omp_get_num_threads());
+      const uint64_t begin = num_edges * tid / team;
+      const uint64_t end = num_edges * (tid + 1) / team;
+      int64_t last_rank =
+          begin == 0 ? 0 : rs_last_.rank(static_cast<int64_t>(begin - 1));
+      const int64_t kUninitializedRank =
+          std::numeric_limits<int64_t>::min();
+      std::array<int64_t, kAlphabetSize + 1> cursor_rank;
+      cursor_rank.fill(kUninitializedRank);
+      std::array<uint64_t, kAlphabetSize + 1> cursor_edge{};
+
+      auto select_w = [&](uint8_t c, int64_t target_rank) -> uint64_t {
+        const uint64_t char_count =
+            w_select_offset[c + 1] - w_select_offset[c];
+        (void)char_count;
+        assert(target_rank >= 0 &&
+               static_cast<uint64_t>(target_rank) < char_count);
+        if (cursor_rank[c] == kUninitializedRank) {
+          cursor_edge[c] = rs_w_.select(c, target_rank);
+          cursor_rank[c] = target_rank;
+          return cursor_edge[c];
+        }
+        assert(target_rank >= cursor_rank[c]);
+        while (cursor_rank[c] < target_rank) {
+          do {
+            ++cursor_edge[c];
+          } while (cursor_edge[c] < num_edges &&
+                   GetW(cursor_edge[c]) != c);
+          assert(cursor_edge[c] < num_edges);
+          ++cursor_rank[c];
+        }
+        return cursor_edge[c];
+      };
+
+      for (uint64_t edge_id = begin; edge_id < end; ++edge_id) {
+        const uint8_t c = LastCharOf(edge_id);
+        const int64_t select_rank = last_rank - rank_f_[c];
+        const uint64_t char_count =
+            w_select_offset[c + 1] - w_select_offset[c];
+        uint64_t backward;
+        if (select_rank >= 0 &&
+            static_cast<uint64_t>(select_rank) < char_count) {
+          backward = select_w(c, select_rank);
+        } else if (select_rank >= 0 &&
+                   static_cast<uint64_t>(select_rank) == char_count) {
+          backward = num_edges;
+        } else {
+          backward = kNullID;
+        }
+        SetCachedBackward(edge_id, backward);
+        last_rank += IsLast(edge_id);
+      }
+    }
+  }
+
+  bool BuildDenseBackwardTopologyCache(uint64_t host_mem) {
+    if (backward_cache_) return true;
+    const uint64_t num_edges = size();
+    if (num_edges == 0u ||
+        num_edges >= static_cast<uint64_t>(
+                         std::numeric_limits<uint32_t>::max()) ||
+        host_mem == 0u ||
+        num_edges > std::numeric_limits<uint64_t>::max() /
+                        sizeof(uint32_t) ||
+        num_edges * sizeof(uint32_t) > host_mem / 8u ||
+        std::getenv("MEGAHIT_DISABLE_DENSE_BACKWARD_TOPOLOGY_CACHE") !=
+            nullptr) {
+      return false;
+    }
+    try {
+      backward_cache_.reset(new uint32_t[num_edges]);
+    } catch (const std::bad_alloc &) {
+      backward_cache_.reset();
+      return false;
+    }
+
+    if (std::getenv("MEGAHIT_DISABLE_LINEAR_TOPOLOGY_BUILD") == nullptr) {
+      BuildBackwardTopologyCacheLinear(num_edges, omp_get_max_threads());
+    } else {
+#pragma omp parallel for schedule(static)
+      for (uint64_t edge_id = 0; edge_id < num_edges; ++edge_id) {
+        SetCachedBackward(edge_id, BackwardUncached(edge_id));
+      }
+    }
+    return true;
+  }
 
   void BuildForwardTopologyCacheLinear(uint64_t num_edges, int num_threads) {
 #pragma omp parallel num_threads(num_threads)
@@ -1477,6 +1714,11 @@ class SDBG {
     uint32_t base_high{0};
     uint32_t high_word_offset{0};
     uint32_t low_word_offset{0};
+    std::array<uint16_t,
+               kCompactBackwardBlockSize /
+                       kCompactBackwardSelectSampleStride -
+                   1u>
+        select_samples{};
   };
 
   uint64_t CompactBackwardTopologyBytes() const {
@@ -1500,12 +1742,16 @@ class SDBG {
       return true;
     }
     const uint64_t num_edges = size();
+    const bool explicitly_enabled =
+        std::getenv("MEGAHIT_ENABLE_COMPACT_BACKWARD_TOPOLOGY_CACHE") !=
+        nullptr;
     if (num_edges == 0 ||
         num_edges >= static_cast<uint64_t>(
                          std::numeric_limits<uint32_t>::max()) ||
         host_mem == 0 ||
-        std::getenv("MEGAHIT_ENABLE_COMPACT_BACKWARD_TOPOLOGY_CACHE") ==
-            nullptr) {
+        (std::getenv("MEGAHIT_DISABLE_COMPACT_BACKWARD_TOPOLOGY_CACHE") !=
+             nullptr &&
+         !explicitly_enabled)) {
       return false;
     }
 
@@ -1594,6 +1840,7 @@ class SDBG {
       assert(base_high <= std::numeric_limits<uint32_t>::max());
       CompactBackwardBlock &block = compact_backward_blocks_[block_id];
       block.base_high = static_cast<uint32_t>(base_high);
+      block.select_samples.fill(kCompactBackwardSelectSampleOverflow);
       // Temporarily hold word counts; the serial prefix sum below replaces
       // them with final offsets.
       block.high_word_offset = static_cast<uint32_t>(
@@ -1622,10 +1869,11 @@ class SDBG {
         compact_backward_blocks_.size() *
             sizeof(compact_backward_blocks_[0]) +
         (high_words + low_words) * sizeof(uint64_t);
-    // Unlike the wide two-direction cache, this representation is useful
-    // under a bounded-memory run.  Still retain three quarters of the caller's
-    // budget for the SDBG, unitigs and output structures.
-    if (cache_bytes > host_mem / 4u) {
+    // Use the same one-eighth optional-transform budget as the wide cache.
+    // This leaves room for the compact simple-path snapshot and downstream
+    // unitig structures; --host_mem is already a per-job budget in shared-node
+    // mode.
+    if (cache_bytes > host_mem / 8u) {
       compact_backward_blocks_.clear();
       return false;
     }
@@ -1653,7 +1901,7 @@ class SDBG {
           group.valid_begin + local_block * kCompactBackwardBlockSize;
       const uint64_t edge_end = std::min<uint64_t>(
           group.edge_end, edge_begin + kCompactBackwardBlockSize);
-      const CompactBackwardBlock &block = compact_backward_blocks_[block_id];
+      CompactBackwardBlock &block = compact_backward_blocks_[block_id];
       const uint32_t next_high_offset =
           block_id + 1u < total_blocks
               ? compact_backward_blocks_[block_id + 1u].high_word_offset
@@ -1688,6 +1936,16 @@ class SDBG {
         const uint64_t high_position =
             (value >> low_bits) - block.base_high + i;
         high[high_position >> 6u] |= uint64_t{1} << (high_position & 63u);
+        if (i != 0 &&
+            i % kCompactBackwardSelectSampleStride == 0) {
+          const uint64_t sample_index =
+              i / kCompactBackwardSelectSampleStride - 1u;
+          assert(sample_index < block.select_samples.size());
+          block.select_samples[sample_index] =
+              high_position < kCompactBackwardSelectSampleOverflow
+                  ? static_cast<uint16_t>(high_position)
+                  : kCompactBackwardSelectSampleOverflow;
+        }
         if (low_bits != 0) {
           const uint64_t bit_position = i * low_bits;
           const uint64_t low_value = value & low_mask;
@@ -1734,9 +1992,22 @@ class SDBG {
 
     const uint64_t *high =
         compact_backward_high_.get() + block.high_word_offset;
-    uint32_t remaining = in_block;
-    uint64_t high_word_index = 0;
-    uint64_t word = high[0];
+    const uint32_t sample =
+        in_block / kCompactBackwardSelectSampleStride;
+    const uint16_t encoded_sample =
+        sample == 0 ? 0 : block.select_samples[sample - 1u];
+    const bool sampled =
+        encoded_sample != kCompactBackwardSelectSampleOverflow;
+    const uint64_t sampled_high_position = sampled ? encoded_sample : 0;
+    uint32_t remaining = sampled
+                             ? in_block -
+                                   sample * kCompactBackwardSelectSampleStride
+                             : in_block;
+    uint64_t high_word_index = sampled_high_position >> 6u;
+    const unsigned sampled_bit =
+        static_cast<unsigned>(sampled_high_position & 63u);
+    uint64_t word =
+        high[high_word_index] & (~uint64_t{0} << sampled_bit);
     for (;;) {
       const uint32_t ones = static_cast<uint32_t>(__builtin_popcountll(word));
       if (remaining < ones) {
@@ -1745,9 +2016,11 @@ class SDBG {
       remaining -= ones;
       word = high[++high_word_index];
     }
-    while (remaining-- != 0u) {
-      word &= word - 1u;
-    }
+#if defined(__BMI2__) && defined(USE_BMI2)
+    word = _pdep_u64(uint64_t{1} << remaining, word);
+#else
+    while (remaining-- != 0u) word &= word - 1u;
+#endif
     const uint64_t selected_high_position =
         high_word_index * 64u + static_cast<uint64_t>(__builtin_ctzll(word));
     const uint64_t high_value =
@@ -1824,8 +2097,10 @@ class SDBG {
     const uint64_t transform_bytes =
         compact_topology_cache_
             ? size() * kCompactTopologyBytesPerEdge
-            : (forward_cache_ ? size() * 2u * sizeof(uint32_t)
-                              : CompactBackwardTopologyBytes());
+            : (forward_cache_
+                   ? size() * 2u * sizeof(uint32_t)
+                   : (backward_cache_ ? size() * sizeof(uint32_t)
+                                      : CompactBackwardTopologyBytes()));
     if (host_mem != 0) {
       if (transform_bytes > host_mem / 8u ||
           sample_bytes > host_mem / 8u - transform_bytes) {
@@ -2023,6 +2298,10 @@ class SDBG {
   std::unique_ptr<uint32_t[]> simple_path_bases_;
   uint64_t simple_path_edge_count_{0};
   uint64_t simple_path_overflow_count_{0};
+  bool simple_path_snapshot_finalized_{false};
+  std::unique_ptr<uint8_t[]> inverse_simple_path_codes_;
+  uint64_t inverse_simple_path_edge_count_{0};
+  uint64_t inverse_simple_path_overflow_count_{0};
   std::vector<uint32_t> reverse_lookup_samples_;
   std::vector<uint64_t> reverse_lookup_sample_offsets_;
   unsigned reverse_lookup_prefix_bases_{0};

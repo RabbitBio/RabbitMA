@@ -27,16 +27,23 @@ to change their command lines.
 - Cached graph topology, parallel unitig traversal, and compact unitig
   adjacency and endpoint lookup.
 - Sharded local-assembly mapping and iterative flank indexes.
+- A reusable exact read-occurrence index across k iterations, with the first
+  iterative join fused into index construction and full-scan fallback when
+  the index cannot be used.
+- Packed intermediate contigs and reusable read-position information to
+  reduce repeated decoding and temporary I/O.
 - Runtime CPU and NUMA discovery without fixed socket, core-count, or
   CAMI-specific thresholds.
+- Automatic NUMA placement for concurrent jobs from the same Linux user,
+  with physical-core reservations and local-preferred memory.
 
 ## Installation
 
 ### Prebuilt Linux package (recommended)
 
 The quickest way to use RabbitMA is to download the prebuilt
-`RabbitMA-v0.1.0-linux-x86_64.tar.gz` package from the
-[v0.1.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.1.0).
+`RabbitMA-v0.2.0-linux-x86_64.tar.gz` package from the
+[v0.2.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.2.0).
 It requires Linux x86_64 with glibc 2.17 or newer, Python 3.6 or newer, gzip,
 and bzip2;
 CMake and a compiler are not needed. The package exposes `megahit` as its only
@@ -44,20 +51,21 @@ public command and includes the internal CPU core variants, test data, and
 required non-glibc runtime libraries.
 
 ```bash
-wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.1.0/RabbitMA-v0.1.0-linux-x86_64.tar.gz
-tar -xzf RabbitMA-v0.1.0-linux-x86_64.tar.gz
-cd RabbitMA-v0.1.0-linux-x86_64
+wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.2.0/RabbitMA-v0.2.0-linux-x86_64.tar.gz
+tar -xzf RabbitMA-v0.2.0-linux-x86_64.tar.gz
+cd RabbitMA-v0.2.0-linux-x86_64
 ./megahit --test -t 4
 ```
 
 The package includes BMI2/POPCNT, POPCNT-only, and portable core binaries. The
 Python driver selects a supported variant at run time.
 
-The v0.1.0 prebuilt launcher predates automatic cgroup memory detection. When
-running that package inside Docker, Kubernetes, or a scheduler job with a hard
-memory limit, pass the job limit explicitly with `-m`. The current source tree
-detects cgroup v1/v2 limits automatically; this fix will be included in the
-next binary release.
+The binary package retains the CentOS 7 / glibc 2.17 baseline and includes
+`libnuma` for automatic NUMA placement. There is no need to upgrade glibc or
+set `LD_LIBRARY_PATH`. Python 3.6 or newer must be available as `python3`;
+CentOS 7's default Python 2 alone is insufficient. The v0.2.0 launcher also
+detects cgroup v1/v2 memory limits automatically, including inside containers
+and scheduler jobs.
 
 ### Build from source
 
@@ -114,7 +122,125 @@ Interleaved and single-end inputs remain compatible with MEGAHIT:
 Run `./megahit --help` for the complete option list. Final contigs are written
 to `OUT_DIR/final.contigs.fa`.
 
+### Automatic NUMA placement
+
+RabbitMA v0.2.0 automatically coordinates concurrent jobs from the same
+Linux user when each job specifies `-t` and fits within one available NUMA
+domain. No extra `numactl` command or NUMA option is needed. This behavior is
+included in both the source and the v0.2.0 binary package. Upgrade older
+binary packages to use it.
+
+For example, on a machine with **72 available physical cores, split into two
+NUMA domains of 36 cores each**, launch two jobs with separate output paths:
+
+```bash
+./megahit --12 sample_A.fq.gz -t 36 -o sample_A.out &
+./megahit --12 sample_B.fq.gz -t 36 -o sample_B.out &
+wait
+```
+
+With both domains available, one job reserves the first domain and the other
+reserves the second. Both may also read the same input file. Keep
+`--jobs-per-node` at its default of 1 for this mode: each job owns a separate
+NUMA resource domain. The log records `Automatic NUMA placement: node ...`
+with the reserved physical-core count and CPU IDs.
+
+Reservations use host-local locks shared by participating launchers under the
+same user account and `/dev/shm` mount. Simultaneous starts are coordinated,
+and child processes retain the reservation until they exit. The launcher
+respects inherited CPU and memory allowances and keeps SMT siblings in the
+same reservation. **72 logical CPUs are not necessarily 72 physical cores.**
+If the scheduler grants only 18 physical cores on each domain, a 36-thread
+job cannot be moved onto 36 cores of one domain.
+
+Automatic placement uses local-preferred memory, allowing remote allocation
+when local memory is exhausted. Fractional `-m` budgets are based on the
+reserved physical-core share of the NUMA domain's capacity, bounded by the
+cgroup memory limit. This is a placement preference and budget, not a hard
+reservation of RAM or isolation from unrelated programs.
+
+If no single-domain reservation fits, `libnuma` or memory-policy permission
+is unavailable, or explicit CPU/memory settings take precedence, the job keeps
+its inherited placement and reports the reason when available. An omitted
+`-t` retains the usual all-visible-CPU default. `--jobs-per-node` greater than
+1 selects the explicit sharing policy below and disables automatic placement.
+Use `--numa-node off` (or `MEGAHIT_DISABLE_AUTO_NUMA=1`) to disable the default
+coordination. Explicit CPU IDs in `OMP_PLACES`, `GOMP_CPU_AFFINITY`,
+`KMP_AFFINITY`, `OMP_PROC_BIND=false`, and inherited non-default memory policies
+are respected.
+
+### Explicit NUMA-local jobs
+
+To select a specific NUMA domain and require strict local-memory allocation:
+
+```bash
+./megahit --12 sample.fq.gz --numa-node 0 -t 32 -o sample.out
+```
+
+`--numa-node` intersects that node with the CPU and memory masks granted by the
+scheduler, binds the launcher and every worker to the resulting CPUs, and
+installs a strict local-memory policy before each core process allocates its
+working data. This explicit Linux mode requires the `libnuma` runtime,
+which is included in the prebuilt package and must be installed separately
+when building from source. If `-t` is omitted, RabbitMA uses the discovered
+physical-core count rather than silently enabling SMT. A fractional `-m` is
+computed from the selected NUMA node's capacity and the cgroup limit, not from
+the whole machine. An unavailable or disallowed node is an error.
+
+Explicit `--numa-node N` bypasses automatic reservations, so assign different
+node IDs to different jobs or let the scheduler separate them. Keep
+`--jobs-per-node 1` when each job owns its selected NUMA domain. Strict binding
+means the job can run out of memory even while another NUMA node has free RAM;
+use it when the job's peak working set fits in the selected domain.
+
+When a scheduler has already restricted each task's CPU mask to exactly one
+NUMA domain, `--numa-node auto` discovers that sole domain and applies strict
+binding. This explicit option fails if the task can still see zero or multiple
+domains. Omitting `--numa-node` uses the automatic coordination described above.
+
+### Several jobs on one node
+
+When several RabbitMA processes really share the same last-level caches and
+node memory allocation, tell every process how many jobs are co-located:
+
+```bash
+./megahit --12 sample.fq.gz -t 16 --jobs-per-node 4 -o sample.out
+```
+
+This does not silently change `-t`. It gives each job an equal share of the
+`-m` memory budget and lets bounded-workset kernels size their active data from
+the CPU affinity, discovered cache topology, operating-system page size, and
+the explicit sharing count. For unequal inputs, an exact byte cap can override
+the equal memory split with `--memory-budget-per-job BYTES`.
+
+Leave `--jobs-per-node` at 1 when the scheduler already gives each process an
+isolated CPU/cache allocation and a per-job memory cgroup. A cpuset alone is
+not memory isolation: jobs pinned to disjoint cores can still share LLC or
+DRAM bandwidth. For paid clusters, choose `jobs × threads` by measuring
+completed samples per node-hour; the fastest isolated `-t` is not necessarily
+the most cost-efficient concurrent configuration.
+
 ## Compatibility and validation
+
+The current source includes the computational optimizations validated in the
+full CAMI3 development runs, together with automatic NUMA placement. Default
+adaptive optimizations use the existing command-line interface. Additional
+`MEGAHIT_EXPERIMENTAL_*` paths remain opt-in; their enabled benchmark timings
+are not a claim about default performance on every input or machine. The
+per-NUMA SDBG replica prototype that failed to show a useful gain is excluded.
+
+For source regression tests, use Python 3.8 or newer after building:
+
+```bash
+python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+cmake --build build --target check_stream_stores check_local_minimizer_gate
+```
+
+`MEGAHIT_TEST_CORE=/path/to/megahit_core_popcnt` (or the portable variant)
+selects another core for the same regression suite. These developer tests
+cover complete sequence orientation and metadata, exact counting, compressed
+input boundaries, local mapping, index build/replay, and graph reuse. The
+application launcher itself continues to support Python 3.6 or newer.
 
 RabbitMA is intended to preserve MEGAHIT v1.2.9 assembly semantics. Structured
 simulations cover unique sequence, strain bubbles, repeats, uneven/error-prone

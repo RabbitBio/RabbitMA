@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <memory>
 #include <vector>
 #include <istream>
 #include <ostream>
@@ -43,7 +44,9 @@ class ContigInfo {
     out_edges_ = contig_info.out_edges_;
     kmer_count_ = contig_info.kmer_count_;
     kmer_size_ = contig_info.kmer_size_;
-    counts_ = contig_info.counts_;
+    if (contig_info.counts_) {
+      counts_.reset(new SequenceCount(*contig_info.counts_));
+    }
   }
 
   const ContigInfo &operator=(const ContigInfo &contig_info) {
@@ -51,13 +54,18 @@ class ContigInfo {
     out_edges_ = contig_info.out_edges_;
     kmer_count_ = contig_info.kmer_count_;
     kmer_size_ = contig_info.kmer_size_;
-    counts_ = contig_info.counts_;
+    if (contig_info.counts_) {
+      if (!counts_) counts_.reset(new SequenceCount());
+      *counts_ = *contig_info.counts_;
+    } else {
+      counts_.reset();
+    }
     return *this;
   }
 
   const ContigInfo &ReverseComplement() {
     std::swap(in_edges_, out_edges_);
-    std::reverse(counts_.begin(), counts_.end());
+    if (counts_) std::reverse(counts_->begin(), counts_->end());
     return *this;
   }
 
@@ -73,8 +81,17 @@ class ContigInfo {
   uint32_t kmer_count() const { return kmer_count_; }
   void set_kmer_count(uint32_t kmer_count) { kmer_count_ = kmer_count; }
 
-  const SequenceCount &counts() const { return counts_; }
-  void set_counts(const SequenceCount &counts) { counts_ = counts; }
+  const SequenceCount &counts() const {
+    static const SequenceCount empty;
+    return counts_ ? *counts_ : empty;
+  }
+  void set_counts(const SequenceCount &counts) {
+    if (counts.empty()) {
+      counts_.reset();
+    } else {
+      mutable_counts() = counts;
+    }
+  }
 
   void swap(ContigInfo &contig_info) {
     if (this != &contig_info) {
@@ -91,7 +108,7 @@ class ContigInfo {
     out_edges_ = 0;
     kmer_size_ = 0;
     kmer_count_ = 0;
-    counts_.clear();
+    if (counts_) counts_->clear();
   }
 
  private:
@@ -99,7 +116,16 @@ class ContigInfo {
   BitEdges out_edges_;
   uint16_t kmer_size_;
   uint32_t kmer_count_;
-  SequenceCount counts_;
+  SequenceCount &mutable_counts() {
+    if (!counts_) counts_.reset(new SequenceCount());
+    return *counts_;
+  }
+
+  // Local assembly deliberately carries only aggregate coverage.  Keeping
+  // the unused vector object inline cost 24 bytes in every transient unitig;
+  // allocate it only for legacy callers that actually materialize per-k-mer
+  // counts.
+  std::unique_ptr<SequenceCount> counts_;
 };
 
 namespace std {

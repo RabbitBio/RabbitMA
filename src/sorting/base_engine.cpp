@@ -95,8 +95,12 @@ static std::pair<int64_t, int64_t> AdjustItemNumbers(int64_t mem_avail,
 
   while (num_lv1_items < num_lv2_items || num_lv1_items < min_lv1_items ||
          num_lv2_items < min_lv2_items) {
-    num_lv2_items = std::max(static_cast<int64_t>(lround(num_lv2_items * 0.95)),
-                             min_lv2_items);
+    // For fewer than 11 items, rounding a 5% reduction can return the same
+    // integer forever. Carrying isolated paths can leave such tiny buckets.
+    num_lv2_items = std::max(
+        std::min(num_lv2_items - 1,
+                 static_cast<int64_t>(lround(num_lv2_items * 0.95))),
+        min_lv2_items);
     num_lv1_items = (mem_avail - bytes_per_lv2_item * num_lv2_items) /
                     bytes_per_lv1_item;
     if (num_lv2_items == min_lv2_items && num_lv1_items < min_lv1_items) {

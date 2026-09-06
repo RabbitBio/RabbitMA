@@ -51,6 +51,19 @@ for core in megahit_core megahit_core_popcnt megahit_core_no_hw_accel; do
   fi
 done
 
+run_clean python3 - "$package_dir" <<'PY'
+import os
+import runpy
+import sys
+
+root = sys.argv[1]
+driver = runpy.run_path(os.path.join(root, 'megahit'))
+library = driver['load_numa_library']()
+assert os.path.samefile(library._name, os.path.join(root, 'lib/libnuma.so.1'))
+assert library.get_mempolicy and library.set_mempolicy
+print('runtime test: bundled libnuma loaded through the relocated entry point')
+PY
+
 run_clean "$package_dir/megahit" --version | tee "$work_dir/version.log"
 grep -Eq '^RabbitMA [0-9]+\.[0-9]+\.[0-9]+ \(MEGAHIT core v1\.2\.9\)$' \
   "$work_dir/version.log"

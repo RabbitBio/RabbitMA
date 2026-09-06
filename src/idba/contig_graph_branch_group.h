@@ -20,14 +20,28 @@
  */
 class ContigGraphBranchGroup {
  public:
+  ContigGraphBranchGroup()
+      : contig_graph_(nullptr),
+        max_branches_(0),
+        max_length_(0),
+        active_branches_(0) {}
+
   ContigGraphBranchGroup(ContigGraph *graph, ContigGraphVertexAdaptor begin,
-                         int max_branches = 2, int max_length = 0) {
+                         int max_branches = 2, int max_length = 0)
+      : active_branches_(0) {
+    Reset(graph, begin, max_branches, max_length);
+  }
+
+  void Reset(ContigGraph *graph, ContigGraphVertexAdaptor begin,
+             int max_branches = 2, int max_length = 0) {
     contig_graph_ = graph;
     begin_ = begin;
     max_branches_ = max_branches;
     max_length_ = max_length;
-
     if (max_length_ == 0) max_length_ = 2 * contig_graph_->kmer_size() + 2;
+    for (ContigGraphPath &path : branches_) path.clear();
+    prefix_workspace_.clear();
+    active_branches_ = 0;
   }
 
   bool Search();
@@ -41,8 +55,10 @@ class ContigGraphBranchGroup {
   ContigGraphVertexAdaptor begin_;
   ContigGraphVertexAdaptor end_;
   std::vector<ContigGraphPath> branches_;
+  ContigGraphPath prefix_workspace_;
   int max_branches_;
   int max_length_;
+  size_t active_branches_;
 };
 
 #endif

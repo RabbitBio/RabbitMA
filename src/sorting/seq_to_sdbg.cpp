@@ -20,6 +20,7 @@
 /* contact: Dinghua Li <dhli@cs.hku.hk> */
 
 #include "seq_to_sdbg.h"
+#include "sorting/stable_contigs.h"
 
 #include <omp.h>
 #include <array>
@@ -40,16 +41,122 @@
 
 #include "sequence/copy_substr.h"
 #include "sequence/io/async_sequence_reader.h"
+#include "sequence/io/contig/contig_writer.h"
 #include "sequence/io/edge/edge_reader.h"
 #include "sequence/kmer.h"
 #include "kmlib/kmsort.h"
 #include "utils/mutex.h"
 #include "utils/startup_affinity.h"
+#include "utils/stream_store.h"
 #include "utils/utils.h"
 
 const unsigned SeqToSdbg::kMaxLookUpPrefixLength;
 
 namespace {
+
+// The experimental two-level seq2sdbg path first partitions records by five
+// leading bases.  One small write-combining buffer per macro keeps that
+// source-order pass sequential at both ends without allocating a staging
+// buffer for all 65,536 final buckets.
+constexpr unsigned kSeqMacroPrefixChars = 5u;
+constexpr unsigned kSeqMacroCount =
+    1u << (kSeqMacroPrefixChars * kBitsPerEdgeChar);
+constexpr unsigned kBucketsPerSeqMacro =
+    BaseSequenceSortingEngine::kNumBuckets / kSeqMacroCount;
+constexpr unsigned kSeqMacroBufferRecords = 16u;
+
+class SeqMacroRecordBuffer {
+ public:
+  SeqMacroRecordBuffer(
+      uint32_t *records,
+      const std::array<uint64_t, kSeqMacroCount> &initial_cursor,
+      unsigned record_words, bool stream_stores)
+      : records_(records), cursor_(initial_cursor),
+        record_words_(record_words),
+        stream_stores_(stream_stores),
+        data_(static_cast<size_t>(kSeqMacroCount) *
+              kSeqMacroBufferRecords * record_words) {
+    assert(record_words_ > 0u);
+    fill_.fill(0u);
+  }
+
+  uint32_t *Reserve(unsigned macro) {
+    assert(macro < kSeqMacroCount);
+    if (fill_[macro] == kSeqMacroBufferRecords) {
+      Flush(macro);
+    }
+    uint32_t *item =
+        data_.data() +
+        (static_cast<size_t>(macro) * kSeqMacroBufferRecords +
+         fill_[macro]++) * record_words_;
+    return item;
+  }
+
+  void Finish() {
+    for (unsigned macro = 0; macro < kSeqMacroCount; ++macro) {
+      Flush(macro);
+    }
+    if (stream_stores_) StreamStoreFence();
+  }
+
+  uint64_t cursor(unsigned macro) const { return cursor_[macro]; }
+
+ private:
+  void Flush(unsigned macro) {
+    const unsigned count = fill_[macro];
+    if (count == 0u) return;
+    uint32_t *const destination =
+        records_ + static_cast<size_t>(cursor_[macro]) * record_words_;
+    const uint32_t *const source = data_.data() + static_cast<size_t>(macro) *
+        kSeqMacroBufferRecords * record_words_;
+    const size_t bytes =
+        static_cast<size_t>(count) * record_words_ * sizeof(uint32_t);
+    if (stream_stores_ && bytes >= 128u) {
+      StreamStoreCopy(destination, source, bytes);
+    } else {
+      std::memcpy(destination, source, bytes);
+    }
+    cursor_[macro] += count;
+    fill_[macro] = 0u;
+  }
+
+  uint32_t *records_;
+  std::array<uint64_t, kSeqMacroCount> cursor_;
+  std::array<uint8_t, kSeqMacroCount> fill_;
+  unsigned record_words_;
+  bool stream_stores_;
+  std::vector<uint32_t> data_;
+};
+
+unsigned SelectStreamActiveDestinations(int num_threads) {
+  if (const char *configured =
+          std::getenv("MEGAHIT_SEQ2SDBG_ACTIVE_DESTINATIONS")) {
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(configured, &end, 10);
+    if (errno == 0 && end != configured && *end == '\0' &&
+        (parsed == 64u || parsed == 128u || parsed == 256u)) {
+      return static_cast<unsigned>(parsed);
+    }
+  }
+
+  const RuntimeResourcePolicy &policy = GetRuntimeResourcePolicy();
+  if (!policy.shared_node()) return 256u;
+  const uint64_t cache_budget = policy.last_level_cache_budget_bytes();
+  const long page_size_value = ::sysconf(_SC_PAGESIZE);
+  if (cache_budget == 0 || page_size_value <= 0) return 256u;
+
+  // An active destination can hold a different current output page.  Reserve
+  // half of each worker's discovered LLC share for those pages and the other
+  // half for input/descriptors.  No CPU model or host-size constant is used.
+  const uint64_t workers = static_cast<uint64_t>(std::max(1, num_threads));
+  const uint64_t destination_page_budget = cache_budget / workers / 2u;
+  const uint64_t destinations =
+      destination_page_budget / static_cast<uint64_t>(page_size_value);
+  if (destinations >= 256u) return 256u;
+  if (destinations >= 128u) return 128u;
+  return 64u;
+}
 
 /**
  * @brief encode seq_id and its offset in one int64_t
@@ -758,6 +865,8 @@ bool SeqToSdbg::ConfigureStreamedEdgeInput(
   stream_edge_fds_.swap(fds);
   stream_input_edges_ = true;
   stream_input_unordered_ = !metadata.is_sorted;
+  stream_active_destinations_ =
+      SelectStreamActiveDestinations(opt_.n_threads);
 
   EdgeBucketHistogram precomputed;
   if (std::getenv("MEGAHIT_DISABLE_COUNT_SDBG_HISTOGRAM") == nullptr &&
@@ -785,6 +894,13 @@ bool SeqToSdbg::ConfigureStreamedEdgeInput(
         "no resident edge copy\n",
         metadata.is_sorted ? "sorted" : "unordered", stream_num_edges_,
         stream_edge_chunks_.size());
+  if (stream_input_unordered_) {
+    const RuntimeResourcePolicy &policy = GetRuntimeResourcePolicy();
+    xinfo("Stream destination working set: {} active buckets per macro; "
+          "{} shared job(s), {} MiB effective LLC budget\n",
+          stream_active_destinations_, policy.jobs_per_node,
+          policy.last_level_cache_budget_bytes() >> 20u);
+  }
   if (use_stream_bucket_histogram_) {
     xinfo("Loaded count-stage radix histogram; the first edge scan can be "
           "elided when no additional sequences are present\n");
@@ -971,8 +1087,7 @@ void SeqToSdbg::ConfigurePackedSeqOffsets() {
         seq_locator_shift_, seq_pkg_.max_length());
 }
 
-int64_t SeqToSdbg::BoundedTransientWorkspaceLimit(
-    uint64_t retained_bytes, bool report) const {
+int64_t SeqToSdbg::AutomaticDirectWorkspaceLimit() const {
   if (std::getenv("MEGAHIT_FORCE_DIRECT_SEQ_ITEMS") != nullptr ||
       opt_.mem_flag != 1) {
     return std::numeric_limits<int64_t>::max();
@@ -981,69 +1096,16 @@ int64_t SeqToSdbg::BoundedTransientWorkspaceLimit(
     return 0;
   }
 
-  long double target_gib = 20.0L;
-  if (const char *value = std::getenv("MEGAHIT_SEQ2SDBG_RSS_TARGET_GIB")) {
-    char *end = nullptr;
-    const long double parsed = std::strtold(value, &end);
-    if (end != value && *end == '\0' && std::isfinite(parsed) &&
-        parsed > 0.0L) {
-      target_gib = parsed;
-    }
+  // Direct records are a transient acceleration cache.  In automatic mode,
+  // bound them by a fraction of the declared memory rather than allowing a
+  // wider k-mer to turn a one-word layout change into a 60--100 GiB RSS
+  // cliff.  Explicit all-memory modes and the force switch remain opt-ins.
+  const long double limit = static_cast<long double>(opt_.host_mem) / 4.0L;
+  if (limit >=
+      static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+    return std::numeric_limits<int64_t>::max();
   }
-  const long double requested =
-      target_gib * static_cast<long double>(uint64_t{1} << 30u);
-  const uint64_t rss_target = static_cast<uint64_t>(std::min<long double>(
-      requested, static_cast<long double>(std::max<double>(0, opt_.host_mem))));
-
-  // The sorting engine keeps three bucket tables per worker while filling
-  // either direct records or compact locators.  Account for them here so the
-  // same process-wide contract applies to every k, rather than only to the
-  // first streamed count input.
-  const unsigned __int128 bucket_tables =
-      static_cast<uint64_t>(std::max(1, opt_.n_threads)) * kNumBuckets *
-      sizeof(int64_t) * 3u;
-  const unsigned __int128 tracked =
-      static_cast<unsigned __int128>(retained_bytes) + bucket_tables;
-  const uint64_t untracked_headroom = std::max<uint64_t>(
-      uint64_t{1} << 30u, rss_target / 10u);
-  if (tracked >= rss_target ||
-      untracked_headroom >= rss_target - static_cast<uint64_t>(tracked)) {
-    return 0;
-  }
-  const uint64_t workspace =
-      rss_target - static_cast<uint64_t>(tracked) - untracked_headroom;
-  if (report) {
-    xinfo("Bounded seq2sdbg workspace: target {.3} GiB, retained {.3} "
-          "GiB, safety {.3} GiB, workspace {.3} GiB\n",
-          static_cast<double>(rss_target) / (uint64_t{1} << 30u),
-          static_cast<double>(tracked) / (uint64_t{1} << 30u),
-          static_cast<double>(untracked_headroom) / (uint64_t{1} << 30u),
-          static_cast<double>(workspace) / (uint64_t{1} << 30u));
-  }
-  return workspace >
-                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
-             ? std::numeric_limits<int64_t>::max()
-             : static_cast<int64_t>(workspace);
-}
-
-uint64_t SeqToSdbg::CurrentRetainedBytes() const {
-  const unsigned __int128 retained =
-      static_cast<uint64_t>(seq_pkg_.size_in_byte()) +
-      static_cast<unsigned __int128>(multiplicity.capacity()) *
-          sizeof(mul_t) +
-      static_cast<unsigned __int128>(endpoint_tip_items_.capacity()) *
-          sizeof(uint32_t) +
-      static_cast<unsigned __int128>(
-          stream_bucket_histogram_.counts.capacity()) *
-          sizeof(uint64_t);
-  return retained > std::numeric_limits<uint64_t>::max()
-             ? std::numeric_limits<uint64_t>::max()
-             : static_cast<uint64_t>(retained);
-}
-
-int64_t SeqToSdbg::AutomaticDirectWorkspaceLimit(
-    uint64_t retained_bytes) const {
-  return BoundedTransientWorkspaceLimit(retained_bytes, false);
+  return static_cast<int64_t>(limit);
 }
 
 int64_t SeqToSdbg::EncodeSeqOffset(int64_t seq_id, unsigned offset,
@@ -1122,6 +1184,8 @@ bool SeqToSdbg::Lv0BuildBalancedRanges(
     if (seq_id < num_stream_chunks) {
       return 2u * stream_edge_chunks_[seq_id].num_records;
     }
+    if (!omitted_sequences_.empty() &&
+        omitted_sequences_[seq_id - num_stream_chunks]) return 0u;
     const uint64_t length =
         seq_pkg_.GetSeqView(seq_id - num_stream_chunks).length();
     if (length < opt_.k + 1u) {
@@ -2040,6 +2104,18 @@ void SeqToSdbg::GenMercyEdges() {
 }
 
 SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
+  const bool probe_bridges = opt_.bridge_contigs || (!opt_.carry_stable_contigs &&
+      std::getenv("MEGAHIT_PROBE_CONTIG_BRIDGES") != nullptr);
+  const bool probe_stable = opt_.carry_stable_contigs ||
+      std::getenv("MEGAHIT_PROBE_STABLE_CONTIGS") != nullptr || probe_bridges;
+  const std::string carry_path = opt_.output_prefix + ".isolated.fa";
+  for (const auto &suffix : {"", ".info", ".mgb", ".mgb.tmp"}) {
+    std::remove((carry_path + suffix).c_str());
+    std::remove((opt_.output_prefix + ".bridges.fa" + suffix).c_str());
+  }
+  std::remove((opt_.output_prefix + ".bridges.meta").c_str());
+  uint64_t primary_begin = 0;
+  std::vector<unsigned> primary_flags;
   full_words_per_substr_ =
       DivCeiling(opt_.k * kBitsPerEdgeChar + kBWTCharNumBits + 1 + kBitsPerMul,
                  kBitsPerEdgeWord);
@@ -2217,10 +2293,7 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
       const unsigned __int128 direct_bytes =
           items * static_cast<uint64_t>(words_per_substr_) * sizeof(uint32_t);
       if (direct_bytes > static_cast<unsigned __int128>(
-                             AutomaticDirectWorkspaceLimit(static_cast<uint64_t>(
-                                 std::min<unsigned __int128>(
-                                     data_bytes,
-                                     std::numeric_limits<uint64_t>::max()))))) {
+                             AutomaticDirectWorkspaceLimit())) {
         return false;
       }
       const uint64_t fixed_headroom = std::max<uint64_t>(
@@ -2235,15 +2308,11 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
 
     const bool stream_semantically_available =
         have_edge_metadata && real_only_requested &&
+        !(opt_.bridge_contigs && !opt_.contig.empty() && opt_.k >= 31u) &&
         std::getenv("MEGAHIT_DISABLE_STREAMED_EDGE_INPUT") == nullptr;
-    // Streamed fixed edges live in the sortable records, not in SeqPackage.
-    // Only supplemental contigs remain resident alongside that workspace.
-    // Charging the packed edge copy here would reject a layout that never
-    // allocates that copy and unnecessarily fall back to the slower resident
-    // representation.
-    const bool streamed_direct_fits = direct_fits(
+    const bool loaded_direct_fits = direct_fits(
         estimate_real_items(edge_reserve_count),
-        estimate_data_bytes(0));
+        estimate_data_bytes(edge_reserve_count));
 
     // The generic compact-locator path can reread resident SeqPackage
     // sequences, whereas streamed fixed edges currently have no stable
@@ -2257,7 +2326,7 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
     const bool has_supplemental_sequences =
         bases_to_reserve != 0 || num_contigs_to_reserve != 0;
     const bool stream_layout_supported =
-        !has_supplemental_sequences || streamed_direct_fits;
+        !has_supplemental_sequences || loaded_direct_fits;
     if (stream_semantically_available && stream_layout_supported) {
       stream_input_edges_ = ConfigureStreamedEdgeInput(edge_metadata);
       stream_requires_mercy_index =
@@ -2271,12 +2340,12 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
               "compact edge index\n");
       }
     } else if (stream_semantically_available &&
-               has_supplemental_sequences && !streamed_direct_fits) {
+               has_supplemental_sequences && !loaded_direct_fits) {
       xinfo("Streaming fixed edges skipped: mixed input requires the exact "
             "resident-locator path when the complete direct workspace does "
             "not fit\n");
     }
-    if (!stream_input_edges_ && !streamed_direct_fits) {
+    if (!stream_input_edges_ && !loaded_direct_fits) {
       real_only_records_ = false;
       if (real_only_requested) {
         xinfo("Real-edge-only sorting skipped: complete exact workspace does "
@@ -2346,6 +2415,8 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
 
   if (!opt_.contig.empty()) {
     ContigReader reader(opt_.contig);
+    primary_begin = seq_pkg_.seq_count();
+    if (probe_stable) reader.SetFlagVector(&primary_flags);
     reader.SetExtendLoop(opt_.k_from, opt_.k)->SetMinLen(opt_.k + 1);
     bool contig_reverse = true;
     auto n_read = reader.ReadAllWithMultiplicity(&seq_pkg_, &multiplicity,
@@ -2408,6 +2479,107 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
         seq_pkg_.size_in_byte(), seq_pkg_.seq_count(), seq_pkg_.base_count(),
         multiplicity.size(), multiplicity.capacity());
 
+  if (probe_stable && !stream_input_edges_) {
+    const double begin = omp_get_wtime();
+    unsigned bridge_margin = 0;
+    if (probe_bridges) {
+      if (const char *value = std::getenv("MEGAHIT_BRIDGE_END_MARGIN")) {
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        if (parsed <= (1u << 28u)) bridge_margin = static_cast<unsigned>(parsed);
+      }
+    }
+    stable_contigs::Plan plan = stable_contigs::Build(
+        seq_pkg_, multiplicity, primary_begin, primary_flags, opt_.k, opt_.n_threads,
+        probe_bridges, probe_bridges || std::getenv("MEGAHIT_EXACT_STABLE_OVERLAPS") != nullptr,
+        bridge_margin);
+    if (probe_bridges && !opt_.bridge_contigs)
+      xinfo("Internal-path probe only; no graph records are omitted\n");
+    xinfo("Stable-contig certificate: {} candidate bases, {} carried contigs / "
+          "{} bases, {} redundant inputs, {} omitted oriented windows; {.4} s\n",
+          plan.candidate_bases, plan.carried_contigs, plan.carried_bases,
+          plan.redundant_sequences, 2u * plan.removed_windows,
+          omp_get_wtime() - begin);
+    // Retain the ordinary path for an entirely isolated input, including
+    // the empty-graph case. This also keeps the carry sidecar optional.
+    uint64_t retained_windows = 0;
+    for (size_t i = 0; i < plan.remove.size(); ++i) {
+      if (!plan.remove[i] && seq_pkg_.GetSeqView(i).length() > opt_.k) {
+        retained_windows += seq_pkg_.GetSeqView(i).length() - opt_.k;
+      }
+    }
+    if (opt_.bridge_contigs && plan.carried_contigs) {
+      const unsigned margin = bridge_margin ? bridge_margin : 2u * opt_.k;
+      const std::string bridge_path = opt_.output_prefix + ".bridges.fa";
+      {
+        ContigWriter writer(bridge_path, true);
+#pragma omp parallel for schedule(dynamic, 64) num_threads(opt_.n_threads)
+        for (int64_t i = 0; i < static_cast<int64_t>(plan.carry.size()); ++i) {
+          if (plan.carry[i]) writer.WriteContig(
+              stable_contigs::OutputSequence(seq_pkg_.GetSeqView(i), opt_.k),
+              opt_.k, i, 0, multiplicity[i]);
+        }
+      }
+      std::ofstream metadata(opt_.output_prefix + ".bridges.meta");
+      metadata << 1 << ' ' << opt_.k << ' ' << margin << ' ' << plan.carried_contigs << '\n';
+      metadata.close();
+      if (!metadata) xfatal("Cannot publish bridge metadata\n");
+
+      struct RetainedSpan { uint32_t input, begin, length; };
+      std::vector<RetainedSpan> retained;
+      uint64_t added_bases = 0, omitted_windows = 0;
+      omitted_sequences_.assign(seq_pkg_.seq_count(), 0);
+      for (size_t span = 0; span < plan.spans.size();) {
+        const uint32_t input = plan.spans[span].input;
+        const uint32_t windows = seq_pkg_.GetSeqView(input).length() - opt_.k;
+        uint32_t cursor = 0;
+        omitted_sequences_[input] = 1;
+        do {
+          const auto &drop = plan.spans[span];
+          if (drop.begin < cursor || drop.end > windows || drop.begin >= drop.end)
+            xfatal("Invalid bridge input interval\n");
+          if (drop.begin > cursor) {
+            retained.push_back({input, cursor, drop.begin - cursor + opt_.k});
+            added_bases += retained.back().length;
+          }
+          omitted_windows += drop.end - drop.begin;
+          cursor = drop.end;
+          ++span;
+        } while (span < plan.spans.size() && plan.spans[span].input == input);
+        if (cursor < windows) {
+          retained.push_back({input, cursor, windows - cursor + opt_.k});
+          added_bases += retained.back().length;
+        }
+      }
+      // Reserve before taking self-referential packed views, so no append
+      // can invalidate the source words while it is copying a retained stub.
+      seq_pkg_.ReserveBases(seq_pkg_.base_count() + added_bases);
+      seq_pkg_.ReserveSequences(seq_pkg_.seq_count() + retained.size());
+      multiplicity.reserve(multiplicity.size() + retained.size());
+      for (const auto &span : retained) {
+        seq_pkg_.AppendSequenceSpan(seq_pkg_.GetSeqView(span.input), span.begin, span.length);
+        multiplicity.push_back(multiplicity[span.input]);
+      }
+      omitted_sequences_.resize(seq_pkg_.seq_count(), 0);
+      xinfo("Compressed {} path interiors, {} retained input fragments, {} "
+            "omitted oriented input windows; total preparation {.4} s\n",
+            plan.carried_contigs, retained.size(), 2u * omitted_windows, omp_get_wtime() - begin);
+    } else if (opt_.carry_stable_contigs && plan.carried_contigs && retained_windows) {
+      {
+        ContigWriter writer(carry_path, true);
+#pragma omp parallel for schedule(dynamic, 64) num_threads(opt_.n_threads)
+        for (int64_t i = 0; i < static_cast<int64_t>(plan.carry.size()); ++i) {
+          if (plan.carry[i]) {
+            writer.WriteContig(stable_contigs::OutputSequence(seq_pkg_.GetSeqView(i), opt_.k),
+                               opt_.k, i, contig_flag::kStandalone, multiplicity[i]);
+          }
+        }
+      }
+      omitted_sequences_.swap(plan.remove);
+      xinfo("Carried isolated paths: {} contigs / {} bases; certificate and "
+            "output total {.4} s\n", plan.carried_contigs, plan.carried_bases,
+            omp_get_wtime() - begin);
+    }
+  }
   ConfigurePackedSeqOffsets();
   // Recovering a sequence ID from a global base offset requires pos_to_id.
   // The packed fast path carries the ID directly and can omit this index.
@@ -2516,6 +2688,7 @@ void SeqToSdbg::Lv0CalcBucketSize(int64_t seq_from, int64_t seq_to,
                num_stream_chunks) -
       num_stream_chunks;
   for (int64_t seq_id = loaded_from; seq_id < loaded_to; ++seq_id) {
+    if (!omitted_sequences_.empty() && omitted_sequences_[seq_id]) continue;
     auto seq_view = seq_pkg_.GetSeqView(seq_id);
     unsigned seq_len = seq_view.length();
 
@@ -2590,6 +2763,7 @@ void SeqToSdbg::Lv1FillOffsetsFor(OffsetFiller &filler, int64_t seq_from,
   // =========== end macro ==========================
 
   for (int64_t seq_id = seq_from; seq_id < seq_to; ++seq_id) {
+    if (!omitted_sequences_.empty() && omitted_sequences_[seq_id]) continue;
     auto seq_view = seq_pkg_.GetSeqView(seq_id);
     unsigned seq_len = seq_view.length();
     if (seq_len < opt_.k + 1) {
@@ -2683,6 +2857,12 @@ void SeqToSdbg::Lv1FillOffsets(OffsetFiller &filler, int64_t seq_from,
 }
 
 bool SeqToSdbg::Lv1SupportsDirectItems() const {
+  // Compression can move a late-k graph just below the all-record memory
+  // cutoff. Materializing tens of GiB then costs more than the bounded
+  // locator passes it replaces. Keep that representation for automatic
+  // compressed graphs; explicit full-memory mode still honours the caller.
+  if (opt_.bridge_contigs && !omitted_sequences_.empty() &&
+      opt_.mem_flag == 1 && !real_only_records_) return false;
   return std::getenv("MEGAHIT_DISABLE_DIRECT_SEQ_ITEMS") == nullptr;
 }
 
@@ -2695,17 +2875,58 @@ int64_t SeqToSdbg::Lv1DirectAuxWordsPerItem() const {
 }
 
 int64_t SeqToSdbg::Lv1DirectMemoryLimit() const {
-  return BoundedTransientWorkspaceLimit(CurrentRetainedBytes(), true);
+  if (precomputed_endpoint_tips_ && opt_.mem_flag == 1) {
+    long double target_gib = 20.0L;
+    if (const char *value =
+            std::getenv("MEGAHIT_SEQ2SDBG_RSS_TARGET_GIB")) {
+      char *end = nullptr;
+      const long double parsed = std::strtold(value, &end);
+      if (end != value && *end == '\0' && std::isfinite(parsed) &&
+          parsed > 0.0L) {
+        target_gib = parsed;
+      }
+    }
+    const long double requested =
+        target_gib * static_cast<long double>(uint64_t{1} << 30u);
+    const uint64_t rss_target = static_cast<uint64_t>(std::min<long double>(
+        requested, static_cast<long double>(std::max<double>(0, opt_.host_mem))));
+    const uint64_t retained =
+        static_cast<uint64_t>(seq_pkg_.size_in_byte()) +
+        static_cast<uint64_t>(multiplicity.capacity()) * sizeof(mul_t) +
+        static_cast<uint64_t>(endpoint_tip_items_.capacity()) *
+            sizeof(uint32_t) +
+        static_cast<uint64_t>(stream_bucket_histogram_.counts.capacity()) *
+            sizeof(uint64_t) +
+        static_cast<uint64_t>(std::max(1, opt_.n_threads)) * kNumBuckets *
+            sizeof(int64_t) * 3u;
+    // Cover writer buffers, thread stacks, allocator metadata and transient
+    // per-bucket merges without encoding a socket/core topology.  It scales
+    // with the user-visible RSS envelope and is intentionally independent of
+    // the current input's coverage or a named machine.
+    const uint64_t untracked_headroom = std::max<uint64_t>(
+        uint64_t{1} << 30u, rss_target / 10u);
+    if (retained >= rss_target ||
+        untracked_headroom >= rss_target - retained) {
+      return 0;
+    }
+    const uint64_t workspace = rss_target - retained - untracked_headroom;
+    xinfo("Bounded seq2sdbg direct budget: target {.3} GiB, retained {.3} "
+          "GiB, safety {.3} GiB, workspace {.3} GiB\n",
+          static_cast<double>(rss_target) / (uint64_t{1} << 30u),
+          static_cast<double>(retained) / (uint64_t{1} << 30u),
+          static_cast<double>(untracked_headroom) / (uint64_t{1} << 30u),
+          static_cast<double>(workspace) / (uint64_t{1} << 30u));
+    return workspace > static_cast<uint64_t>(
+                           std::numeric_limits<int64_t>::max())
+               ? std::numeric_limits<int64_t>::max()
+               : static_cast<int64_t>(workspace);
+  }
+  return AutomaticDirectWorkspaceLimit();
 }
 
 bool SeqToSdbg::Lv1AllowsPartialDirectItems() const {
   return stream_input_edges_ && precomputed_endpoint_tips_ &&
          std::getenv("MEGAHIT_VALIDATE_PRECOMPUTED_ENDPOINTS") == nullptr;
-}
-
-int64_t SeqToSdbg::Lv1AutoWorkspaceLimit() const {
-  if (opt_.mem_flag != 1) return 0;
-  return BoundedTransientWorkspaceLimit(CurrentRetainedBytes(), false);
 }
 
 bool SeqToSdbg::Lv1UseWriteCombine() const {
@@ -2935,6 +3156,84 @@ inline __attribute__((always_inline)) void SeqToSdbg::MaterializeStreamedEdge(
   }
 }
 
+template <unsigned NWords, bool BucketPacked,
+          unsigned ActiveDestinations>
+void SeqToSdbg::Lv1FillStreamedEdgeMacrosFor(
+    OffsetFiller &filler, int64_t chunk_from, int64_t chunk_to,
+    std::vector<uint32_t> *records) {
+  static_assert(ActiveDestinations >= 1u &&
+                    ActiveDestinations <= kNumBuckets &&
+                    (ActiveDestinations & (ActiveDestinations - 1u)) == 0u,
+                "active destination count must be a bucket-aligned power of two");
+  constexpr unsigned kNumMacros = kNumBuckets / ActiveDestinations;
+  std::array<uint32_t, kNumMacros> macro_counts{};
+  std::array<uint32_t, kNumMacros + 1u> macro_begin{};
+  std::array<uint32_t, kNumMacros> macro_cursor{};
+  std::vector<uint32_t> descriptors;
+  const unsigned reverse_window_offset =
+      stream_edge_length_ - 1u - kBucketPrefixLength;
+  for (int64_t chunk_id = chunk_from; chunk_id < chunk_to; ++chunk_id) {
+    const StreamEdgeChunk &chunk = stream_edge_chunks_[chunk_id];
+    ReadStreamedEdgeChunk(chunk, records);
+    macro_counts.fill(0);
+
+    const uint32_t *edge = records->data();
+    for (uint32_t i = 0; i < chunk.num_records; ++i,
+                  edge += stream_words_per_edge_) {
+      const uint16_t key = ExtractRawBaseWindow8(edge, 1u);
+      const uint16_t reverse_key = ReverseComplementWindow8(
+          ExtractRawBaseWindow8(edge, reverse_window_offset));
+      if (filler.IsHandling(key)) {
+        ++macro_counts[key / ActiveDestinations];
+      }
+      if (filler.IsHandling(reverse_key)) {
+        ++macro_counts[reverse_key / ActiveDestinations];
+      }
+    }
+    macro_begin[0] = 0;
+    for (unsigned macro = 0; macro < kNumMacros; ++macro) {
+      macro_begin[macro + 1u] =
+          macro_begin[macro] + macro_counts[macro];
+      macro_cursor[macro] = macro_begin[macro];
+    }
+    descriptors.resize(macro_begin[kNumMacros]);
+
+    edge = records->data();
+    for (uint32_t i = 0; i < chunk.num_records; ++i,
+                  edge += stream_words_per_edge_) {
+      const uint16_t key = ExtractRawBaseWindow8(edge, 1u);
+      const uint16_t reverse_key = ReverseComplementWindow8(
+          ExtractRawBaseWindow8(edge, reverse_window_offset));
+      if (filler.IsHandling(key)) {
+        descriptors[macro_cursor[key / ActiveDestinations]++] = i << 1u;
+      }
+      if (filler.IsHandling(reverse_key)) {
+        descriptors[macro_cursor[reverse_key / ActiveDestinations]++] =
+            (i << 1u) | 1u;
+      }
+    }
+
+    for (unsigned macro = 0; macro < kNumMacros; ++macro) {
+      for (uint32_t j = macro_begin[macro];
+           j < macro_begin[macro + 1u]; ++j) {
+        const uint32_t descriptor = descriptors[j];
+        const unsigned strand = descriptor & 1u;
+        const uint32_t *source =
+            records->data() +
+            static_cast<size_t>(descriptor >> 1u) * stream_words_per_edge_;
+        const uint16_t key =
+            strand == 0u
+                ? ExtractRawBaseWindow8(source, 1u)
+                : ReverseComplementWindow8(ExtractRawBaseWindow8(
+                      source, reverse_window_offset));
+        assert(key / ActiveDestinations == macro);
+        MaterializeStreamedEdge<NWords, BucketPacked>(
+            source, strand, filler.ReserveNextItem(key));
+      }
+    }
+  }
+}
+
 template <unsigned NWords, bool BucketPacked>
 void SeqToSdbg::Lv1FillStreamedEdgesFor(OffsetFiller &filler,
                                         int64_t chunk_from,
@@ -2958,82 +3257,21 @@ void SeqToSdbg::Lv1FillStreamedEdgesFor(OffsetFiller &filler,
     }
   }
   if (stream_input_unordered_ && handles_all_buckets) {
-    // A full 16-bit radix partition emits mostly tiny runs for a 2 MiB input
-    // chunk (about five records per bucket here), which turns into millions of
-    // small copies.  Partition only by the high byte instead.  During the
-    // final pass at most 256 bucket streams are active, keeping their current
-    // destination pages and cache lines within the per-core TLB/cache budget,
-    // while every record is materialized exactly once into the final array.
-    constexpr unsigned kMacroBits = 8u;
-    constexpr unsigned kBucketBits = 2u * kBucketPrefixLength;
-    static_assert(kBucketBits >= kMacroBits, "invalid macro radix");
-    constexpr unsigned kMacroShift = kBucketBits - kMacroBits;
-    constexpr unsigned kNumMacros = 1u << kMacroBits;
-    std::array<uint32_t, kNumMacros> macro_counts{};
-    std::array<uint32_t, kNumMacros + 1u> macro_begin{};
-    std::array<uint32_t, kNumMacros> macro_cursor{};
-    std::vector<uint32_t> descriptors;
-
-    for (int64_t chunk_id = chunk_from; chunk_id < chunk_to; ++chunk_id) {
-      const StreamEdgeChunk &chunk = stream_edge_chunks_[chunk_id];
-      ReadStreamedEdgeChunk(chunk, &records);
-      macro_counts.fill(0);
-
-      const uint32_t *edge = records.data();
-      for (uint32_t i = 0; i < chunk.num_records; ++i,
-                    edge += stream_words_per_edge_) {
-        const uint16_t key = ExtractRawBaseWindow8(edge, 1u);
-        const uint16_t reverse_key = ReverseComplementWindow8(
-            ExtractRawBaseWindow8(edge, reverse_window_offset));
-        if (filler.IsHandling(key)) {
-          ++macro_counts[key >> kMacroShift];
-        }
-        if (filler.IsHandling(reverse_key)) {
-          ++macro_counts[reverse_key >> kMacroShift];
-        }
-      }
-
-      macro_begin[0] = 0;
-      for (unsigned macro = 0; macro < kNumMacros; ++macro) {
-        macro_begin[macro + 1u] =
-            macro_begin[macro] + macro_counts[macro];
-        macro_cursor[macro] = macro_begin[macro];
-      }
-      descriptors.resize(macro_begin[kNumMacros]);
-
-      edge = records.data();
-      for (uint32_t i = 0; i < chunk.num_records; ++i,
-                    edge += stream_words_per_edge_) {
-        const uint16_t key = ExtractRawBaseWindow8(edge, 1u);
-        const uint16_t reverse_key = ReverseComplementWindow8(
-            ExtractRawBaseWindow8(edge, reverse_window_offset));
-        if (filler.IsHandling(key)) {
-          descriptors[macro_cursor[key >> kMacroShift]++] = i << 1u;
-        }
-        if (filler.IsHandling(reverse_key)) {
-          descriptors[macro_cursor[reverse_key >> kMacroShift]++] =
-              (i << 1u) | 1u;
-        }
-      }
-
-      for (unsigned macro = 0; macro < kNumMacros; ++macro) {
-        for (uint32_t j = macro_begin[macro];
-             j < macro_begin[macro + 1u]; ++j) {
-          const uint32_t descriptor = descriptors[j];
-          const unsigned strand = descriptor & 1u;
-          const uint32_t *source =
-              records.data() +
-              static_cast<size_t>(descriptor >> 1u) * stream_words_per_edge_;
-          const uint16_t key =
-              strand == 0u
-                  ? ExtractRawBaseWindow8(source, 1u)
-                  : ReverseComplementWindow8(ExtractRawBaseWindow8(
-                        source, reverse_window_offset));
-          assert((key >> kMacroShift) == macro);
-          MaterializeStreamedEdge<NWords, BucketPacked>(
-              source, strand, filler.ReserveNextItem(key));
-        }
-      }
+    // A full 16-bit radix emits tiny runs.  Macro partitioning preserves
+    // per-bucket input order while bounding the pages touched concurrently.
+    switch (stream_active_destinations_) {
+      case 64u:
+        Lv1FillStreamedEdgeMacrosFor<NWords, BucketPacked, 64u>(
+            filler, chunk_from, chunk_to, &records);
+        break;
+      case 128u:
+        Lv1FillStreamedEdgeMacrosFor<NWords, BucketPacked, 128u>(
+            filler, chunk_from, chunk_to, &records);
+        break;
+      default:
+        Lv1FillStreamedEdgeMacrosFor<NWords, BucketPacked, 256u>(
+            filler, chunk_from, chunk_to, &records);
+        break;
     }
     return;
   }
@@ -3077,6 +3315,7 @@ void SeqToSdbg::Lv1FillDirectItemsFor(OffsetFiller &filler, int64_t seq_from,
                num_stream_chunks) -
       num_stream_chunks;
   for (int64_t seq_id = loaded_from; seq_id < loaded_to; ++seq_id) {
+    if (!omitted_sequences_.empty() && omitted_sequences_[seq_id]) continue;
     auto seq_view = seq_pkg_.GetSeqView(seq_id);
     const unsigned seq_len = seq_view.length();
     if (seq_len < opt_.k + 1) {
@@ -3186,9 +3425,8 @@ void SeqToSdbg::Lv2ExtractSubStringFor(OffsetFetcher &fetcher,
     }
     const uint64_t locator = fetcher.Next();
     uint32_t *const output_item = &*substr;
-    const auto decoded =
-        SeqLocatorDecoder<PackedOffsets>::Decode(locator, seq_locator_shift_,
-                                                  seq_offset_mask_, seq_pkg_);
+    const auto decoded = SeqLocatorDecoder<PackedOffsets>::Decode(
+        locator, seq_locator_shift_, seq_offset_mask_, seq_pkg_);
     MaterializeItem<NWords, BucketPacked>(
         decoded.seq_view, decoded.offset, decoded.strand, output_item);
     substr += words_per_substr_;
@@ -4000,6 +4238,553 @@ void SeqToSdbg::Lv2Postprocess(int64_t from, int64_t to, int tid,
     }
   }
   sdbg_writer_.SaveSnapshot(snapshot);
+}
+
+bool SeqToSdbg::RunSpecializedMainLoop() {
+  // The macro path replaces 65,536 independent source traversals with one
+  // source-order materialization followed by a cache-resident 64-way radix
+  // inside each five-base block.  It is a win while an exact record is at
+  // most six words wide; beyond that, copying the wider records outweighs
+  // the saved source scans.  This gate follows the representation width, not
+  // a particular k, input, CPU or cache size.  Retain an escape hatch for
+  // bit-for-bit A/B testing and conservative deployments.
+  if (std::getenv("MEGAHIT_DISABLE_SEQ_MACRO_RADIX") != nullptr) {
+    return false;
+  }
+
+  constexpr unsigned kMetadataBits =
+      kBWTCharNumBits + 1u + kBitsPerMul;
+  static_assert(kBucketsPerSeqMacro == 64u,
+                "five-base macros must contain 64 final buckets");
+
+  // This first implementation deliberately covers the resident mixed-input
+  // layout that dominates later k rounds.  Streamed fixed edges already have
+  // a separate one-pass direct path and must not be silently materialized by
+  // a semantically different implementation.
+  if (opt_.k <= kSeqMacroPrefixChars) {
+    xinfo("Experimental sequence macro-radix path is not applicable to "
+          "this record layout; using the generic engine\n");
+    return false;
+  }
+  const unsigned macro_base_bits =
+      (opt_.k - kSeqMacroPrefixChars) * kBitsPerEdgeChar;
+  if (words_per_substr_ <= 0 || real_only_records_ ||
+      precomputed_endpoint_tips_ || stream_input_edges_ ||
+      !stream_edge_chunks_.empty()) {
+    xinfo("Experimental sequence macro-radix path is not applicable to "
+          "this record layout; using the generic engine\n");
+    return false;
+  }
+  const unsigned record_words = static_cast<unsigned>(words_per_substr_);
+  if (record_words > 6u) {
+    xinfo("Sequence macro-radix skipped for {}-word records; using the "
+          "generic engine\n",
+          record_words);
+    return false;
+  }
+  const unsigned record_bits = record_words * kBitsPerEdgeWord;
+  const unsigned macro_metadata_bit =
+      bucket_packed_records_
+          ? macro_base_bits
+          : record_bits - kMetadataBits -
+                kSeqMacroPrefixChars * kBitsPerEdgeChar;
+  if (macro_base_bits > macro_metadata_bit ||
+      macro_metadata_bit + kMetadataBits > record_bits) {
+    xinfo("Experimental sequence macro-radix path is not applicable to "
+          "this record layout; using the generic engine\n");
+    return false;
+  }
+
+  const unsigned num_threads =
+      static_cast<unsigned>(std::max(1, opt_.n_threads));
+  const int64_t num_sequences =
+      static_cast<int64_t>(seq_pkg_.seq_count());
+  if (num_sequences == 0) {
+    return false;
+  }
+
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  if (!Lv0BuildBalancedRanges(&ranges) || ranges.size() != num_threads) {
+    ranges.resize(num_threads);
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+      ranges[tid] = {
+          static_cast<int64_t>(
+              (static_cast<unsigned __int128>(num_sequences) * tid) /
+              num_threads),
+          static_cast<int64_t>(
+              (static_cast<unsigned __int128>(num_sequences) *
+               (tid + 1u)) /
+              num_threads)};
+    }
+  }
+
+  xinfo("Two-level sequence macro-radix enabled: one "
+        "source-order materialization pass, {} macro blocks\n",
+        kSeqMacroCount);
+  SimpleTimer phase_timer;
+  phase_timer.start();
+
+  // First pass: only the five-base macro ID is rolled.  The matrix is tiny
+  // enough to remain private to each worker and removes atomics from the hot
+  // loop.
+  std::vector<uint64_t> thread_macro_counts(
+      static_cast<size_t>(num_threads) * kSeqMacroCount, uint64_t{0});
+#pragma omp parallel for schedule(static) num_threads(num_threads)
+  for (int tid_int = 0; tid_int < static_cast<int>(num_threads); ++tid_int) {
+    const unsigned tid = static_cast<unsigned>(tid_int);
+    uint64_t *counts =
+        thread_macro_counts.data() + static_cast<size_t>(tid) *
+                                         kSeqMacroCount;
+    for (int64_t seq_id = ranges[tid].first;
+         seq_id < ranges[tid].second; ++seq_id) {
+      if (!omitted_sequences_.empty() && omitted_sequences_[seq_id]) continue;
+      const auto seq_view = seq_pkg_.GetSeqView(seq_id);
+      const unsigned seq_len = seq_view.length();
+      if (seq_len < opt_.k + 1u) continue;
+
+      unsigned macro = 0u;
+      unsigned reverse_macro = 0u;
+      for (unsigned i = 0; i < kSeqMacroPrefixChars; ++i) {
+        macro = macro * kBucketBase + seq_view.base_at(i);
+        reverse_macro = reverse_macro * kBucketBase +
+                        (3u - seq_view.base_at(seq_len - 1u - i));
+      }
+
+      const unsigned final_offset = seq_len - opt_.k + 1u;
+      for (unsigned offset = 0;; ++offset) {
+        ++counts[macro];
+        ++counts[reverse_macro];
+        if (offset == final_offset) break;
+        macro = ((macro << kBitsPerEdgeChar) &
+                 (kSeqMacroCount - 1u)) |
+                seq_view.base_at(offset + kSeqMacroPrefixChars);
+        reverse_macro =
+            ((reverse_macro << kBitsPerEdgeChar) &
+             (kSeqMacroCount - 1u)) |
+            (3u - seq_view.base_at(
+                      seq_len - 1u - offset - kSeqMacroPrefixChars));
+      }
+    }
+  }
+
+  std::array<uint64_t, kSeqMacroCount + 1u> macro_begin{};
+  for (unsigned macro = 0; macro < kSeqMacroCount; ++macro) {
+    uint64_t macro_size = 0u;
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+      macro_size += thread_macro_counts[
+          static_cast<size_t>(tid) * kSeqMacroCount + macro];
+    }
+    if (macro_size > std::numeric_limits<uint64_t>::max() -
+                         macro_begin[macro]) {
+      xfatal("Sequence macro record count overflow\n");
+    }
+    macro_begin[macro + 1u] = macro_begin[macro] + macro_size;
+  }
+  const uint64_t num_records = macro_begin[kSeqMacroCount];
+  const unsigned __int128 record_bytes_wide =
+      static_cast<unsigned __int128>(num_records) *
+      record_words * sizeof(uint32_t);
+  if (record_bytes_wide > std::numeric_limits<size_t>::max()) {
+    xinfo("Sequence macro-radix workspace exceeds the addressable size; "
+          "using the generic engine\n");
+    return false;
+  }
+  const uint64_t record_bytes = static_cast<uint64_t>(record_bytes_wide);
+  const uint64_t retained_bytes =
+      static_cast<uint64_t>(seq_pkg_.size_in_byte()) +
+      static_cast<uint64_t>(multiplicity.capacity()) * sizeof(mul_t);
+  const uint64_t staging_bytes =
+      static_cast<uint64_t>(num_threads) * kSeqMacroCount *
+      kSeqMacroBufferRecords * record_words * sizeof(uint32_t);
+  const uint64_t host_budget =
+      opt_.host_mem <= 0
+          ? 0u
+          : (opt_.host_mem >=
+                     static_cast<double>(std::numeric_limits<uint64_t>::max())
+                 ? std::numeric_limits<uint64_t>::max()
+                 : static_cast<uint64_t>(opt_.host_mem));
+  // The decision is derived solely from the requested memory contract and
+  // the measured input cardinality.  Keep explicit room for allocator/page
+  // metadata and the writer rather than embedding a host-specific threshold.
+  const uint64_t safety_bytes =
+      std::max<uint64_t>(uint64_t{2} << 30u, host_budget / 100u);
+  if (host_budget == 0u ||
+      static_cast<unsigned __int128>(retained_bytes) + staging_bytes +
+              safety_bytes >=
+          host_budget) {
+    xinfo("Sequence macro-radix workspace does not fit the requested memory "
+          "budget; using the generic engine\n");
+    return false;
+  }
+
+  struct MacroBatch {
+    unsigned begin;
+    unsigned end;
+    uint64_t records;
+  };
+  uint64_t largest_macro_records = 0u;
+  for (unsigned macro = 0; macro < kSeqMacroCount; ++macro) {
+    largest_macro_records =
+        std::max(largest_macro_records,
+                 macro_begin[macro + 1u] - macro_begin[macro]);
+  }
+  const uint64_t usable_bytes =
+      host_budget - retained_bytes - staging_bytes - safety_bytes;
+  const uint64_t largest_macro_bytes =
+      largest_macro_records * record_words * sizeof(uint32_t);
+  // In balanced mode this array is a transient acceleration workspace.
+  // Reuse a bounded arena instead of consuming most of the job's memory for
+  // write-once records. Explicit all-memory/force modes retain their policy.
+  uint64_t target_arena_bytes = std::min(record_bytes, usable_bytes);
+  if (opt_.mem_flag == 1 &&
+      std::getenv("MEGAHIT_FORCE_DIRECT_SEQ_ITEMS") == nullptr) {
+    target_arena_bytes = std::min(target_arena_bytes, host_budget / 8u);
+  }
+  if (const char *configured =
+          std::getenv("MEGAHIT_SEQ_MACRO_ARENA_BYTES")) {
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(configured, &end, 10);
+    if (errno == 0 && end != configured && *end == '\0' && parsed > 0u) {
+      target_arena_bytes = std::min<uint64_t>(record_bytes, parsed);
+    }
+  }
+  target_arena_bytes =
+      std::max(target_arena_bytes, largest_macro_bytes);
+  target_arena_bytes = std::min(target_arena_bytes, usable_bytes);
+  if (target_arena_bytes < largest_macro_bytes) {
+    xinfo("Sequence macro-radix workspace does not fit the requested memory "
+          "budget; using the generic engine\n");
+    return false;
+  }
+
+  const uint64_t target_arena_records =
+      std::max<uint64_t>(1u, target_arena_bytes /
+                                 (record_words * sizeof(uint32_t)));
+  std::vector<MacroBatch> batches;
+  for (unsigned begin = 0; begin < kSeqMacroCount;) {
+    unsigned end = begin;
+    uint64_t batch_records = 0u;
+    while (end < kSeqMacroCount) {
+      const uint64_t macro_records =
+          macro_begin[end + 1u] - macro_begin[end];
+      if (end != begin &&
+          macro_records > target_arena_records - batch_records) {
+        break;
+      }
+      batch_records += macro_records;
+      ++end;
+    }
+    batches.push_back({begin, end, batch_records});
+    begin = end;
+  }
+  uint64_t arena_records = 0u;
+  for (const MacroBatch &batch : batches) {
+    arena_records = std::max(arena_records, batch.records);
+  }
+  const uint64_t arena_bytes =
+      arena_records * record_words * sizeof(uint32_t);
+
+  void *raw_records = nullptr;
+  if (posix_memalign(&raw_records, size_t{2} << 20u,
+                     static_cast<size_t>(arena_bytes)) != 0 ||
+      raw_records == nullptr) {
+    xinfo("Could not allocate {}-byte sequence macro-radix workspace; "
+          "using the generic engine\n",
+          arena_bytes);
+    return false;
+  }
+  std::unique_ptr<uint32_t, decltype(&std::free)> records(
+      static_cast<uint32_t *>(raw_records), &std::free);
+  if (num_threads > 1u &&
+      InterleaveMemoryPages(records.get(), static_cast<size_t>(arena_bytes))) {
+    xinfo("Interleaved sequence macro-radix workspace across allowed NUMA "
+          "nodes\n");
+  }
+  AdviseHugePages(records.get(), static_cast<size_t>(arena_bytes));
+  phase_timer.stop();
+  xinfo("Sequence macro histogram/allocation: {.4} sec, {} records, {} "
+        "batches, {}-byte reusable arena\n",
+        phase_timer.elapsed(), num_records, batches.size(), arena_bytes);
+
+  // A cache-resident output benefits from ordinary stores. Large outputs
+  // cannot survive the materialization barrier in cache; streaming their
+  // complete lines avoids write allocation and protects each worker's small
+  // staging buffers. Unknown topology keeps the portable cached policy.
+  const uint64_t cache_budget =
+      GetRuntimeResourcePolicy().last_level_cache_budget_bytes();
+  bool stream_stores = cache_budget != 0u && arena_bytes / cache_budget >= 2u;
+  if (std::getenv("MEGAHIT_EXPERIMENTAL_SEQ_MACRO_STREAM_STORES") != nullptr)
+    stream_stores = true;
+  if (std::getenv("MEGAHIT_DISABLE_SEQ_MACRO_STREAM_STORES") != nullptr)
+    stream_stores = false;
+  stream_stores = stream_stores && StreamStoresAvailable();
+  xinfo("Sequence macro streaming stores: {}, effective cache budget {} bytes\n",
+        stream_stores ? "enabled" : "disabled", cache_budget);
+
+  const unsigned metadata_word = macro_metadata_bit / kBitsPerEdgeWord;
+  const unsigned metadata_in_word = macro_metadata_bit % kBitsPerEdgeWord;
+  assert(metadata_word < record_words);
+  assert(metadata_in_word + kMetadataBits <= 2u * kBitsPerEdgeWord);
+
+  const auto append_metadata =
+      [metadata_word, metadata_in_word](uint32_t *item,
+                                        uint32_t metadata) {
+        constexpr uint32_t kMetadataMask =
+            (uint32_t{1} << kMetadataBits) - 1u;
+        const uint64_t field =
+            static_cast<uint64_t>(metadata & kMetadataMask)
+            << (2u * kBitsPerEdgeWord - metadata_in_word -
+                kMetadataBits);
+        item[metadata_word] |=
+            static_cast<uint32_t>(field >> kBitsPerEdgeWord);
+        if (metadata_in_word + kMetadataBits > kBitsPerEdgeWord) {
+          item[metadata_word + 1u] |= static_cast<uint32_t>(field);
+        }
+      };
+  const auto materialize_macro_item =
+      [this, append_metadata,
+       record_words](const SeqPackage::SeqView &seq_view, int offset,
+                     unsigned strand, uint32_t *item) {
+        const unsigned seq_len = seq_view.length();
+        const unsigned num_chars_to_copy =
+            opt_.k - (offset + static_cast<int>(opt_.k) >
+                      static_cast<int>(seq_len));
+        assert(num_chars_to_copy >= kSeqMacroPrefixChars);
+        int counting = 0;
+        if (offset > 0 && offset + static_cast<int>(opt_.k) <=
+                              static_cast<int>(seq_len)) {
+          counting = multiplicity[seq_view.id()];
+        }
+
+        const auto raw = seq_view.raw_address();
+        const unsigned start_offset = raw.second;
+        const unsigned words_this_seq =
+            DivCeiling(start_offset + seq_len, kCharsPerEdgeWord);
+        unsigned previous_base;
+        if (strand == 0u) {
+          previous_base =
+              offset == 0 ? kSentinelValue : seq_view.base_at(offset - 1);
+          CopySubstring(item, raw.first,
+                        offset + start_offset + kSeqMacroPrefixChars,
+                        num_chars_to_copy - kSeqMacroPrefixChars, 1,
+                        words_this_seq, record_words);
+        } else {
+          previous_base =
+              offset == 0
+                  ? kSentinelValue
+                  : 3u - seq_view.base_at(seq_len - offset);
+          int copy_offset = static_cast<int>(seq_len) - 1 - offset -
+                            (static_cast<int>(opt_.k) - 1);
+          if (copy_offset < 0) {
+            assert(num_chars_to_copy == opt_.k - 1u);
+            copy_offset = 0;
+          }
+          CopySubstringRC(item, raw.first, copy_offset + start_offset,
+                          num_chars_to_copy - kSeqMacroPrefixChars, 1,
+                          words_this_seq, record_words);
+        }
+        const uint32_t metadata =
+            (uint32_t{num_chars_to_copy == opt_.k}
+             << (kBWTCharNumBits + kBitsPerMul)) |
+            (previous_base << kBitsPerMul) |
+            static_cast<unsigned>(std::max(0, kMaxMul - counting));
+        append_metadata(item, metadata);
+      };
+
+  // Partition each macro by its remaining three prefix bases.  This is one
+  // linear 64-way radix step.  Once the six equal prefix bits are removed,
+  // the existing per-bucket sorter and postprocessor see byte-for-byte the
+  // same record layout as the generic path.
+  const auto bucket_sort = SelectSortingFunc(
+      record_words, 0, Lv2SortIgnoredLowBytes(),
+      Lv2SortIgnoredHighBytes());
+  std::vector<uint64_t> thread_macro_begin(
+      static_cast<size_t>(num_threads) * kSeqMacroCount, 0u);
+  double materialize_seconds = 0.0;
+  double sort_seconds = 0.0;
+  for (const MacroBatch &batch : batches) {
+    for (unsigned macro = batch.begin; macro < batch.end; ++macro) {
+      uint64_t cursor = macro_begin[macro] - macro_begin[batch.begin];
+      for (unsigned tid = 0; tid < num_threads; ++tid) {
+        const size_t index =
+            static_cast<size_t>(tid) * kSeqMacroCount + macro;
+        thread_macro_begin[index] = cursor;
+        cursor += thread_macro_counts[index];
+      }
+      assert(cursor == macro_begin[macro + 1u] -
+                           macro_begin[batch.begin]);
+    }
+
+    phase_timer.reset();
+    phase_timer.start();
+#pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int tid_int = 0; tid_int < static_cast<int>(num_threads);
+         ++tid_int) {
+      const unsigned tid = static_cast<unsigned>(tid_int);
+      std::array<uint64_t, kSeqMacroCount> cursor{};
+      for (unsigned macro = batch.begin; macro < batch.end; ++macro) {
+        cursor[macro] = thread_macro_begin[
+            static_cast<size_t>(tid) * kSeqMacroCount + macro];
+      }
+      SeqMacroRecordBuffer output(records.get(), cursor, record_words,
+                                   stream_stores);
+
+      for (int64_t seq_id = ranges[tid].first;
+           seq_id < ranges[tid].second; ++seq_id) {
+        if (!omitted_sequences_.empty() && omitted_sequences_[seq_id]) continue;
+        const auto seq_view = seq_pkg_.GetSeqView(seq_id);
+        const unsigned seq_len = seq_view.length();
+        if (seq_len < opt_.k + 1u) continue;
+
+        unsigned macro = 0u;
+        unsigned reverse_macro = 0u;
+        for (unsigned i = 0; i < kSeqMacroPrefixChars; ++i) {
+          macro = macro * kBucketBase + seq_view.base_at(i);
+          reverse_macro = reverse_macro * kBucketBase +
+                          (3u - seq_view.base_at(seq_len - 1u - i));
+        }
+        const unsigned final_offset = seq_len - opt_.k + 1u;
+        for (unsigned offset = 0;; ++offset) {
+          if (macro >= batch.begin && macro < batch.end) {
+            materialize_macro_item(
+                seq_view, static_cast<int>(offset), 0u,
+                output.Reserve(macro));
+          }
+          if (reverse_macro >= batch.begin &&
+              reverse_macro < batch.end) {
+            materialize_macro_item(
+                seq_view, static_cast<int>(offset), 1u,
+                output.Reserve(reverse_macro));
+          }
+          if (offset == final_offset) break;
+          macro = ((macro << kBitsPerEdgeChar) &
+                   (kSeqMacroCount - 1u)) |
+                  seq_view.base_at(offset + kSeqMacroPrefixChars);
+          reverse_macro =
+              ((reverse_macro << kBitsPerEdgeChar) &
+               (kSeqMacroCount - 1u)) |
+              (3u - seq_view.base_at(
+                        seq_len - 1u - offset - kSeqMacroPrefixChars));
+        }
+      }
+
+      output.Finish();
+      for (unsigned macro = batch.begin; macro < batch.end; ++macro) {
+        const size_t index =
+            static_cast<size_t>(tid) * kSeqMacroCount + macro;
+        if (output.cursor(macro) !=
+            thread_macro_begin[index] + thread_macro_counts[index]) {
+          xfatal("Sequence macro materialization count mismatch\n");
+        }
+      }
+    }
+    phase_timer.stop();
+    materialize_seconds += phase_timer.elapsed();
+
+    phase_timer.reset();
+    phase_timer.start();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
+    for (int macro_int = static_cast<int>(batch.begin);
+         macro_int < static_cast<int>(batch.end); ++macro_int) {
+      const unsigned macro = static_cast<unsigned>(macro_int);
+      uint32_t *const macro_data =
+          records.get() +
+          static_cast<size_t>(macro_begin[macro] -
+                              macro_begin[batch.begin]) *
+              record_words;
+      const uint64_t macro_size =
+          macro_begin[macro + 1u] - macro_begin[macro];
+      std::array<uint64_t, kBucketsPerSeqMacro> bucket_count{};
+      for (uint64_t i = 0; i < macro_size; ++i) {
+        const unsigned bucket =
+            macro_data[static_cast<size_t>(i) * record_words] >> 26u;
+        assert(bucket < kBucketsPerSeqMacro);
+        ++bucket_count[bucket];
+      }
+      std::array<uint64_t, kBucketsPerSeqMacro + 1u> bucket_begin{};
+      for (unsigned bucket = 0; bucket < kBucketsPerSeqMacro; ++bucket) {
+        bucket_begin[bucket + 1u] =
+            bucket_begin[bucket] + bucket_count[bucket];
+      }
+      assert(bucket_begin[kBucketsPerSeqMacro] == macro_size);
+
+      // A record becomes final as soon as the American-flag partition puts
+      // it into its exact three-base subbucket.  Convert its macro-relative
+      // layout at that write instead of sweeping the complete (often tens of
+      // GiB) arena once more after partitioning.  The displaced record is
+      // deliberately left untouched until its own destination is known.
+      const auto finalize_record =
+          [this, macro, record_words](uint32_t *item) {
+            if (bucket_packed_records_) {
+              constexpr unsigned kShift =
+                  (kBucketPrefixLength - kSeqMacroPrefixChars) *
+                  kBitsPerEdgeChar;
+              for (unsigned word = 0; word + 1u < record_words; ++word) {
+                item[word] = (item[word] << kShift) |
+                             (item[word + 1u] >>
+                              (kBitsPerEdgeWord - kShift));
+              }
+              item[record_words - 1u] <<= kShift;
+            } else {
+              constexpr unsigned kShift =
+                  kSeqMacroPrefixChars * kBitsPerEdgeChar;
+              for (unsigned word = record_words - 1u; word > 0u; --word) {
+                item[word] =
+                    (item[word] >> kShift) |
+                    (item[word - 1u] << (kBitsPerEdgeWord - kShift));
+              }
+              item[0] =
+                  (item[0] >> kShift) | (macro << (32u - kShift));
+            }
+          };
+
+      std::array<uint64_t, kBucketsPerSeqMacro> next{};
+      std::copy(bucket_begin.begin(), bucket_begin.end() - 1u, next.begin());
+      for (unsigned target = 0; target < kBucketsPerSeqMacro; ++target) {
+        while (next[target] < bucket_begin[target + 1u]) {
+          uint32_t *item =
+              macro_data + static_cast<size_t>(next[target]) * record_words;
+          const unsigned destination = item[0] >> 26u;
+          if (destination == target) {
+            finalize_record(item);
+            ++next[target];
+            continue;
+          }
+          assert(destination > target &&
+                 next[destination] < bucket_begin[destination + 1u]);
+          uint32_t *other =
+              macro_data + static_cast<size_t>(next[destination]) *
+                               record_words;
+          for (unsigned word = 0; word < record_words; ++word) {
+            std::swap(item[word], other[word]);
+          }
+          finalize_record(other);
+          ++next[destination];
+        }
+      }
+
+      const unsigned tid = static_cast<unsigned>(omp_get_thread_num());
+      for (unsigned local_bucket = 0;
+           local_bucket < kBucketsPerSeqMacro; ++local_bucket) {
+        const uint64_t begin = bucket_begin[local_bucket];
+        const uint64_t end = bucket_begin[local_bucket + 1u];
+        uint32_t *bucket_data =
+            macro_data + static_cast<size_t>(begin) * record_words;
+        const int64_t bucket_size = static_cast<int64_t>(end - begin);
+        bucket_sort(bucket_data, bucket_size);
+        Lv2Postprocess(0, bucket_size, static_cast<int>(tid), bucket_data,
+                       macro * kBucketsPerSeqMacro + local_bucket);
+      }
+    }
+    phase_timer.stop();
+    sort_seconds += phase_timer.elapsed();
+  }
+  xinfo("Batched source-order record materialization: {.4} sec\n",
+        materialize_seconds);
+  xinfo("Macro partition, exact-bucket sort, and graph emission: {.4} sec\n",
+        sort_seconds);
+  return true;
 }
 
 void SeqToSdbg::Lv0Postprocess() {

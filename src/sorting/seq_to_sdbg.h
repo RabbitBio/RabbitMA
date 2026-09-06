@@ -47,6 +47,8 @@ struct Seq2SdbgOption {
   std::string output_prefix;
   int mem_flag{1};
   bool need_mercy{false};
+  bool carry_stable_contigs{false};
+  bool bridge_contigs{false};
 };
 
 class SeqToSdbg : public BaseSequenceSortingEngine {
@@ -80,7 +82,6 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
   int64_t Lv1DirectAuxWordsPerItem() const override;
   int64_t Lv1DirectMemoryLimit() const override;
   bool Lv1AllowsPartialDirectItems() const override;
-  int64_t Lv1AutoWorkspaceLimit() const override;
   bool Lv1UseWriteCombine() const override;
   int Lv2SortIgnoredLowBytes() const override;
   int Lv2SortIgnoredHighBytes() const override;
@@ -91,6 +92,7 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
                               int64_t seq_to) const override;
   bool Lv2DeferPostprocess() const override;
   void Lv2PostprocessDeferred() override;
+  bool RunSpecializedMainLoop() override;
 
  private:
   // input options
@@ -105,6 +107,7 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
   // big arrays
   SeqPackage seq_pkg_;
   std::vector<mul_t> multiplicity;
+  std::vector<uint8_t> omitted_sequences_;
 
   // Fixed-length edges can be consumed twice as sequential raw streams:
   // once for exact bucket counts and once to materialize the final sortable
@@ -118,6 +121,10 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
   bool stream_input_edges_{false};
   bool stream_input_unordered_{false};
   bool stream_compact_mercy_index_{false};
+  // Maximum number of final bucket streams touched by one streamed-edge
+  // macro.  Shared-node policy derives this from the effective LLC/page
+  // budget; the exclusive default remains the historical 256.
+  unsigned stream_active_destinations_{256u};
   uint32_t stream_edge_length_{0};
   uint32_t stream_words_per_edge_{0};
   int64_t stream_num_edges_{0};
@@ -146,10 +153,7 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
 
   // output
   SdbgWriter sdbg_writer_;
-  int64_t AutomaticDirectWorkspaceLimit(uint64_t retained_bytes = 0) const;
-  int64_t BoundedTransientWorkspaceLimit(uint64_t retained_bytes,
-                                         bool report) const;
-  uint64_t CurrentRetainedBytes() const;
+  int64_t AutomaticDirectWorkspaceLimit() const;
   void ConfigurePackedSeqOffsets();
   bool ConfigureStreamedEdgeInput(const EdgeIoMetadata &metadata);
   void RetainMercyEdgesForStreamedInput(size_t original_edge_count);
@@ -165,6 +169,11 @@ class SeqToSdbg : public BaseSequenceSortingEngine {
   template <unsigned NWords, bool BucketPacked>
   void Lv1FillStreamedEdgesFor(OffsetFiller &filler, int64_t chunk_from,
                                int64_t chunk_to);
+  template <unsigned NWords, bool BucketPacked,
+            unsigned ActiveDestinations>
+  void Lv1FillStreamedEdgeMacrosFor(OffsetFiller &filler,
+                                    int64_t chunk_from, int64_t chunk_to,
+                                    std::vector<uint32_t> *records);
   int64_t EncodeSeqOffset(int64_t seq_id, unsigned offset,
                           unsigned strand) const;
   template <bool PackedOffsets>

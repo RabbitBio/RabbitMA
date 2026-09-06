@@ -3,15 +3,20 @@
 //
 
 #include "hash_mapper.h"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <mutex>
 #include <omp.h>
 #include "sequence/io/contig/contig_reader.h"
+#include "sequence/io/read_anchor_positions.h"
 #include "utils/startup_affinity.h"
 #include "utils/utils.h"
 
 namespace {
+
+constexpr uint64_t kEndpointSeedValueFlag = uint64_t{1} << 63u;
+constexpr uint64_t kRepetitiveSeedValue = UINT64_MAX;
 
 inline uint64_t EncodeContigOffset(uint32_t contig_id, uint32_t contig_offset,
                                    uint8_t strand) {
@@ -20,7 +25,11 @@ inline uint64_t EncodeContigOffset(uint32_t contig_id, uint32_t contig_offset,
 
 inline void DecodeContigOffset(uint64_t code, uint32_t &contig_id,
                                uint32_t &contig_offset, uint8_t &strand) {
-  contig_id = code >> 32;
+  // The high bit is free because the index has historically used it to mark
+  // repetitive seeds (and therefore already supports at most 2^31 contigs).
+  // Unique endpoint seeds reuse it after repetitive values are changed to an
+  // all-ones sentinel.  Mask the tag before decoding the original value.
+  contig_id = (code >> 32) & 0x7FFFFFFFULL;
   contig_offset = (code & 0xFFFFFFFFULL) >> 1;
   strand = code & 1ULL;
 }
@@ -101,6 +110,19 @@ void HashMapper::LoadAndBuild(const std::string &contig_file, int32_t min_len,
   }
   seed_kmer_size_ = seed_kmer_size;
   index_sparsity_ = sparsity;
+  // The certificate changes only how soon an already exact mapping decision
+  // is proved: every possible winner/tie is covered by disjoint seed phases,
+  // and incomplete or repetitive evidence falls back to the historical full
+  // scan.  Keep an explicit disable switch for diagnostics, but use the
+  // result-preserving path in normal runs now that it has passed cross-thread
+  // and full-output equivalence checks.
+  perfect_phase_certificate_enabled_ =
+      std::getenv("MEGAHIT_DISABLE_PERFECT_PHASE_CERTIFICATE") == nullptr;
+  phase_certificate_stats_.clear();
+  if (perfect_phase_certificate_enabled_) {
+    phase_certificate_stats_.resize(
+        static_cast<size_t>(std::max(1, omp_get_max_threads())));
+  }
   ContigReader reader(contig_file);
   reader.SetMinLen(min_len)->SetDiscardFlag(contig_flag::kLoop);
   auto sizes = reader.GetNumContigsAndBases();
@@ -184,7 +206,7 @@ void HashMapper::LoadAndBuild(const std::string &contig_file, int32_t min_len,
         auto &index = index_[shard];
         for (const auto &item : items) {
           auto result = index.emplace(item.first, item.second);
-          if (!result.second) result.first->second |= uint64_t{1} << 63u;
+          if (!result.second) result.first->second = kRepetitiveSeedValue;
         }
         items.clear();
       }
@@ -225,6 +247,8 @@ void HashMapper::LoadAndBuild(const std::string &contig_file, int32_t min_len,
     seed_filter_.clear();
     seed_filter_replicas_.clear();
     seed_filter_mask_ = 0u;
+    repetitive_seed_filter_.clear();
+    repetitive_seed_filter_mask_ = 0u;
   }
   xinfo("Number of contigs: {}, index size: {} in {} shards\n",
         refseq_.seq_count(), index_size, index_.size());
@@ -240,7 +264,7 @@ std::vector<HashMapper::TSeedKey> HashMapper::CollectUniqueEndpointSeeds(
     auto &keys = shard_keys[static_cast<size_t>(shard_id)];
     keys.reserve(index_[static_cast<size_t>(shard_id)].size() / 4u + 1u);
     for (const auto &entry : index_[static_cast<size_t>(shard_id)]) {
-      if ((entry.second >> 63u) != 0u) continue;
+      if (entry.second == kRepetitiveSeedValue) continue;
       uint32_t contig_id = 0;
       uint32_t contig_offset = 0;
       uint8_t strand = 0;
@@ -273,7 +297,9 @@ void HashMapper::BuildSeedFilter(size_t index_size) {
   if (index_size == 0) {
     seed_filter_.clear();
     seed_filter_replicas_.clear();
+    repetitive_seed_filter_.clear();
     seed_filter_mask_ = 0;
+    repetitive_seed_filter_mask_ = 0;
     return;
   }
 
@@ -299,6 +325,25 @@ void HashMapper::BuildSeedFilter(size_t index_size) {
   seed_filter_.assign(num_words, 0);
   seed_filter_replicas_.clear();
   seed_filter_mask_ = num_words - 1u;
+
+  repetitive_seed_filter_.clear();
+  repetitive_seed_filter_mask_ = 0u;
+  // Capacity affects only false positives, never correctness.  Derive a tiny
+  // power-of-two companion from the already-sized main filter instead of
+  // making an additional pass over the multi-GiB table just to count the
+  // comparatively rare repetitive entries.  If an unusual data set saturates
+  // it, the certificate simply falls back more often.
+  const size_t repetitive_words = std::max<size_t>(1u, num_words >> 7u);
+  repetitive_seed_filter_.assign(repetitive_words, 0u);
+  repetitive_seed_filter_mask_ = repetitive_words - 1u;
+  const size_t repetitive_bytes =
+      repetitive_words * sizeof(repetitive_seed_filter_[0]);
+  if (omp_get_max_threads() > 1 &&
+      InterleaveMemoryPages(repetitive_seed_filter_.data(),
+                            repetitive_bytes)) {
+    DiscardMemoryPages(repetitive_seed_filter_.data(), repetitive_bytes);
+  }
+  AdviseHugePages(repetitive_seed_filter_.data(), repetitive_bytes);
 
   // The filter is a large shared random-access array. std::vector::assign()
   // otherwise first-touches every page on the calling thread's NUMA domain,
@@ -342,8 +387,12 @@ void HashMapper::BuildSeedFilter(size_t index_size) {
       // load instead of a random phmap lookup followed by the same rejection.
       // Usable unique seeds are unchanged, so false negatives remain
       // impossible for every candidate that can affect mapping semantics.
-      if ((entry.second >> 63u) != 0u) {
+      if (entry.second == kRepetitiveSeedValue) {
         ++repetitive_entries;
+        const size_t hash = IndexHash(entry.first);
+        __atomic_fetch_or(
+            &repetitive_seed_filter_[hash & repetitive_seed_filter_mask_],
+            SeedFilterBits(hash), __ATOMIC_RELAXED);
         continue;
       }
       ++usable_entries;
@@ -373,8 +422,10 @@ void HashMapper::BuildSeedFilter(size_t index_size) {
   }
 
   xinfo("Local seed membership filter: {} bytes for {} usable and {} "
-        "repetitive indexed k-mers ({} NUMA-local copies)\n",
+        "repetitive indexed k-mers ({}-byte repetitive certificate, {} "
+        "NUMA-local copies)\n",
         filter_bytes, usable_entries, repetitive_entries,
+        repetitive_seed_filter_.size() * sizeof(uint64_t),
         seed_filter_replicas_.size() + 1u);
 }
 
@@ -465,13 +516,13 @@ void HashMapper::BuildEndpointSeedFilter(int32_t endpoint_range) {
     DiscardMemoryPages(endpoint_seed_filter_.data(), filter_bytes);
   }
   AdviseHugePages(endpoint_seed_filter_.data(), filter_bytes);
-
   uint64_t endpoint_entries = 0;
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : endpoint_entries)
   for (int64_t shard_id = 0;
        shard_id < static_cast<int64_t>(index_.size()); ++shard_id) {
-    for (const auto &entry : index_[shard_id]) {
-      if ((entry.second >> 63u) != 0u) continue;
+    for (auto &entry : index_[shard_id]) {
+      if (entry.second == kRepetitiveSeedValue) continue;
+      entry.second &= ~kEndpointSeedValueFlag;
       uint32_t contig_id, contig_offset;
       uint8_t strand;
       DecodeContigOffset(entry.second, contig_id, contig_offset, strand);
@@ -481,6 +532,7 @@ void HashMapper::BuildEndpointSeedFilter(int32_t endpoint_range) {
               contig_length) {
         continue;
       }
+      entry.second |= kEndpointSeedValueFlag;
       ++endpoint_entries;
       const size_t hash = IndexHash(entry.first);
       __atomic_fetch_or(
@@ -541,6 +593,238 @@ bool HashMapper::MayMapToEndpoint(const uint32_t *packed_words,
   return MayMapToEndpointRaw(packed_words, 0u, length, witness);
 }
 
+bool HashMapper::BuildEndpointMinimizerGate() {
+  ReleaseEndpointMinimizerGate();
+  if (seed_kmer_size_ != 31 || endpoint_range_ <= 0) return false;
+  uint64_t entries = 0u;
+#pragma omp parallel for reduction(+ : entries)
+  for (int64_t shard = 0; shard < static_cast<int64_t>(index_.size()); ++shard) {
+    for (const auto &entry : index_[shard]) {
+      entries += entry.second != kRepetitiveSeedValue &&
+                 (entry.second & kEndpointSeedValueFlag) != 0u;
+    }
+  }
+  if (entries == 0u || entries > std::numeric_limits<size_t>::max() / 4u)
+    return false;
+  size_t slots = 1u;
+  while (slots < entries * 2u) {
+    if (slots > std::numeric_limits<size_t>::max() / 2u)
+      throw std::length_error("local minimizer gate is too large");
+    slots *= 2u;
+  }
+  const size_t bytes = slots * sizeof(uint16_t);
+  const size_t domains = GetNumaTopology().domain_count();
+  const uint64_t budget = GetRuntimeResourcePolicy().memory_budget_per_job;
+  // Include every NUMA copy and the optional small filter in the bound.
+  // The original exact endpoint gate remains available when this does not fit.
+  if (budget != 0u && bytes > budget / 16u / std::max<size_t>(1u, domains) / 2u)
+    return false;
+  endpoint_anchor_offsets_.assign(slots, 0u);
+  endpoint_anchor_mask_ = slots - 1u;
+  const bool use_filter =
+      std::getenv("MEGAHIT_DISABLE_LOCAL_MINIMIZER_FILTER") == nullptr;
+  const size_t filter_words = std::max<size_t>(1u, slots / 32u);
+  endpoint_anchor_filter_.assign(use_filter ? filter_words : 0u, 0u);
+  endpoint_anchor_filter_replicas_.clear();
+  endpoint_anchor_filter_mask_ = filter_words - 1u;
+  const size_t filter_bytes = endpoint_anchor_filter_.size() * sizeof(uint64_t);
+  if (domains > 1u) {
+    BindMemoryPagesToNumaDomain(endpoint_anchor_offsets_.data(), bytes, 0u);
+    DiscardMemoryPages(endpoint_anchor_offsets_.data(), bytes);
+  }
+  AdviseHugePages(endpoint_anchor_offsets_.data(), bytes);
+  if (use_filter) {
+    BindMemoryPagesToNumaDomain(endpoint_anchor_filter_.data(), filter_bytes, 0u);
+    DiscardMemoryPages(endpoint_anchor_filter_.data(), filter_bytes);
+    AdviseHugePages(endpoint_anchor_filter_.data(), filter_bytes);
+  }
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int64_t shard = 0; shard < static_cast<int64_t>(index_.size()); ++shard) {
+    for (const auto &entry : index_[shard]) {
+      if (entry.second == kRepetitiveSeedValue ||
+          (entry.second & kEndpointSeedValueFlag) == 0u) continue;
+      uint64_t oriented = entry.first;
+      for (unsigned strand = 0; strand < 2u; ++strand) {
+        if (strand != 0u)
+          oriented = kmlib::bit::ReverseComplement<2>(entry.first) << 2u;
+        uint64_t minimum = UINT64_MAX;
+        unsigned offset = 0;
+        for (unsigned p = 0; p <= 12u; ++p) {
+          const uint64_t key = (oriented << (p * 2u)) >> 26u;
+          const uint64_t rank = ReadAnchorRankHash(key);
+          if (rank <= minimum) { minimum = rank; offset = p; }
+        }
+        // Hash collisions only add candidate offsets. Every candidate is
+        // verified against the complete original, non-repetitive 31-mer.
+        __atomic_fetch_or(
+            &endpoint_anchor_offsets_[minimum & endpoint_anchor_mask_],
+            static_cast<uint16_t>(1u << offset), __ATOMIC_RELAXED);
+        if (use_filter) {
+          const uint64_t hash = ReadAnchorMix64(minimum);
+          __atomic_fetch_or(
+              &endpoint_anchor_filter_[hash & endpoint_anchor_filter_mask_],
+              SeedFilterBits(hash), __ATOMIC_RELAXED);
+        }
+      }
+    }
+  }
+  endpoint_anchor_replicas_.resize(domains > 0u ? domains - 1u : 0u);
+  if (use_filter) endpoint_anchor_filter_replicas_.resize(
+      endpoint_anchor_replicas_.size());
+  for (size_t domain = 1u; domain < domains; ++domain) {
+    auto &replica = endpoint_anchor_replicas_[domain - 1u];
+    replica.assign(slots, 0u);
+    BindMemoryPagesToNumaDomain(replica.data(), bytes, domain);
+    DiscardMemoryPages(replica.data(), bytes);
+    AdviseHugePages(replica.data(), bytes);
+    if (use_filter) {
+      auto &filter_replica = endpoint_anchor_filter_replicas_[domain - 1u];
+      filter_replica.assign(filter_words, 0u);
+      BindMemoryPagesToNumaDomain(filter_replica.data(), filter_bytes, domain);
+      DiscardMemoryPages(filter_replica.data(), filter_bytes);
+      AdviseHugePages(filter_replica.data(), filter_bytes);
+    }
+  }
+#pragma omp parallel for
+  for (int64_t replica = 0;
+       replica < static_cast<int64_t>(endpoint_anchor_replicas_.size());
+       ++replica) {
+    std::copy(endpoint_anchor_offsets_.begin(), endpoint_anchor_offsets_.end(),
+               endpoint_anchor_replicas_[replica].begin());
+    if (use_filter)
+      std::copy(endpoint_anchor_filter_.begin(), endpoint_anchor_filter_.end(),
+                  endpoint_anchor_filter_replicas_[replica].begin());
+  }
+  xinfo("Exact endpoint minimizer gate: {} seeds, {} bytes, {} copies, "
+        "{} filter bytes\n", entries, bytes,
+        endpoint_anchor_replicas_.size() + 1u, filter_bytes);
+  return true;
+}
+
+bool HashMapper::MayMapToEndpointAnchors(
+    const uint32_t *query_words, unsigned length, const uint8_t *positions,
+    EndpointSeedWitness *witness) const {
+  if (positions == nullptr || endpoint_anchor_offsets_.empty() || length > 512u)
+    return MayMapToEndpoint(query_words, length, witness);
+  if (witness != nullptr) witness->valid = false;
+  if (length < 50u) return false;
+  const size_t domain = CurrentNumaDomain();
+  const uint16_t *const offsets =
+      domain > 0u && domain <= endpoint_anchor_replicas_.size()
+          ? endpoint_anchor_replicas_[domain - 1u].data()
+          : endpoint_anchor_offsets_.data();
+  const uint64_t *const filter = LocalEndpointSeedFilter();
+  const uint64_t *const anchor_filter = endpoint_anchor_filter_.empty()
+      ? nullptr
+      : domain > 0u && domain <= endpoint_anchor_filter_replicas_.size()
+          ? endpoint_anchor_filter_replicas_[domain - 1u].data()
+          : endpoint_anchor_filter_.data();
+  uint64_t visited[8] = {};
+  EndpointSeedWitness best;
+  best.end_position = static_cast<int32_t>(length);
+  struct AnchorProbe { uint64_t rank, filter_hash; unsigned position; };
+  struct SeedProbe {
+    uint64_t key;
+    size_t hash;
+    unsigned start;
+    uint8_t strand;
+  };
+  std::array<AnchorProbe, 32> anchors;
+  std::array<SeedProbe, 32> seeds;
+  unsigned anchor_count = 0, seed_count = 0;
+  const auto consume_seeds = [&]() {
+    uint8_t positives[32];
+    unsigned count = 0;
+    for (unsigned i = 0; i < seed_count; ++i) {
+      const auto &seed = seeds[i];
+      const uint64_t bits = SeedFilterBits(seed.hash);
+      if ((filter[seed.hash & endpoint_seed_filter_mask_] & bits) != bits)
+        continue;
+      index_[IndexShard(seed.hash)].prefetch_hash(seed.hash);
+      positives[count++] = static_cast<uint8_t>(i);
+    }
+    for (unsigned i = 0; i < count; ++i) {
+      const auto &seed = seeds[positives[i]];
+      if (seed.start + 30u >= static_cast<unsigned>(best.end_position)) continue;
+      const auto &shard = index_[IndexShard(seed.hash)];
+      const auto found = shard.find(seed.key, seed.hash);
+      if (found == shard.end() || found->second == kRepetitiveSeedValue ||
+          (found->second & kEndpointSeedValueFlag) == 0u) continue;
+      best.index_value = found->second;
+      best.end_position = seed.start + 30u;
+      best.query_strand = seed.strand;
+      best.valid = true;
+    }
+    seed_count = 0;
+  };
+  const auto consume_anchors = [&]() {
+    uint8_t positives[32];
+    unsigned positive_count = 0;
+    for (unsigned i = 0; i < anchor_count; ++i) {
+      const auto &anchor = anchors[i];
+      if (anchor_filter != nullptr) {
+        const uint64_t bits = SeedFilterBits(anchor.filter_hash);
+        if ((anchor_filter[anchor.filter_hash & endpoint_anchor_filter_mask_] &
+             bits) != bits) continue;
+      }
+      __builtin_prefetch(offsets + (anchor.rank & endpoint_anchor_mask_), 0, 3);
+      positives[positive_count++] = static_cast<uint8_t>(i);
+    }
+    for (unsigned positive = 0; positive < positive_count; ++positive) {
+      const unsigned i = positives[positive];
+      const auto &anchor = anchors[i];
+      unsigned mask = offsets[anchor.rank & endpoint_anchor_mask_];
+      while (mask != 0u) {
+        const unsigned offset = __builtin_ctz(mask);
+        mask &= mask - 1u;
+        if (anchor.position < offset) continue;
+        const unsigned start = anchor.position - offset;
+        if (start + 31u > length ||
+            start + 30u >= static_cast<unsigned>(best.end_position)) continue;
+        const uint64_t bit = uint64_t{1} << (start & 63u);
+        if ((visited[start >> 6u] & bit) != 0u) continue;
+        visited[start >> 6u] |= bit;
+        const uint64_t forward = GetWord64(query_words, 0u, start, 31, false);
+        const uint64_t reverse = kmlib::bit::ReverseComplement<2>(forward) << 2u;
+        auto &seed = seeds[seed_count++];
+        seed.strand = forward <= reverse ? 0u : 1u;
+        seed.key = seed.strand == 0u ? forward : reverse;
+        seed.hash = IndexHash(seed.key);
+        seed.start = start;
+        __builtin_prefetch(filter + (seed.hash & endpoint_seed_filter_mask_),
+                             0, 3);
+        if (seed_count == seeds.size()) consume_seeds();
+      }
+    }
+    consume_seeds();
+    anchor_count = 0;
+  };
+  for (unsigned byte = 0; byte < (length - 18u + 7u) / 8u; ++byte) {
+    unsigned bits = positions[byte];
+    while (bits != 0u) {
+      const unsigned position = byte * 8u + __builtin_ctz(bits);
+      bits &= bits - 1u;
+      if (position + 19u > length) continue;
+      if (best.valid && position > static_cast<unsigned>(best.end_position) -
+                                       30u + 12u) break;
+      const uint64_t key = GetWord64(query_words, 0u, position, 19, false) >> 26u;
+      auto &anchor = anchors[anchor_count++];
+      anchor.rank = ReadAnchorRankHash(key);
+      anchor.filter_hash = ReadAnchorMix64(anchor.rank);
+      anchor.position = position;
+      if (anchor_filter != nullptr)
+        __builtin_prefetch(anchor_filter +
+            (anchor.filter_hash & endpoint_anchor_filter_mask_), 0, 3);
+      else
+        __builtin_prefetch(offsets + (anchor.rank & endpoint_anchor_mask_), 0, 3);
+      if (anchor_count == anchors.size()) consume_anchors();
+    }
+  }
+  if (anchor_count != 0u) consume_anchors();
+  if (witness != nullptr) *witness = best;
+  return best.valid;
+}
+
 bool HashMapper::MayMapToEndpointRaw(const uint32_t *query_words,
                                      unsigned query_shift,
                                      unsigned length,
@@ -587,22 +871,18 @@ bool HashMapper::MayMapToEndpointRaw(const uint32_t *query_words,
       const EndpointProbe &probe = probes[positives[positive_id]];
       const auto &shard = index_[IndexShard(probe.hash)];
       const auto found = shard.find(probe.key, probe.hash);
-      if (found == shard.end() || (found->second >> 63u) != 0u) continue;
-      uint32_t contig_id, contig_offset;
-      uint8_t strand;
-      DecodeContigOffset(found->second, contig_id, contig_offset, strand);
-      const uint64_t contig_length = refseq_.GetSeqView(contig_id).length();
-      if (contig_offset < static_cast<uint32_t>(endpoint_range_) ||
-          static_cast<uint64_t>(contig_offset) + endpoint_range_ >=
-              contig_length) {
-        if (witness != nullptr) {
-          witness->index_value = found->second;
-          witness->end_position = probe.end_position;
-          witness->query_strand = probe.query_strand;
-          witness->valid = true;
-        }
-        return true;
+      if (found == shard.end() ||
+          (found->second & kEndpointSeedValueFlag) == 0u ||
+          found->second == kRepetitiveSeedValue) {
+        continue;
       }
+      if (witness != nullptr) {
+        witness->index_value = found->second;
+        witness->end_position = probe.end_position;
+        witness->query_strand = probe.query_strand;
+        witness->valid = true;
+      }
+      return true;
     }
     num_probes = 0u;
     return false;
@@ -685,6 +965,16 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
   MappingRecord bad_record;
   bad_record.valid = false;
 
+  PhaseCertificateStats *certificate_stats = nullptr;
+  if (perfect_phase_certificate_enabled_) {
+    const int thread = omp_in_parallel() ? omp_get_thread_num() : 0;
+    if (thread >= 0 &&
+        static_cast<size_t>(thread) < phase_certificate_stats_.size()) {
+      certificate_stats = &phase_certificate_stats_[thread];
+      ++certificate_stats->attempts;
+    }
+  }
+
   const int len = static_cast<int>(length);
   if (len < seed_kmer_size_ || len < 50)
     return bad_record;  // too short reads not reliable
@@ -723,7 +1013,8 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
   const bool power_of_two_sparsity =
       (static_cast<uint32_t>(index_sparsity_) & sparsity_mask) == 0u;
 
-  auto process_seed_value = [&](uint64_t value, uint8_t query_strand, int i) {
+  auto make_mapping_record = [&](uint64_t value, uint8_t query_strand, int i,
+                                 MappingRecord *record) {
     uint32_t contig_id, contig_offset;
     uint8_t contig_strand;
     DecodeContigOffset(value, contig_id, contig_offset, contig_strand);
@@ -744,7 +1035,7 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
 
     if (contig_to - contig_from + 1 < len &&
         contig_to - contig_from + 1 < min_mapped_len_) {
-      return;  // clipped alignment is considered iff its length >=
+      return false;  // clipped alignment is considered iff its length >=
       // min_mapped_len_
     }
 
@@ -760,21 +1051,28 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
     assert(query_to >= 0 &&
            static_cast<uint32_t>(query_to) < length);
 
-    auto rec = MappingRecord{contig_id,  contig_from,
-                             contig_to,  query_id,
-                             query_from, query_to,
-                             0,          mapping_strand,
-                             true};
+    *record = MappingRecord{contig_id,  contig_from,
+                            contig_to,  query_id,
+                            query_from, query_to,
+                            0,          mapping_strand,
+                            true};
+    return true;
+  };
+
+  auto process_seed_value = [&](uint64_t value, uint8_t query_strand, int i) {
+    MappingRecord rec;
+    if (!make_mapping_record(value, query_strand, i, &rec)) return;
     auto end = mapping_records.begin() + n_mapping_records;
     if (std::find(mapping_records.begin(), end, rec) == end) {
       if (n_mapping_records < kArraySize) {
+        const auto contig_view = refseq_.GetSeqView(rec.contig_id);
         const auto ref_address = contig_view.raw_address();
         const int64_t diagonal =
-            mapping_strand == 0
-                ? static_cast<int64_t>(contig_from) - query_from
-                : static_cast<int64_t>(contig_to) + query_from;
+            rec.strand == 0
+                ? static_cast<int64_t>(rec.contig_from) - rec.query_from
+                : static_cast<int64_t>(rec.contig_to) + rec.query_from;
         int64_t indexed_end_phase =
-            mapping_strand == 0
+            rec.strand == 0
                 ? static_cast<int64_t>(seed_kmer_size_ - 1) - diagonal
                 : diagonal;
         indexed_end_phase %= index_sparsity_;
@@ -786,7 +1084,7 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
             diagonal,
             static_cast<int32_t>(contig_view.length()),
             static_cast<uint32_t>(indexed_end_phase),
-            mapping_strand};
+            rec.strand};
         ++n_mapping_records;
       } else {
         if (v_mapping_records.get() == nullptr) {
@@ -803,13 +1101,237 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
   // normal diagonal proof then suppresses every redundant seed on this
   // alignment while all unexplained seeds are still probed in historical
   // order, so alternative mappings and tie semantics are unchanged.
-  // Keep an exact A/B path for regression tests.  The optimized path is the
-  // default; disabling it only skips reuse of the already-proven endpoint
-  // seed and otherwise executes the historical mapper unchanged.
-  if (std::getenv("MEGAHIT_DISABLE_ENDPOINT_WITNESS") == nullptr &&
-      witness != nullptr && witness->valid) {
+  if (witness != nullptr && witness->valid) {
     process_seed_value(witness->index_value, witness->query_strand,
                        witness->end_position);
+  }
+
+  // Before replaying all O(read length) sliding seeds, try to prove the exact
+  // winner from a small phase-complete certificate.  An alignment has one of
+  // `index_sparsity_` phases.  For each phase, a query seed at that phase maps
+  // to a sampled contig offset.  An absent seed therefore rules out an exact
+  // match through it, while a globally unique seed identifies the only
+  // candidate that can match it.
+  //
+  // One informative seed per phase is enough for a perfect winner.  More
+  // generally, if a known candidate scores len-e, any candidate able to tie
+  // or beat it has at most e mismatched-or-clipped query bases.  Among e+1
+  // pairwise-disjoint seeds of its phase, at least one must be fully matched.
+  // Collecting every unique candidate exposed by those seeds is therefore an
+  // exact certificate for the historical best-score/tie rule.  Repetitive or
+  // RC-palindromic seeds are skipped; insufficient evidence falls back to the
+  // complete original scan.
+  if (local_seed_filter != nullptr && perfect_phase_certificate_enabled_) {
+    constexpr unsigned kMaximumPhases = 8u;
+    constexpr unsigned kMaximumCertifiedErrors = 3u;
+    constexpr unsigned kMaximumCertificateCandidates =
+        kMaximumPhases * (kMaximumCertifiedErrors + 1u) + 1u;
+    std::array<MappingRecord, kMaximumCertificateCandidates>
+        certificate_candidates;
+    std::array<int32_t, kMaximumCertificateCandidates> candidate_scores;
+    unsigned num_certificate_candidates = 0u;
+    // A full certificate must contain every exposed candidate.  The current
+    // constants make the fixed array exactly large enough, but keep overflow
+    // fail-safe if the phase/error limits are changed later: fall back to the
+    // historical full scan instead of silently proving from an incomplete
+    // candidate set.
+    bool certificate_overflow = false;
+    std::array<std::array<unsigned, kMaximumCertifiedErrors + 1u>,
+               kMaximumPhases>
+        selected_starts;
+    std::array<unsigned, kMaximumPhases> selected_counts{};
+    const unsigned phase_count = static_cast<unsigned>(index_sparsity_);
+
+    auto add_certificate_candidate = [&](const MappingRecord &candidate) {
+      for (unsigned i = 0u; i < num_certificate_candidates; ++i) {
+        if (certificate_candidates[i] == candidate) return;
+      }
+      if (num_certificate_candidates >= certificate_candidates.size()) {
+        certificate_overflow = true;
+        return;
+      }
+      certificate_candidates[num_certificate_candidates] = candidate;
+      candidate_scores[num_certificate_candidates] =
+          Match(query_words, query_shift, candidate.query_from,
+                candidate.query_to, candidate.contig_id,
+                candidate.contig_from, candidate.contig_to,
+                candidate.strand);
+      ++num_certificate_candidates;
+    };
+
+    // The endpoint gate has already supplied a unique indexed seed for this
+    // record.  Score it before phase sampling so a one-to-three-error witness
+    // can immediately determine how much evidence is required.
+    if (n_mapping_records == 1) {
+      add_certificate_candidate(mapping_records[0]);
+    }
+
+    auto select_certificate_seed = [&](unsigned phase,
+                                       unsigned query_from) {
+      const uint64_t forward =
+          GetWord64(query_words, query_shift, static_cast<int>(query_from),
+                    seed_kmer_size_, false);
+      uint64_t reverse = kmlib::bit::ReverseComplement<2>(forward);
+      if (seed_padding != 0u) reverse <<= seed_padding;
+      // For even seed lengths an RC palindrome cannot identify which query
+      // orientation produced the unique table occurrence.
+      if (forward == reverse) return false;
+      const uint8_t query_strand = forward < reverse ? 0u : 1u;
+      const uint64_t key = query_strand == 0u ? forward : reverse;
+      const size_t hash = IndexHash(key);
+      // The hot mapper filter deliberately omits repetitive keys.  Its tiny
+      // companion distinguishes definitely-absent keys from possible
+      // repetitive ones without probing the multi-GiB table.
+      if (!SeedMayContain(hash, local_seed_filter)) {
+        if (RepetitiveSeedMayContain(hash)) {
+          if (certificate_stats != nullptr) {
+            ++certificate_stats->repetitive_skips;
+          }
+          return false;
+        }
+        selected_starts[phase][selected_counts[phase]++] = query_from;
+        return true;
+      }
+
+      if (certificate_stats != nullptr) ++certificate_stats->table_probes;
+      const auto &shard = index_[IndexShard(hash)];
+      const auto found = shard.find(key, hash);
+      if (found != shard.end() &&
+          found->second == kRepetitiveSeedValue) {
+        if (certificate_stats != nullptr) {
+          ++certificate_stats->repetitive_skips;
+        }
+        return false;
+      }
+
+      selected_starts[phase][selected_counts[phase]++] = query_from;
+      if (found != shard.end()) {
+        MappingRecord candidate;
+        const int end_position =
+            static_cast<int>(query_from) + seed_kmer_size_ - 1;
+        if (make_mapping_record(found->second, query_strand, end_position,
+                                &candidate)) {
+          add_certificate_candidate(candidate);
+        }
+      }
+      return true;
+    };
+
+    bool all_phases_certified = phase_count <= kMaximumPhases;
+    for (unsigned phase = 0u;
+         all_phases_certified && phase < phase_count; ++phase) {
+      for (unsigned query_from = phase;
+           query_from + static_cast<unsigned>(seed_kmer_size_) <= length;
+           query_from += phase_count) {
+        if (select_certificate_seed(phase, query_from)) break;
+      }
+      if (selected_counts[phase] == 0u) all_phases_certified = false;
+    }
+
+    if (all_phases_certified) {
+      unsigned num_perfect = 0u;
+      unsigned perfect_id = 0u;
+      int32_t sampled_best_score = 0;
+      for (unsigned i = 0u; i < num_certificate_candidates; ++i) {
+        sampled_best_score =
+            std::max(sampled_best_score, candidate_scores[i]);
+        if (candidate_scores[i] == len) {
+          perfect_id = i;
+          ++num_perfect;
+        }
+      }
+      if (!certificate_overflow && num_perfect == 1u) {
+        if (certificate_stats != nullptr) {
+          ++certificate_stats->unique_perfect;
+        }
+        certificate_candidates[perfect_id].mismatch = 0u;
+        return certificate_candidates[perfect_id];
+      }
+      if (!certificate_overflow && num_perfect > 1u) {
+        if (certificate_stats != nullptr) {
+          ++certificate_stats->multiple_perfect;
+        }
+        return bad_record;
+      }
+
+      const unsigned errors = sampled_best_score <= 0
+                                  ? kMaximumCertifiedErrors + 1u
+                                  : static_cast<unsigned>(
+                                        len - sampled_best_score);
+      const unsigned collection_target =
+          errors <= kMaximumCertifiedErrors
+              ? errors + 1u
+              : 0u;
+      if (collection_target != 0u) {
+        for (unsigned phase = 0u; phase < phase_count; ++phase) {
+          unsigned query_from = selected_starts[phase][0] +
+                                static_cast<unsigned>(seed_kmer_size_);
+          query_from +=
+              (phase + phase_count - query_from % phase_count) % phase_count;
+          while (selected_counts[phase] < collection_target &&
+                 query_from + static_cast<unsigned>(seed_kmer_size_) <=
+                     length) {
+            if (select_certificate_seed(phase, query_from)) {
+              query_from =
+                  selected_starts[phase][selected_counts[phase] - 1u] +
+                  static_cast<unsigned>(seed_kmer_size_);
+              query_from += (phase + phase_count -
+                             query_from % phase_count) % phase_count;
+            } else {
+              query_from += phase_count;
+            }
+          }
+        }
+
+        int32_t best_score = 0;
+        int best_id = -1;
+        bool tied = false;
+        for (unsigned i = 0u; i < num_certificate_candidates; ++i) {
+          const int32_t score = candidate_scores[i];
+          if (score == best_score) {
+            if (score != 0) tied = true;
+          } else if (score > best_score) {
+            best_score = score;
+            best_id = static_cast<int>(i);
+            tied = false;
+          }
+        }
+        const unsigned final_errors =
+            best_score <= 0
+                ? kMaximumCertifiedErrors + 1u
+                : static_cast<unsigned>(len - best_score);
+        bool enough_disjoint_seeds =
+            final_errors <= kMaximumCertifiedErrors;
+        for (unsigned phase = 0u;
+             enough_disjoint_seeds && phase < phase_count; ++phase) {
+          enough_disjoint_seeds =
+              selected_counts[phase] >= final_errors + 1u;
+        }
+        if (!certificate_overflow && enough_disjoint_seeds &&
+            best_score >= sampled_best_score) {
+            if (tied) {
+              if (certificate_stats != nullptr) {
+                ++certificate_stats->near_perfect_ties;
+              }
+              return bad_record;
+            }
+            if (best_id >= 0) {
+              MappingRecord result = certificate_candidates[best_id];
+              result.mismatch = static_cast<uint32_t>(
+                  result.query_to - result.query_from + 1 - best_score);
+              if (certificate_stats != nullptr) {
+                ++certificate_stats->unique_near_perfect;
+              }
+              return result;
+            }
+        }
+      }
+      if (certificate_stats != nullptr) {
+        ++certificate_stats->certified_without_perfect;
+      }
+    } else if (certificate_stats != nullptr) {
+      ++certificate_stats->uncertified;
+    }
   }
 
   // The blocked membership filter is deliberately much smaller than the
@@ -856,7 +1378,7 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
     return false;
   };
 
-  constexpr unsigned kSeedProbeBatch = 32;
+  constexpr unsigned kSeedProbeBatch = 64;
   std::array<SeedProbe, kSeedProbeBatch> probes;
   std::array<uint8_t, kSeedProbeBatch> positive_probe_ids;
   unsigned num_probes = 0;
@@ -891,7 +1413,9 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
       }
       const auto &index = index_[IndexShard(probe.hash)];
       const auto iter = index.find(probe.key, probe.hash);
-      if (iter == index.end() || (iter->second >> 63u) != 0u) continue;
+      if (iter == index.end() || iter->second == kRepetitiveSeedValue) {
+        continue;
+      }
       process_seed_value(iter->second, probe.strand, probe.end_position);
     }
     num_probes = 0;
@@ -935,11 +1459,11 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
   MappingRecord *best = &bad_record;
   int32_t max_match = 0;
 
-#define CHECK_BEST_UNIQ(rec)                                              \
-  do {                                                                    \
-    int32_t match_bases =                                                 \
-        Match(query_words, query_shift, rec.query_from, rec.query_to,     \
-              rec.contig_id, rec.contig_from, rec.contig_to, rec.strand); \
+#define CHECK_BEST_UNIQ(rec)                                               \
+  do {                                                                     \
+    int32_t match_bases =                                                  \
+        Match(query_words, query_shift, rec.query_from, rec.query_to,      \
+              rec.contig_id, rec.contig_from, rec.contig_to, rec.strand);  \
     if (match_bases == max_match) {                                       \
       best = &bad_record;                                                 \
     } else if (match_bases > max_match) {                                 \
@@ -971,4 +1495,28 @@ MappingRecord HashMapper::TryMapRaw(const uint32_t *query_words,
 #undef CHECK_BEST_UNIQ
 
   return *best;
+}
+
+void HashMapper::ReportPhaseCertificateStats() const {
+  if (!perfect_phase_certificate_enabled_) return;
+  PhaseCertificateStats total;
+  for (const PhaseCertificateStats &stats : phase_certificate_stats_) {
+    total.attempts += stats.attempts;
+    total.unique_perfect += stats.unique_perfect;
+    total.multiple_perfect += stats.multiple_perfect;
+    total.unique_near_perfect += stats.unique_near_perfect;
+    total.near_perfect_ties += stats.near_perfect_ties;
+    total.certified_without_perfect += stats.certified_without_perfect;
+    total.uncertified += stats.uncertified;
+    total.table_probes += stats.table_probes;
+    total.repetitive_skips += stats.repetitive_skips;
+  }
+  xinfo("Phase certificate: {} attempts, {} unique-perfect exits, {} perfect "
+        "ties, {} unique-near-perfect exits, {} near-perfect ties, {} "
+        "certified fallbacks, {} uncertified; {} exact table probes, {} "
+        "possible-repetitive skips\n",
+        total.attempts, total.unique_perfect, total.multiple_perfect,
+        total.unique_near_perfect, total.near_perfect_ties,
+        total.certified_without_perfect, total.uncertified,
+        total.table_probes, total.repetitive_skips);
 }

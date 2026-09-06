@@ -6,6 +6,7 @@
 #define MEGAHIT_FASTX_READER_H
 
 #include <zlib.h>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -21,6 +22,7 @@
  * fallback for stdin, plain files and unsupported gzip variants.
  */
 class AsyncGzipReader;
+class RangeGzipReader;
 struct MegahitRapidGzipHandle;
 
 struct MgzStream {
@@ -29,6 +31,7 @@ struct MgzStream {
   std::vector<char> mem;
   size_t pos{0};
   std::unique_ptr<AsyncGzipReader> async;
+  std::unique_ptr<RangeGzipReader> range;
   std::string error;
   ~MgzStream();
 };
@@ -36,7 +39,9 @@ typedef MgzStream *mgzFile;
 
 mgzFile mgz_open(const std::string &file_name,
                  bool allow_whole_gzip = true,
-                 unsigned gzip_threads = 0);
+                 unsigned gzip_threads = 0,
+                 uint64_t compressed_begin = 0,
+                 uint64_t compressed_end = 0);
 void mgz_close(mgzFile f);
 int mgz_read(mgzFile f, void *buf, unsigned len);
 
@@ -49,7 +54,9 @@ class FastxReader : public BaseSequenceReader {
  public:
   explicit FastxReader(const std::string &file_name,
                        bool allow_whole_gzip = true,
-                       unsigned gzip_threads = 0);
+                       unsigned gzip_threads = 0,
+                       uint64_t compressed_begin = 0,
+                       uint64_t compressed_end = 0);
   virtual ~FastxReader();
   virtual int64_t Read(SeqPackage *pkg, int64_t max_num, int64_t max_num_bases,
                        bool reverse);

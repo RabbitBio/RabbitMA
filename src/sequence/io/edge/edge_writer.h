@@ -103,6 +103,17 @@ class EdgeWriter {
     ++metadata_.num_edges;
   }
 
+  void WriteUnorderedBatch(const uint32_t *edge_ptr, size_t num_edges) {
+    assert(!metadata_.is_sorted);
+    assert(metadata_.num_files == 1);
+    if (num_edges == 0) return;
+    files_[0]->write(
+        reinterpret_cast<const char *>(edge_ptr),
+        static_cast<std::streamsize>(sizeof(uint32_t) *
+                                     metadata_.words_per_edge * num_edges));
+    metadata_.num_edges += static_cast<int64_t>(num_edges);
+  }
+
   void WriteUnordered(uint32_t *edge_ptr, int tid) {
     assert(!metadata_.is_sorted);
     assert(tid >= 0 && tid < static_cast<int>(files_.size()));

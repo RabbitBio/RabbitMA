@@ -86,18 +86,29 @@ class HashMapper {
   // by local assembly. False Bloom positives are verified in the full index;
   // false negatives for a retained mapping are impossible.
   void BuildEndpointSeedFilter(int32_t endpoint_range);
+  bool BuildEndpointMinimizerGate();
+  void ReleaseEndpointMinimizerGate() {
+    std::vector<uint16_t>().swap(endpoint_anchor_offsets_);
+    std::vector<std::vector<uint16_t>>().swap(endpoint_anchor_replicas_);
+    std::vector<uint64_t>().swap(endpoint_anchor_filter_);
+    std::vector<std::vector<uint64_t>>().swap(endpoint_anchor_filter_replicas_);
+    endpoint_anchor_mask_ = endpoint_anchor_filter_mask_ = 0;
+  }
+  bool MayMapToEndpointAnchors(const uint32_t *packed_words, unsigned length,
+                                const uint8_t *positions,
+                                EndpointSeedWitness *witness = nullptr) const;
   bool MayMapToEndpoint(
       const SeqPackage::SeqView &seq_view,
       EndpointSeedWitness *witness = nullptr) const;
   bool MayMapToEndpoint(const uint32_t *packed_words, unsigned length,
                         EndpointSeedWitness *witness = nullptr) const;
-
   MappingRecord TryMap(
       const SeqPackage ::SeqView &seq_view,
       const EndpointSeedWitness *witness = nullptr) const;
   MappingRecord TryMap(const uint32_t *packed_words, unsigned length,
                        uint64_t query_id,
                        const EndpointSeedWitness *witness = nullptr) const;
+  void ReportPhaseCertificateStats() const;
   const SeqPackage &refseq() const { return refseq_; }
 
 
@@ -108,10 +119,13 @@ class HashMapper {
     std::vector<TIndexShard>().swap(index_);
     std::vector<uint64_t>().swap(seed_filter_);
     std::vector<std::vector<uint64_t>>().swap(seed_filter_replicas_);
+    std::vector<uint64_t>().swap(repetitive_seed_filter_);
     std::vector<uint64_t>().swap(endpoint_seed_filter_);
     std::vector<std::vector<uint64_t>>().swap(
         endpoint_seed_filter_replicas_);
+    ReleaseEndpointMinimizerGate();
     seed_filter_mask_ = 0;
+    repetitive_seed_filter_mask_ = 0;
     endpoint_seed_filter_mask_ = 0;
     endpoint_range_ = 0;
     index_shard_shift_ = sizeof(size_t) * 8u;
@@ -153,6 +167,12 @@ class HashMapper {
     const uint64_t bits = SeedFilterBits(hash);
     return (filter[hash & seed_filter_mask_] & bits) == bits;
   }
+  bool RepetitiveSeedMayContain(size_t hash) const {
+    if (repetitive_seed_filter_.empty()) return false;
+    const uint64_t bits = SeedFilterBits(hash);
+    return (repetitive_seed_filter_[hash & repetitive_seed_filter_mask_] &
+            bits) == bits;
+  }
   static uint64_t SeedFilterBits(uint64_t hash) {
     return (uint64_t{1} << ((hash >> 32u) & 63u)) |
            (uint64_t{1} << ((hash >> 40u) & 63u)) |
@@ -172,6 +192,18 @@ class HashMapper {
                 int ref_to, bool strand) const;
 
  private:
+  struct alignas(64) PhaseCertificateStats {
+    uint64_t attempts{0};
+    uint64_t unique_perfect{0};
+    uint64_t multiple_perfect{0};
+    uint64_t unique_near_perfect{0};
+    uint64_t near_perfect_ties{0};
+    uint64_t certified_without_perfect{0};
+    uint64_t uncertified{0};
+    uint64_t table_probes{0};
+    uint64_t repetitive_skips{0};
+  };
+
   std::vector<TIndexShard> index_;
   unsigned index_shard_shift_{sizeof(size_t) * 8u};
   bool index_shards_power_of_two_{true};
@@ -183,16 +215,31 @@ class HashMapper {
   // change physical placement, never membership semantics.
   std::vector<std::vector<uint64_t>> seed_filter_replicas_;
   size_t seed_filter_mask_{0};
+  // The main membership filter intentionally omits repetitive seeds because
+  // the historical mapper rejects them.  A much smaller companion filter
+  // distinguishes "definitely absent" from "possibly repetitive" when the
+  // exact phase-certificate fast path needs to prove that no perfect mapping
+  // was hidden by that omission.
+  std::vector<uint64_t> repetitive_seed_filter_;
+  size_t repetitive_seed_filter_mask_{0};
   std::vector<uint64_t> endpoint_seed_filter_;
   std::vector<std::vector<uint64_t>> endpoint_seed_filter_replicas_;
   size_t endpoint_seed_filter_mask_{0};
   int32_t endpoint_range_{0};
+  std::vector<uint16_t> endpoint_anchor_offsets_;
+  std::vector<std::vector<uint16_t>> endpoint_anchor_replicas_;
+  size_t endpoint_anchor_mask_{0};
+  std::vector<uint64_t> endpoint_anchor_filter_;
+  std::vector<std::vector<uint64_t>> endpoint_anchor_filter_replicas_;
+  size_t endpoint_anchor_filter_mask_{0};
   SeqPackage refseq_;
 
   int32_t seed_kmer_size_{31};
   int32_t index_sparsity_{1};
   int32_t min_mapped_len_{50};
   double similarity_{0.95};
+  bool perfect_phase_certificate_enabled_{false};
+  mutable std::vector<PhaseCertificateStats> phase_certificate_stats_;
 };
 
 #endif  // MEGAHIT_LOCALASM_HASH_MAPPER_H

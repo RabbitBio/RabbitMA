@@ -31,7 +31,12 @@
 
 #include <omp.h>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 #include "kmlib/kmbit.h"
+#include "sequence/io/read_anchor_positions.h"
 #include "sequence/io/read_chunk_index.h"
 #include "utils/startup_affinity.h"
 
@@ -42,6 +47,12 @@ struct InputLibrary {
   std::string type;
   std::string file_name1;
   std::string file_name2;
+  uint64_t compressed_begin{0};
+  uint64_t compressed_end{0};
+
+  bool HasCompressedRange() const {
+    return compressed_end > compressed_begin;
+  }
 };
 
 bool ReadLibraryPath(std::istream &input, std::string *path) {
@@ -83,6 +94,96 @@ struct BuiltLibrary {
   std::string error;
 };
 
+class AnchorPositionWriter {
+ public:
+  AnchorPositionWriter(const std::string &path, unsigned anchor_len,
+                       unsigned window_len)
+      : path_(path), anchor_len_(anchor_len), window_len_(window_len),
+        output_(path, std::ios::binary | std::ios::out | std::ios::trunc) {
+    if (!output_) {
+      throw std::runtime_error("cannot create read-anchor position stream " +
+                               path);
+    }
+    const ReadAnchorPositionHeader placeholder;
+    output_.write(reinterpret_cast<const char *>(&placeholder),
+                  sizeof(placeholder));
+    if (!output_) {
+      throw std::runtime_error("cannot initialize read-anchor position stream");
+    }
+  }
+
+  ~AnchorPositionWriter() { output_.close(); }
+
+  void Append(const uint8_t *data, size_t bytes) {
+    if (bytes == 0u) return;
+    output_.write(reinterpret_cast<const char *>(data),
+                  static_cast<std::streamsize>(bytes));
+    if (!output_) {
+      throw std::runtime_error("failed writing read-anchor positions");
+    }
+    payload_bytes_ += bytes;
+  }
+
+  void FinishChunk(const PackedReadChunk &chunk) {
+    const uint64_t begin = chunks_.empty() ? 0u : chunks_.back().payload_end;
+    chunks_.push_back(ReadAnchorPositionChunk{
+        chunk.word_begin, chunk.word_end, chunk.read_begin, chunk.read_end,
+        begin, payload_bytes_});
+  }
+
+  bool Finalize(const BuiltLibrary &library) {
+    const bool empty_library =
+        library.num_reads == 0 && library.num_words == 0 &&
+        library.num_bases == 0 && library.chunks.empty() && chunks_.empty();
+    if (!empty_library &&
+        (chunks_.empty() || chunks_.size() != library.chunks.size() ||
+         chunks_.back().word_end != library.num_words ||
+         chunks_.back().read_end != static_cast<uint64_t>(library.num_reads))) {
+      xwarn("Read-anchor directory mismatch for {s}: writer chunks {}, "
+            "library chunks {}, last words {}/{}, last reads {}/{}\n",
+            path_.c_str(), chunks_.size(), library.chunks.size(),
+            chunks_.empty() ? 0u : chunks_.back().word_end,
+            library.num_words,
+            chunks_.empty() ? 0u : chunks_.back().read_end,
+            library.num_reads);
+      output_.close();
+      std::remove(path_.c_str());
+      return false;
+    }
+    const uint64_t index_offset =
+        sizeof(ReadAnchorPositionHeader) + payload_bytes_;
+    output_.write(reinterpret_cast<const char *>(chunks_.data()),
+                  static_cast<std::streamsize>(
+                      chunks_.size() * sizeof(ReadAnchorPositionChunk)));
+    ReadAnchorPositionHeader header;
+    header.anchor_len = anchor_len_;
+    header.window_len = window_len_;
+    header.source_bytes = library.num_words * sizeof(uint32_t);
+    header.num_reads = static_cast<uint64_t>(library.num_reads);
+    header.num_bases = static_cast<uint64_t>(library.num_bases);
+    header.payload_bytes = payload_bytes_;
+    header.chunk_index_offset = index_offset;
+    header.num_chunks = chunks_.size();
+    output_.seekp(0);
+    output_.write(reinterpret_cast<const char *>(&header), sizeof(header));
+    output_.close();
+    if (!output_) {
+      xwarn("Could not finalize read-anchor stream {s}\n", path_.c_str());
+      std::remove(path_.c_str());
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  std::string path_;
+  unsigned anchor_len_{0};
+  unsigned window_len_{0};
+  std::ofstream output_;
+  uint64_t payload_bytes_{0};
+  std::vector<ReadAnchorPositionChunk> chunks_;
+};
+
 uint64_t RegularFileSize(const std::string &path) {
   struct stat st;
   if (path == "-" || stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
@@ -93,11 +194,181 @@ uint64_t RegularFileSize(const std::string &path) {
 }
 
 uint64_t InputWorkBytes(const InputLibrary &lib) {
+  if (lib.HasCompressedRange()) {
+    return lib.compressed_end - lib.compressed_begin;
+  }
   return RegularFileSize(lib.file_name1) + RegularFileSize(lib.file_name2);
 }
 
 unsigned InputStreamCount(const InputLibrary &lib) {
   return lib.type == "pe" ? 2u : 1u;
+}
+
+struct GzipMemberRange {
+  uint64_t begin{0};
+  uint64_t end{0};
+
+  GzipMemberRange() = default;
+  GzipMemberRange(uint64_t begin_arg, uint64_t end_arg)
+      : begin(begin_arg), end(end_arg) {}
+};
+
+/**
+ * Find independently compressed gzip members without inflating the stream.
+ *
+ * A gzip header has six stable bytes around its variable MTIME field:
+ * ID1/ID2/CM/FLG at offsets 0..3 and XFL/OS at offsets 8..9.  Requiring all
+ * six bytes to match the first member makes an accidental compressed-payload
+ * hit vanishingly unlikely, while still accepting members written at
+ * different times and with different optional filenames.  This function only
+ * proposes boundaries: each range is later decoded with CRC/ISIZE checking
+ * and must end at the next proposed boundary exactly.  Any failure causes the
+ * caller to discard every staged part and use the ordinary whole-file path.
+ */
+std::vector<GzipMemberRange> DiscoverGzipMembers(const std::string &path,
+                                                 unsigned num_threads,
+                                                 double *elapsed) {
+  const double begin_time = omp_get_wtime();
+  std::vector<GzipMemberRange> ranges;
+  const uint64_t file_size = RegularFileSize(path);
+  if (file_size < 20u || num_threads < 2u || path == "-" ||
+      std::getenv("MEGAHIT_DISABLE_GZIP_MEMBER_PARALLEL") != nullptr) {
+    if (elapsed != nullptr) *elapsed = omp_get_wtime() - begin_time;
+    return ranges;
+  }
+
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (elapsed != nullptr) *elapsed = omp_get_wtime() - begin_time;
+    return ranges;
+  }
+  unsigned char first[10]{};
+  const ssize_t first_size = pread(fd, first, sizeof(first), 0);
+  if (first_size != static_cast<ssize_t>(sizeof(first)) ||
+      first[0] != 0x1fu || first[1] != 0x8bu || first[2] != 8u ||
+      (first[3] & 0xe0u) != 0u) {
+    close(fd);
+    if (elapsed != nullptr) *elapsed = omp_get_wtime() - begin_time;
+    return ranges;
+  }
+
+#ifdef POSIX_FADV_SEQUENTIAL
+  posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+  constexpr uint64_t kScanChunkBytes = uint64_t{8} << 20u;
+  const unsigned scan_threads = std::max(
+      1u, std::min<unsigned>(
+              std::min<unsigned>(num_threads, 32u),
+              static_cast<unsigned>(DivCeiling<uint64_t>(
+                  file_size, uint64_t{1} << 30u))));
+  std::vector<std::vector<uint64_t>> thread_offsets(scan_threads);
+
+#pragma omp parallel num_threads(scan_threads)
+  {
+    const unsigned tid = static_cast<unsigned>(omp_get_thread_num());
+    const uint64_t range_begin = file_size * tid / scan_threads;
+    const uint64_t range_end = file_size * (tid + 1u) / scan_threads;
+    std::vector<unsigned char> buffer(kScanChunkBytes + 32u);
+    std::vector<uint64_t> &offsets = thread_offsets[tid];
+    for (uint64_t offset = range_begin; offset < range_end;
+         offset += kScanChunkBytes) {
+      const uint64_t owned_bytes =
+          std::min<uint64_t>(kScanChunkBytes, range_end - offset);
+      const size_t request = static_cast<size_t>(std::min<uint64_t>(
+          owned_bytes + 16u, file_size - offset));
+      size_t received = 0u;
+      while (received < request) {
+        const ssize_t got = pread(fd, buffer.data() + received,
+                                  request - received,
+                                  static_cast<off_t>(offset + received));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        received += static_cast<size_t>(got);
+      }
+      if (received < 10u) continue;
+
+      size_t position = 0u;
+#if defined(__SSE2__)
+      const __m128i id1 = _mm_set1_epi8(static_cast<char>(first[0]));
+      const __m128i id2 = _mm_set1_epi8(static_cast<char>(first[1]));
+      const __m128i cm = _mm_set1_epi8(static_cast<char>(first[2]));
+      const __m128i flags = _mm_set1_epi8(static_cast<char>(first[3]));
+      for (; position + 25u <= received; position += 16u) {
+        __m128i matches = _mm_cmpeq_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                                buffer.data() + position)),
+            id1);
+        matches = _mm_and_si128(
+            matches,
+            _mm_cmpeq_epi8(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                                    buffer.data() + position + 1u)),
+                id2));
+        matches = _mm_and_si128(
+            matches,
+            _mm_cmpeq_epi8(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                                    buffer.data() + position + 2u)),
+                cm));
+        matches = _mm_and_si128(
+            matches,
+            _mm_cmpeq_epi8(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                                    buffer.data() + position + 3u)),
+                flags));
+        unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(matches));
+        while (mask != 0u) {
+          const unsigned lane = static_cast<unsigned>(__builtin_ctz(mask));
+          const size_t local = position + lane;
+          if (local < owned_bytes && local + 10u <= received &&
+              buffer[local + 8u] == first[8] &&
+              buffer[local + 9u] == first[9]) {
+            offsets.push_back(offset + local);
+          }
+          mask &= mask - 1u;
+        }
+      }
+#endif
+      for (; position + 10u <= received && position < owned_bytes;
+           ++position) {
+        if (buffer[position] == first[0] &&
+            buffer[position + 1u] == first[1] &&
+            buffer[position + 2u] == first[2] &&
+            buffer[position + 3u] == first[3] &&
+            buffer[position + 8u] == first[8] &&
+            buffer[position + 9u] == first[9]) {
+          offsets.push_back(offset + position);
+        }
+      }
+    }
+  }
+  close(fd);
+
+  std::vector<uint64_t> offsets;
+  for (std::vector<uint64_t> &local : thread_offsets) {
+    offsets.insert(offsets.end(), local.begin(), local.end());
+  }
+  std::sort(offsets.begin(), offsets.end());
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+  const size_t resource_limit =
+      std::max<size_t>(256u, static_cast<size_t>(num_threads) * 4u);
+  if (offsets.size() < 2u || offsets.front() != 0u ||
+      offsets.size() > resource_limit ||
+      file_size / offsets.size() < kScanChunkBytes) {
+    if (elapsed != nullptr) *elapsed = omp_get_wtime() - begin_time;
+    return ranges;
+  }
+  offsets.push_back(file_size);
+  ranges.reserve(offsets.size() - 1u);
+  for (size_t i = 0; i + 1u < offsets.size(); ++i) {
+    if (offsets[i + 1u] <= offsets[i]) {
+      ranges.clear();
+      break;
+    }
+    ranges.push_back(GzipMemberRange{offsets[i], offsets[i + 1u]});
+  }
+  if (elapsed != nullptr) *elapsed = omp_get_wtime() - begin_time;
+  return ranges;
 }
 
 /**
@@ -228,8 +499,10 @@ LibraryIoPlan SplitDecoderThreads(const InputLibrary &lib,
  */
 class PackedBinaryWriter {
  public:
-  explicit PackedBinaryWriter(std::ostream *output)
-      : output_(output), buffer_(8u << 20u), used_(0) {
+  explicit PackedBinaryWriter(std::ostream *output,
+                              AnchorPositionWriter *anchor_writer = nullptr)
+      : output_(output), anchor_writer_(anchor_writer),
+        buffer_(8u << 20u), used_(0) {
     for (int i = 0; i < 10; ++i) {
       dna_map_[static_cast<unsigned char>("ACGTNacgtn"[i])] =
           static_cast<unsigned char>("0123201232"[i] - '0');
@@ -295,6 +568,8 @@ class PackedBinaryWriter {
    */
   void AppendEncodedBatch(const std::vector<char> &encoded,
                           const std::vector<uint32_t> &packed_lengths,
+                          const std::vector<uint8_t> &anchor_data,
+                          const std::vector<uint32_t> &anchor_offsets,
                           BuiltLibrary *result) {
     Flush();
     if (!encoded.empty()) {
@@ -303,7 +578,13 @@ class PackedBinaryWriter {
         throw std::runtime_error("failed writing temporary binary library");
       }
     }
-    for (uint32_t packed_length : packed_lengths) {
+    if (anchor_writer_ != nullptr &&
+        anchor_offsets.size() != packed_lengths.size() + 1u) {
+      throw std::runtime_error("read-anchor batch directory mismatch");
+    }
+    size_t anchor_segment_begin = 0u;
+    for (size_t read = 0; read < packed_lengths.size(); ++read) {
+      const uint32_t packed_length = packed_lengths[read];
       const size_t num_words =
           DivCeiling<size_t>(packed_length, SeqPackage::kBasesPerWord);
       ++result->num_reads;
@@ -315,8 +596,19 @@ class PackedBinaryWriter {
       chunk_max_read_len_ =
           std::max(chunk_max_read_len_, packed_length);
       if (total_words_ - chunk_word_begin_ >= kChunkWords) {
+        if (anchor_writer_ != nullptr) {
+          const size_t anchor_end = anchor_offsets[read + 1u];
+          anchor_writer_->Append(anchor_data.data() + anchor_segment_begin,
+                                 anchor_end - anchor_segment_begin);
+          anchor_segment_begin = anchor_end;
+        }
         FinishChunk(result);
       }
+    }
+    if (anchor_writer_ != nullptr &&
+        anchor_segment_begin != anchor_data.size()) {
+      anchor_writer_->Append(anchor_data.data() + anchor_segment_begin,
+                             anchor_data.size() - anchor_segment_begin);
     }
   }
 
@@ -341,6 +633,9 @@ class PackedBinaryWriter {
         chunk_word_begin_, total_words_, chunk_read_begin_,
         static_cast<uint64_t>(result->num_reads), chunk_bases_,
         chunk_max_read_len_});
+    if (anchor_writer_ != nullptr) {
+      anchor_writer_->FinishChunk(result->chunks.back());
+    }
     chunk_word_begin_ = total_words_;
     chunk_read_begin_ = static_cast<uint64_t>(result->num_reads);
     chunk_bases_ = 0;
@@ -365,6 +660,7 @@ class PackedBinaryWriter {
   }
 
   std::ostream *output_;
+  AnchorPositionWriter *anchor_writer_{nullptr};
   std::vector<char> buffer_;
   size_t used_;
   uint64_t total_words_{0};
@@ -413,8 +709,12 @@ size_t FastqLineLength(const std::vector<char> &data, size_t begin,
  */
 class FastqRecordBatchReader {
  public:
-  FastqRecordBatchReader(const std::string &path, unsigned gzip_threads)
-      : stream_(mgz_open(path, false, gzip_threads)) {
+  FastqRecordBatchReader(const std::string &path, unsigned gzip_threads,
+                         uint64_t compressed_begin = 0,
+                         uint64_t compressed_end = 0)
+      : stream_(mgz_open(path, false, gzip_threads, compressed_begin,
+                         compressed_end)),
+        require_member_newline_(compressed_end > compressed_begin) {
     if (stream_ == nullptr) {
       throw std::runtime_error("cannot open FASTQ input " + path);
     }
@@ -442,6 +742,13 @@ class FastqRecordBatchReader {
 
       if (eof_) {
         if (line_begin_ < data_.size()) {
+          // EOF at a physical member boundary is not EOF of the FASTQ
+          // stream. Accepting an unterminated line here could invent a
+          // record boundary before bytes belonging to that same line.
+          if (require_member_newline_) {
+            throw UnsupportedParallelFastq(
+                "gzip member ends inside a FASTQ line");
+          }
           const size_t begin = line_begin_;
           const size_t end = data_.size();
           line_begin_ = end;
@@ -601,6 +908,7 @@ class FastqRecordBatchReader {
   State state_{State::kHeader};
   bool eof_{false};
   bool finished_{false};
+  bool require_member_newline_{false};
 };
 
 struct RawFastqBatch {
@@ -614,6 +922,9 @@ struct EncodedFastqBatch {
   uint64_t ordinal{0};
   std::vector<char> data;
   std::vector<uint32_t> packed_lengths;
+  std::vector<uint8_t> anchor_data;
+  std::vector<uint32_t> anchor_offsets;
+  uint64_t anchor_count{0};
   std::exception_ptr error;
 };
 
@@ -772,14 +1083,77 @@ EncodedFastqBatch EncodeFastqData(const std::vector<char> &input_data,
   return output;
 }
 
+void BuildAnchorPositionBatch(EncodedFastqBatch *batch, unsigned anchor_len,
+                              unsigned window_len) {
+  if (anchor_len == 0u) return;
+  batch->anchor_offsets.clear();
+  batch->anchor_offsets.reserve(batch->packed_lengths.size() + 1u);
+  batch->anchor_offsets.push_back(0u);
+  // One selected position per minimizer span is typical.  This is only a
+  // reserve hint; the stream remains exact for repetitive/tie-heavy reads.
+  batch->anchor_data.clear();
+  batch->anchor_data.reserve(batch->data.size() / 8u);
+  batch->anchor_count = 0u;
+  std::vector<uint32_t> queue_pos;
+  std::vector<uint64_t> queue_hash;
+  std::vector<uint64_t> queue_key;
+  std::vector<uint32_t> positions;
+  const char *cursor = batch->data.data();
+  const char *const end = cursor + batch->data.size();
+  for (uint32_t expected_length : batch->packed_lengths) {
+    if (end - cursor < static_cast<ptrdiff_t>(sizeof(uint32_t))) {
+      throw std::runtime_error("truncated encoded FASTQ batch");
+    }
+    uint32_t length = 0;
+    std::memcpy(&length, cursor, sizeof(length));
+    if (length != expected_length) {
+      throw std::runtime_error("encoded FASTQ length directory mismatch");
+    }
+    cursor += sizeof(uint32_t);
+    const size_t words =
+        DivCeiling<size_t>(length, SeqPackage::kBasesPerWord);
+    const size_t bytes = words * sizeof(uint32_t);
+    if (bytes > static_cast<size_t>(end - cursor)) {
+      throw std::runtime_error("truncated encoded FASTQ sequence");
+    }
+    const uint32_t *sequence =
+        reinterpret_cast<const uint32_t *>(cursor);
+    positions.clear();
+    ForEachPackedReadAnchor(
+        sequence, length, anchor_len, window_len, &queue_pos, &queue_hash,
+        &queue_key, [&](uint64_t, uint32_t position) {
+          positions.push_back(position);
+        });
+    AppendReadAnchorVarint(static_cast<uint32_t>(positions.size()),
+                           &batch->anchor_data);
+    uint32_t previous = 0u;
+    for (uint32_t position : positions) {
+      AppendReadAnchorVarint(position - previous, &batch->anchor_data);
+      previous = position;
+    }
+    batch->anchor_count += positions.size();
+    if (batch->anchor_data.size() > UINT32_MAX) {
+      throw std::length_error("one read-anchor batch exceeds 32-bit offsets");
+    }
+    batch->anchor_offsets.push_back(
+        static_cast<uint32_t>(batch->anchor_data.size()));
+    cursor += bytes;
+  }
+  if (cursor != end) {
+    throw std::runtime_error("encoded FASTQ batch has trailing data");
+  }
+}
+
 size_t PackedRecordBytes(uint32_t packed_length) {
   return sizeof(uint32_t) *
          (DivCeiling<size_t>(packed_length, SeqPackage::kBasesPerWord) + 1u);
 }
 
-EncodedFastqBatch EncodeFastqBatch(RawFastqBatch input) {
+EncodedFastqBatch EncodeFastqBatch(RawFastqBatch input, unsigned anchor_len,
+                                   unsigned window_len) {
   EncodedFastqBatch left = EncodeFastqData(input.data, input.ordinal);
   if (!input.paired) {
+    BuildAnchorPositionBatch(&left, anchor_len, window_len);
     return left;
   }
 
@@ -814,6 +1188,7 @@ EncodedFastqBatch EncodeFastqBatch(RawFastqBatch input) {
   if (left_offset != left.data.size() || right_offset != right.data.size()) {
     throw std::runtime_error("invalid packed paired FASTQ batch");
   }
+  BuildAnchorPositionBatch(&interleaved, anchor_len, window_len);
   return interleaved;
 }
 
@@ -828,7 +1203,9 @@ EncodedFastqBatch EncodeFastqBatch(RawFastqBatch input) {
 class ParallelFastqPacker {
  public:
   ParallelFastqPacker(unsigned worker_count, bool paired,
-                      PackedBinaryWriter *writer, BuiltLibrary *result)
+                      PackedBinaryWriter *writer, BuiltLibrary *result,
+                      unsigned anchor_len = 0,
+                      unsigned window_len = 0)
       : worker_count_(std::max(1u, worker_count)),
         max_in_flight_(std::max<unsigned>(
             2u, std::min<unsigned>(
@@ -837,7 +1214,9 @@ class ParallelFastqPacker {
                         (kFastqBatchBytes * (paired ? 2u : 1u))),
                     std::max(worker_count_, worker_count_ * 2u)))),
         writer_(writer),
-        result_(result) {
+        result_(result),
+        anchor_len_(anchor_len),
+        window_len_(window_len) {
     workers_.reserve(worker_count_);
     for (unsigned i = 0; i < worker_count_; ++i) {
       workers_.emplace_back(&ParallelFastqPacker::WorkerLoop, this);
@@ -979,7 +1358,9 @@ class ParallelFastqPacker {
     if (batch.error) {
       std::rethrow_exception(batch.error);
     }
-    writer_->AppendEncodedBatch(batch.data, batch.packed_lengths, result_);
+    writer_->AppendEncodedBatch(batch.data, batch.packed_lengths,
+                                batch.anchor_data, batch.anchor_offsets,
+                                result_);
   }
 
   void WorkerLoop() {
@@ -1005,7 +1386,7 @@ class ParallelFastqPacker {
       EncodedFastqBatch output;
       const uint64_t ordinal = task.ordinal;
       try {
-        output = EncodeFastqBatch(std::move(task));
+        output = EncodeFastqBatch(std::move(task), anchor_len_, window_len_);
       } catch (...) {
         output.ordinal = ordinal;
         output.error = std::current_exception();
@@ -1040,6 +1421,8 @@ class ParallelFastqPacker {
   unsigned max_in_flight_;
   PackedBinaryWriter *writer_;
   BuiltLibrary *result_;
+  unsigned anchor_len_{0};
+  unsigned window_len_{0};
   std::deque<RawFastqBatch> tasks_;
   std::map<uint64_t, EncodedFastqBatch> completed_;
   std::vector<std::thread> workers_;
@@ -1094,7 +1477,10 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
                  AuxiliaryThreadBudget *auxiliary_budget,
                  bool intra_file_parallel,
                  bool allow_parallel_fastq,
-                 BuiltLibrary *result) {
+                 BuiltLibrary *result,
+                 AnchorPositionWriter *anchor_writer = nullptr,
+                 unsigned anchor_len = 0,
+                 unsigned window_len = 0) {
   // Independent libraries already expose coarse-grained parallelism.  Keep
   // every gzip stream and packed-output chunk bounded instead of materializing
   // either a whole input or an intermediate SeqPackage.
@@ -1105,7 +1491,8 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
   // this is a topology choice and does not depend on file contents or a
   // machine-specific threshold.
   const bool parallel_fastq_candidate =
-      allow_parallel_fastq && intra_file_parallel &&
+      allow_parallel_fastq &&
+      (intra_file_parallel || lib.HasCompressedRange()) &&
       lib.file_name1 != "-" &&
       (lib.type != "pe" || lib.file_name2 != "-");
   const unsigned requested_auxiliary =
@@ -1114,6 +1501,37 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
           : (lib.type == "pe" ? 2u : 1u);
   AuxiliaryThreadLease auxiliary_lease(auxiliary_budget,
                                        requested_auxiliary);
+
+  if (lib.HasCompressedRange()) {
+    // Range inflation runs on this library worker; it creates no decoder
+    // helpers. Every leased slot can therefore pack complete record batches.
+    // With no helper slots, use the same strict parser synchronously, including
+    // anchor generation. Never let kseq interpret a member's EOF as file EOF.
+    if (!allow_parallel_fastq) {
+      throw UnsupportedParallelFastq("gzip member needs whole-stream parsing");
+    }
+    PackedBinaryWriter writer(output, anchor_writer);
+    FastqRecordBatchReader reader(lib.file_name1, 0u, lib.compressed_begin,
+                                  lib.compressed_end);
+    const unsigned parser_workers =
+        std::min(kMaxFastqParserWorkers, auxiliary_lease.count());
+    if (parser_workers != 0u) {
+      ParallelFastqPacker packer(parser_workers, false, &writer, result,
+                                 anchor_len, window_len);
+      packer.Run(&reader);
+    } else {
+      RawFastqBatch raw;
+      while (reader.Next(&raw.data)) {
+        EncodedFastqBatch batch =
+            EncodeFastqBatch(std::move(raw), anchor_len, window_len);
+        writer.AppendEncodedBatch(batch.data, batch.packed_lengths,
+                                   batch.anchor_data, batch.anchor_offsets,
+                                   result);
+      }
+    }
+    writer.Finish(result);
+    return;
+  }
 
   if (parallel_fastq_candidate) {
     const unsigned input_streams = InputStreamCount(lib);
@@ -1124,13 +1542,15 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
             "workers across {} input stream(s)\n",
             lib.metadata.c_str(), pipeline.gzip_threads,
             pipeline.parser_workers, input_streams);
-      PackedBinaryWriter writer(output);
+      PackedBinaryWriter writer(output, anchor_writer);
       ParallelFastqPacker packer(pipeline.parser_workers, lib.type == "pe",
-                                 &writer, result);
+                                 &writer, result, anchor_len, window_len);
       const LibraryIoPlan io_plan =
           SplitDecoderThreads(lib, pipeline.gzip_threads);
       FastqRecordBatchReader reader1(lib.file_name1,
-                                     io_plan.file1_threads);
+                                     io_plan.file1_threads,
+                                     lib.compressed_begin,
+                                     lib.compressed_end);
       if (lib.type == "pe") {
         FastqRecordBatchReader reader2(lib.file_name2,
                                        io_plan.file2_threads);
@@ -1152,7 +1572,8 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
       SplitDecoderThreads(lib, auxiliary_lease.count());
   PackedBinaryWriter writer(output);
   if (lib.type == "pe") {
-    FastxReader mate1(lib.file_name1, false, io_plan.file1_threads);
+    FastxReader mate1(lib.file_name1, false, io_plan.file1_threads,
+                      lib.compressed_begin, lib.compressed_end);
     FastxReader mate2(lib.file_name2, false, io_plan.file2_threads);
     while (true) {
       kseq_t *read1 = mate1.ReadNext();
@@ -1164,7 +1585,8 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
       writer.Append(read2->seq.s, read2->seq.l, result);
     }
   } else {
-    FastxReader reader(lib.file_name1, false, io_plan.file1_threads);
+    FastxReader reader(lib.file_name1, false, io_plan.file1_threads,
+                       lib.compressed_begin, lib.compressed_end);
     while (kseq_t *read = reader.ReadNext()) {
       writer.Append(read->seq.s, read->seq.l, result);
     }
@@ -1181,7 +1603,10 @@ void PackLibrary(const InputLibrary &lib, std::ostream *output,
 void BuildOneLibrary(const InputLibrary &lib, const std::string &part_path,
                      AuxiliaryThreadBudget *auxiliary_budget,
                      bool intra_file_parallel,
-                     BuiltLibrary *result) {
+                     BuiltLibrary *result,
+                     const std::string &anchor_part_path = std::string(),
+                     unsigned anchor_len = 0,
+                     unsigned window_len = 0) {
   result->part_path = part_path;
   {
     std::ofstream part_file(part_path,
@@ -1192,12 +1617,25 @@ void BuildOneLibrary(const InputLibrary &lib, const std::string &part_path,
                                part_path);
     }
     try {
+      std::unique_ptr<AnchorPositionWriter> anchor_writer;
+      if (!anchor_part_path.empty()) {
+        anchor_writer.reset(new AnchorPositionWriter(
+            anchor_part_path, anchor_len, window_len));
+      }
       PackLibrary(lib, &part_file, auxiliary_budget, intra_file_parallel, true,
-                  result);
+                  result, anchor_writer.get(), anchor_len, window_len);
+      if (anchor_writer && !anchor_writer->Finalize(*result)) {
+        xwarn("Read-anchor side stream was not generated for {s}\n",
+              lib.file_name1.c_str());
+      }
       return;
     } catch (const UnsupportedParallelFastq &e) {
+      // A member may split a read, quality line, or FASTA sequence. Only the
+      // original stream has the context needed for kseq's fallback semantics.
+      if (lib.HasCompressedRange()) throw;
       xwarn("Parallel FASTQ parser fallback for {s}: {s}\n",
             lib.file_name1.c_str(), e.what());
+      if (!anchor_part_path.empty()) std::remove(anchor_part_path.c_str());
     }
   }
 
@@ -1236,11 +1674,339 @@ void AppendFile(const std::string &path, std::ostream *output,
   }
 }
 
+struct FileCopyPart {
+  std::string path;
+  uint64_t source_begin;
+  uint64_t output_begin;
+  uint64_t bytes;
+};
+
+// The prefix sum of exact staged lengths fixes output order before any copy
+// starts. Independent positional writes then remove the single-writer merge
+// bottleneck without changing a byte or retaining another in-memory library.
+void CopyFileParts(const std::vector<FileCopyPart> &parts,
+                    const std::string &output_path, uint64_t output_bytes,
+                    unsigned num_threads) {
+  if (output_bytes > static_cast<uint64_t>(
+                         std::numeric_limits<off_t>::max())) {
+    throw std::length_error("merged library exceeds file-offset range");
+  }
+  const int output_fd = open(output_path.c_str(), O_WRONLY | O_CLOEXEC);
+  if (output_fd < 0) {
+    throw std::runtime_error("cannot open merged library " + output_path);
+  }
+  if (ftruncate(output_fd, static_cast<off_t>(output_bytes)) != 0) {
+    close(output_fd);
+    throw std::runtime_error("cannot size merged library " + output_path);
+  }
+  std::vector<std::string> errors(parts.size());
+  const unsigned workers = std::max(
+      1u, std::min<unsigned>(num_threads, static_cast<unsigned>(parts.size())));
+#pragma omp parallel for schedule(dynamic) num_threads(workers)
+  for (int64_t i = 0; i < static_cast<int64_t>(parts.size()); ++i) {
+    const FileCopyPart &part = parts[i];
+    int input_fd = -1;
+    try {
+      input_fd = open(part.path.c_str(), O_RDONLY | O_CLOEXEC);
+      struct stat status {};
+      if (input_fd < 0 || fstat(input_fd, &status) != 0 || status.st_size < 0 ||
+          part.source_begin > static_cast<uint64_t>(status.st_size) ||
+          part.bytes > static_cast<uint64_t>(status.st_size) - part.source_begin ||
+          part.output_begin > output_bytes ||
+          part.bytes > output_bytes - part.output_begin) {
+        throw std::runtime_error("invalid staged range " + part.path);
+      }
+      std::vector<char> buffer(static_cast<size_t>(
+          std::min<uint64_t>(part.bytes, uint64_t{8} << 20u)));
+      uint64_t copied = 0;
+      while (copied < part.bytes) {
+        const size_t request = static_cast<size_t>(
+            std::min<uint64_t>(buffer.size(), part.bytes - copied));
+        const ssize_t got = pread(input_fd, buffer.data(), request,
+                                  static_cast<off_t>(part.source_begin + copied));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+          throw std::runtime_error("cannot read staged range " + part.path);
+        }
+        size_t written = 0;
+        while (written < static_cast<size_t>(got)) {
+          const ssize_t put = pwrite(
+              output_fd, buffer.data() + written,
+              static_cast<size_t>(got) - written,
+              static_cast<off_t>(part.output_begin + copied + written));
+          if (put < 0 && errno == EINTR) continue;
+          if (put <= 0) {
+            throw std::runtime_error("cannot write merged library " + output_path);
+          }
+          written += static_cast<size_t>(put);
+        }
+        copied += static_cast<uint64_t>(got);
+      }
+    } catch (const std::exception &e) {
+      errors[i] = e.what();
+    }
+    if (input_fd >= 0) close(input_fd);
+  }
+  const bool closed = close(output_fd) == 0;
+  for (const std::string &error : errors) {
+    if (!error.empty()) throw std::runtime_error(error);
+  }
+  if (!closed) {
+    throw std::runtime_error("cannot close merged library " + output_path);
+  }
+}
+
+void MergeAnchorPositionParts(
+    const std::vector<std::string> &paths,
+    const std::vector<BuiltLibrary> &members, const BuiltLibrary &merged,
+    const std::string &output_path, unsigned anchor_len,
+    unsigned window_len, unsigned num_threads) {
+  if (paths.size() != members.size()) {
+    throw std::logic_error("read-anchor member directory mismatch");
+  }
+  std::ofstream output(output_path,
+                       std::ios::binary | std::ios::out | std::ios::trunc);
+  if (!output) {
+    throw std::runtime_error("cannot create merged read-anchor stream " +
+                             output_path);
+  }
+  const ReadAnchorPositionHeader placeholder;
+  output.write(reinterpret_cast<const char *>(&placeholder),
+               sizeof(placeholder));
+  output.flush();
+  std::vector<FileCopyPart> parts;
+  std::vector<ReadAnchorPositionChunk> chunks;
+  uint64_t payload_base = 0u;
+  uint64_t word_base = 0u;
+  uint64_t read_base = 0u;
+
+  for (size_t member = 0; member < paths.size(); ++member) {
+    std::ifstream input(paths[member],
+                        std::ios::binary | std::ios::in);
+    if (!input) {
+      throw std::runtime_error("missing read-anchor member stream " +
+                               paths[member]);
+    }
+    ReadAnchorPositionHeader header;
+    input.read(reinterpret_cast<char *>(&header), sizeof(header));
+    if (!input || header.magic != kReadAnchorPositionMagic ||
+        header.version != kReadAnchorPositionVersion ||
+        header.header_bytes != sizeof(ReadAnchorPositionHeader) ||
+        header.anchor_len != anchor_len ||
+        header.window_len != window_len ||
+        header.source_bytes != members[member].num_words * sizeof(uint32_t) ||
+        header.num_reads !=
+            static_cast<uint64_t>(members[member].num_reads) ||
+        header.num_bases !=
+            static_cast<uint64_t>(members[member].num_bases) ||
+        header.chunk_index_offset !=
+            sizeof(ReadAnchorPositionHeader) + header.payload_bytes ||
+        header.num_chunks != members[member].chunks.size()) {
+      throw std::runtime_error("invalid read-anchor member stream " +
+                               paths[member]);
+    }
+
+    parts.push_back(FileCopyPart{
+        paths[member], sizeof(ReadAnchorPositionHeader),
+        sizeof(ReadAnchorPositionHeader) + payload_base, header.payload_bytes});
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(header.chunk_index_offset));
+    std::vector<ReadAnchorPositionChunk> local(header.num_chunks);
+    if (!local.empty()) {
+      input.read(reinterpret_cast<char *>(local.data()),
+                 static_cast<std::streamsize>(
+                     local.size() * sizeof(ReadAnchorPositionChunk)));
+      if (!input) {
+        throw std::runtime_error("truncated read-anchor member index " +
+                                 paths[member]);
+      }
+    }
+    for (const ReadAnchorPositionChunk &chunk : local) {
+      chunks.push_back(ReadAnchorPositionChunk{
+          word_base + chunk.word_begin, word_base + chunk.word_end,
+          read_base + chunk.read_begin, read_base + chunk.read_end,
+          payload_base + chunk.payload_begin,
+          payload_base + chunk.payload_end});
+    }
+    payload_base += header.payload_bytes;
+    word_base += members[member].num_words;
+    read_base += static_cast<uint64_t>(members[member].num_reads);
+  }
+
+  const uint64_t index_offset =
+      sizeof(ReadAnchorPositionHeader) + payload_base;
+  CopyFileParts(parts, output_path, index_offset, num_threads);
+  output.seekp(static_cast<std::streamoff>(index_offset));
+  if (!chunks.empty()) {
+    output.write(reinterpret_cast<const char *>(chunks.data()),
+                 static_cast<std::streamsize>(
+                     chunks.size() * sizeof(ReadAnchorPositionChunk)));
+  }
+  ReadAnchorPositionHeader header;
+  header.anchor_len = anchor_len;
+  header.window_len = window_len;
+  header.source_bytes = merged.num_words * sizeof(uint32_t);
+  header.num_reads = static_cast<uint64_t>(merged.num_reads);
+  header.num_bases = static_cast<uint64_t>(merged.num_bases);
+  header.payload_bytes = payload_base;
+  header.chunk_index_offset = index_offset;
+  header.num_chunks = chunks.size();
+  output.seekp(0);
+  output.write(reinterpret_cast<const char *>(&header), sizeof(header));
+  output.close();
+  if (!output) {
+    throw std::runtime_error("failed finalizing merged read-anchor stream " +
+                             output_path);
+  }
+}
+
+bool BuildGzipMembers(const InputLibrary &library,
+                      const std::vector<GzipMemberRange> &ranges,
+                      const std::string &part_path, unsigned num_threads,
+                      const std::string &anchor_part_path,
+                      unsigned anchor_len, unsigned window_len,
+                      BuiltLibrary *result, std::string *failure) {
+  const double decode_begin = omp_get_wtime();
+  const unsigned worker_count = std::max(
+      1u, std::min<unsigned>(num_threads,
+                            static_cast<unsigned>(ranges.size())));
+  const unsigned auxiliary_count =
+      num_threads > worker_count ? num_threads - worker_count : 0u;
+  std::vector<InputLibrary> member_libraries(ranges.size(), library);
+  std::vector<BuiltLibrary> members(ranges.size());
+  std::vector<std::string> anchor_paths(ranges.size());
+  for (size_t i = 0; i < ranges.size(); ++i) {
+    // Physical members do not create biological libraries. A paired read can
+    // cross a member boundary; validate parity only after restoring order.
+    member_libraries[i].type = "se";
+    member_libraries[i].compressed_begin = ranges[i].begin;
+    member_libraries[i].compressed_end = ranges[i].end;
+    member_libraries[i].metadata =
+        library.metadata + " [gzip member " + std::to_string(i) + "]";
+    if (!anchor_part_path.empty()) {
+      anchor_paths[i] =
+          anchor_part_path + ".member." + std::to_string(i);
+    }
+  }
+
+#pragma omp parallel for schedule(dynamic) num_threads(worker_count)
+  for (int64_t member = 0;
+       member < static_cast<int64_t>(member_libraries.size()); ++member) {
+    const std::string member_path =
+        part_path + ".member." + std::to_string(member);
+    try {
+      // Give every simultaneously active member a deterministic share.  A
+      // single global first-come lease lets early members consume the final
+      // helper slots and can force late members onto the scalar fallback.
+      // Quotient/remainder partitioning uses every requested CPU while never
+      // oversubscribing it.
+      const unsigned member_slot =
+          static_cast<unsigned>(omp_get_thread_num());
+      const unsigned auxiliary_share =
+          auxiliary_count / worker_count +
+          static_cast<unsigned>(member_slot <
+                                auxiliary_count % worker_count);
+      AuxiliaryThreadBudget member_budget(auxiliary_share, 1u);
+      BuildOneLibrary(member_libraries[member], member_path,
+                      &member_budget, false, &members[member],
+                      anchor_paths[member], anchor_len, window_len);
+    } catch (const std::exception &e) {
+      members[member].error = e.what();
+      members[member].part_path = member_path;
+    }
+  }
+
+  const auto cleanup = [&]() {
+    for (const BuiltLibrary &member : members) {
+      if (!member.part_path.empty()) std::remove(member.part_path.c_str());
+    }
+    for (const std::string &path : anchor_paths) {
+      if (!path.empty()) std::remove(path.c_str());
+    }
+  };
+  for (size_t i = 0; i < members.size(); ++i) {
+    if (!members[i].error.empty()) {
+      if (failure != nullptr) *failure = members[i].error;
+      cleanup();
+      return false;
+    }
+  }
+
+  BuiltLibrary merged;
+  merged.part_path = part_path;
+  uint64_t word_base = 0u;
+  uint64_t read_base = 0u;
+  for (const BuiltLibrary &member : members) {
+    merged.num_reads += member.num_reads;
+    merged.num_bases += member.num_bases;
+    merged.max_read_len =
+        std::max(merged.max_read_len, member.max_read_len);
+    for (const PackedReadChunk &chunk : member.chunks) {
+      merged.chunks.push_back(PackedReadChunk{
+          word_base + chunk.word_begin, word_base + chunk.word_end,
+          read_base + chunk.read_begin, read_base + chunk.read_end,
+          chunk.num_bases, chunk.max_read_len});
+    }
+    word_base += member.num_words;
+    read_base += static_cast<uint64_t>(member.num_reads);
+  }
+  merged.num_words = word_base;
+  if (library.type == "interleaved" && merged.num_reads % 2 != 0) {
+    if (failure != nullptr) *failure = "interleaved library has an odd read count";
+    cleanup();
+    return false;
+  }
+
+  const double merge_begin = omp_get_wtime();
+  try {
+    std::ofstream output(part_path,
+                         std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!output) {
+      throw std::runtime_error("cannot create merged gzip-member library " +
+                               part_path);
+    }
+    std::vector<FileCopyPart> parts;
+    uint64_t output_begin = 0;
+    for (const BuiltLibrary &member : members) {
+      const uint64_t bytes = member.num_words * sizeof(uint32_t);
+      parts.push_back(FileCopyPart{member.part_path, 0, output_begin, bytes});
+      output_begin += bytes;
+    }
+    CopyFileParts(parts, part_path, output_begin, num_threads);
+    output.close();
+    if (!output) {
+      throw std::runtime_error("failed finalizing merged gzip-member library " +
+                               part_path);
+    }
+    if (!anchor_part_path.empty()) {
+      MergeAnchorPositionParts(anchor_paths, members, merged,
+                               anchor_part_path, anchor_len, window_len,
+                               num_threads);
+    }
+  } catch (const std::exception &e) {
+    if (failure != nullptr) *failure = e.what();
+    std::remove(part_path.c_str());
+    if (!anchor_part_path.empty()) std::remove(anchor_part_path.c_str());
+    cleanup();
+    return false;
+  }
+
+  cleanup();
+  xinfo("Gzip-member phases: decode/pack {.4}, ordered merge {.4} s; "
+        "{} members / {} workers\n",
+        merge_begin - decode_begin, omp_get_wtime() - merge_begin,
+        ranges.size(), worker_count);
+  *result = std::move(merged);
+  return true;
+}
+
 }  // namespace
 
 void SequenceLibCollection::Build(const std::string &lib_file,
                                   const std::string &out_prefix,
-                                  unsigned num_threads) {
+                                  unsigned num_threads,
+                                  unsigned anchor_len,
+                                  unsigned window_len) {
   std::ifstream lib_config(lib_file);
 
   if (!lib_config.is_open()) {
@@ -1318,15 +2084,58 @@ void SequenceLibCollection::Build(const std::string &lib_file,
     // restartable.  Successful output is renamed in place, so the normal path
     // still performs no second read/copy pass.
     const std::string part_path = out_prefix + ".bin.part.0";
+    const std::string anchor_path =
+        ReadAnchorPositionPath(out_prefix + ".bin");
+    const std::string anchor_part_path = anchor_path + ".part";
+    const bool build_anchor_positions =
+        anchor_len != 0u && window_len >= anchor_len;
     try {
-      BuildOneLibrary(input_libs[0], part_path, &auxiliary_budget,
-                      intra_file_parallel, &built[0]);
+      bool built_from_members = false;
+      if (input_libs[0].type != "pe") {
+        double member_scan_seconds = 0.0;
+        const std::vector<GzipMemberRange> member_ranges =
+            DiscoverGzipMembers(input_libs[0].file_name1, num_threads,
+                                &member_scan_seconds);
+        if (member_ranges.size() > 1u) {
+          xinfo("Discovered {} independently compressed gzip members in "
+                "{.3}s; decoding members in parallel with ordered commit\n",
+                member_ranges.size(), member_scan_seconds);
+          std::string member_failure;
+          built_from_members = BuildGzipMembers(
+              input_libs[0], member_ranges, part_path, num_threads,
+              build_anchor_positions ? anchor_part_path : std::string(),
+              anchor_len, window_len, &built[0], &member_failure);
+          if (!built_from_members) {
+            xwarn("Gzip-member parallel path rejected ({s}); retrying the "
+                  "validated whole stream\n",
+                  member_failure.c_str());
+          }
+        }
+      }
+      if (!built_from_members) {
+        BuildOneLibrary(input_libs[0], part_path, &auxiliary_budget,
+                        intra_file_parallel, &built[0],
+                        build_anchor_positions ? anchor_part_path
+                                               : std::string(),
+                        anchor_len, window_len);
+      }
       if (std::rename(part_path.c_str(), (out_prefix + ".bin").c_str()) != 0) {
         throw std::runtime_error("cannot publish temporary binary library " +
                                  part_path);
       }
+      if (build_anchor_positions) {
+        if (std::rename(anchor_part_path.c_str(), anchor_path.c_str()) != 0) {
+          std::remove(anchor_part_path.c_str());
+          xwarn("Could not publish read-anchor position stream for {s}.bin\n",
+                out_prefix.c_str());
+        } else {
+          xinfo("Published buildlib read-anchor positions: a={}, w={}, {s}\n",
+                anchor_len, window_len, anchor_path.c_str());
+        }
+      }
     } catch (const std::exception &e) {
       std::remove(part_path.c_str());
+      std::remove(anchor_part_path.c_str());
       xfatal("Failed to build read library: {s}\n", e.what());
     }
   } else if (worker_count == 1) {

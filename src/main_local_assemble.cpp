@@ -49,6 +49,8 @@ LocalAsmOption ParseLocalAsmOptions(int argc, char *argv[]) {
                  "alignment similarity threshold");
   desc.AddOption("num_threads", "t", opt.num_threads, "");
   desc.AddOption("output_file", "o", opt.output_file, "");
+  desc.AddOption("candidate_file", "", opt.candidate_file,
+                 "exact persistent-index candidate read offsets");
 
   try {
     desc.Parse(argc, argv);

@@ -33,6 +33,7 @@
 #include "sorting/kmsort_selector.h"
 #include "utils/startup_affinity.h"
 #include "utils/utils.h"
+#include "xxhash/xxh3.h"
 
 // A read-only view of buildlib's native [length][packed words] stream.  Count
 // only needs one producer scan when its minimizer runs carry the exact bases
@@ -681,6 +682,155 @@ inline uint64_t LoadCountPayload48(const uint8_t *source) {
   return payload;
 }
 
+// Exact per-minimizer-shard reduction for the 80-bit count path.  A shard is
+// deliberately small enough to be an independent scheduling/cache unit, yet
+// high-coverage inputs can contain many copies of the same biological key.
+// Keeping one aggregate per exact key avoids moving every 14-byte occurrence
+// through all radix passes.  Locator payloads are retained only while at
+// least one endpoint side is still unresolved; once both sides have solid
+// context, no locator belonging to that key can affect mercy-read bounds.
+class CountSuffixHashAggregator {
+ public:
+  enum : uint32_t { kEmpty = UINT32_MAX };
+
+  struct Entry {
+    uint64_t suffix{0};
+    uint64_t count{0};
+    uint64_t first_payload{0};
+    uint32_t payload_head{kEmpty};
+    uint32_t payload_tail{kEmpty};
+    uint16_t prefix{0};
+    uint8_t context_counts[10]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t connected_sides{0};
+  };
+
+  struct PayloadNode {
+    uint64_t payload;
+    uint32_t next;
+  };
+
+  void Reset() {
+    for (uint32_t slot : touched_slots_) slots_[slot] = kEmpty;
+    touched_slots_.clear();
+    entries_.clear();
+    payloads_.clear();
+    if (slots_.empty()) Grow(1024u);
+  }
+
+  uint32_t LookupOrInsert(uint16_t prefix, uint64_t suffix,
+                          uint64_t first_payload, bool *inserted) {
+    return LookupOrInsertHashed(prefix, suffix, first_payload,
+                                 Hash(prefix, suffix), inserted);
+  }
+
+  static uint64_t KeyHash(uint16_t prefix, uint64_t suffix) {
+    return Hash(prefix, suffix);
+  }
+
+  uint32_t LookupOrInsertHashed(uint16_t prefix, uint64_t suffix,
+                                 uint64_t first_payload, uint64_t hash,
+                                 bool *inserted) {
+    uint32_t slot = FindSlot(prefix, suffix, hash);
+    if (slots_[slot] != kEmpty) {
+      *inserted = false;
+      return slots_[slot];
+    }
+    if ((entries_.size() + 1u) * 10u > slots_.size() * 7u) {
+      Grow(slots_.size() * 2u);
+      slot = FindSlot(prefix, suffix, hash);
+    }
+    if (entries_.size() >= UINT32_MAX) {
+      throw std::length_error("count hash shard exceeds 32-bit entry IDs");
+    }
+    const uint32_t id = static_cast<uint32_t>(entries_.size());
+    entries_.emplace_back();
+    Entry &entry = entries_.back();
+    entry.prefix = prefix;
+    entry.suffix = suffix;
+    entry.count = 1u;
+    entry.first_payload = first_payload;
+    slots_[slot] = id;
+    touched_slots_.push_back(slot);
+    *inserted = true;
+    return id;
+  }
+
+  void AppendPayload(Entry *entry, uint64_t payload) {
+    if (payloads_.size() >= UINT32_MAX) {
+      throw std::length_error("count hash shard exceeds 32-bit payload IDs");
+    }
+    const uint32_t id = static_cast<uint32_t>(payloads_.size());
+    payloads_.push_back(PayloadNode{payload, kEmpty});
+    if (entry->payload_tail == kEmpty) {
+      entry->payload_head = entry->payload_tail = id;
+    } else {
+      payloads_[entry->payload_tail].next = id;
+      entry->payload_tail = id;
+    }
+  }
+
+  void DiscardPayloads(Entry *entry) {
+    entry->payload_head = entry->payload_tail = kEmpty;
+  }
+
+  std::vector<Entry> &entries() { return entries_; }
+  const std::vector<PayloadNode> &payloads() const { return payloads_; }
+
+ private:
+  static uint64_t Hash(uint16_t prefix, uint64_t suffix) {
+    uint64_t value = suffix ^
+                     (uint64_t(prefix) * UINT64_C(0x9e3779b97f4a7c15));
+    value ^= value >> 30u;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27u;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31u;
+    return value;
+  }
+
+  uint32_t FindSlot(uint16_t prefix, uint64_t suffix) const {
+    return FindSlot(prefix, suffix, Hash(prefix, suffix));
+  }
+
+  uint32_t FindSlot(uint16_t prefix, uint64_t suffix, uint64_t hash) const {
+    const uint32_t mask = static_cast<uint32_t>(slots_.size() - 1u);
+    uint32_t slot = static_cast<uint32_t>(hash) & mask;
+    while (slots_[slot] != kEmpty) {
+      const Entry &entry = entries_[slots_[slot]];
+      if (entry.prefix == prefix && entry.suffix == suffix) break;
+      slot = (slot + 1u) & mask;
+    }
+    return slot;
+  }
+
+  void Grow(size_t requested) {
+    size_t capacity = 1024u;
+    while (capacity < requested) {
+      if (capacity > (uint64_t{UINT32_MAX} + 1u) / 2u) {
+        throw std::length_error("count hash table exceeds 32-bit slots");
+      }
+      capacity <<= 1u;
+    }
+    if (capacity > uint64_t{UINT32_MAX} + 1u) {
+      throw std::length_error("count hash table exceeds 32-bit slots");
+    }
+    slots_.assign(capacity, kEmpty);
+    touched_slots_.clear();
+    touched_slots_.reserve(entries_.size());
+    for (uint32_t id = 0; id < entries_.size(); ++id) {
+      const Entry &entry = entries_[id];
+      const uint32_t slot = FindSlot(entry.prefix, entry.suffix);
+      slots_[slot] = id;
+      touched_slots_.push_back(slot);
+    }
+  }
+
+  std::vector<uint32_t> slots_;
+  std::vector<uint32_t> touched_slots_;
+  std::vector<Entry> entries_;
+  std::vector<PayloadNode> payloads_;
+};
+
 #ifdef __linux__
 struct CountRunSpoolBlockHeader {
   uint32_t payload_bytes;
@@ -992,6 +1142,89 @@ class AsyncCountFileRemover {
 
 struct CountExternalRunRef {
   uint64_t offset;
+};
+
+// Reduce exact repeated super-kmers before expanding their individual edges.
+// Both boundary contexts belong to the key. Read IDs and read offsets remain
+// in an occurrence chain for the minority of unresolved mercy boundaries.
+class CountRunGroups {
+ public:
+  enum : uint32_t { kEmpty = UINT32_MAX };
+  struct Group {
+    uint64_t hash;
+    uint32_t first, head, count;
+  };
+  void Build(const uint8_t *data, const CountExternalRunRef *refs,
+              size_t count, unsigned edge_length) {
+    if (count >= kEmpty) throw std::length_error("too many count run members");
+    size_t capacity = 1u;
+    while (capacity < count * 2u) capacity *= 2u;
+    slots_.assign(capacity, kEmpty);
+    groups_.clear();
+    next_.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint8_t *record = data + refs[i].offset;
+      const size_t bytes = 2u + ((edge_length + record[6] - 1u + 15u) / 16u) * 4u;
+      const uint64_t hash = XXH3_64bits(record + 6u, bytes);
+      size_t slot = hash & (capacity - 1u);
+      while (slots_[slot] != kEmpty) {
+        const Group &group = groups_[slots_[slot]];
+        const uint8_t *other = data + refs[group.first].offset;
+        if (hash == group.hash && record[6] == other[6] &&
+            std::memcmp(record + 6u, other + 6u, bytes) == 0) break;
+        slot = (slot + 1u) & (capacity - 1u);
+      }
+      if (slots_[slot] == kEmpty) {
+        slots_[slot] = groups_.size();
+        groups_.push_back(Group{hash, i, i, 1u});
+        next_[i] = kEmpty;
+      } else {
+        Group &group = groups_[slots_[slot]];
+        next_[i] = group.head;
+        group.head = i;
+        ++group.count;
+      }
+    }
+  }
+  const std::vector<Group> &groups() const { return groups_; }
+  uint32_t next(uint32_t member) const { return next_[member]; }
+
+ private:
+  std::vector<uint32_t> slots_, next_;
+  std::vector<Group> groups_;
+};
+
+// A negative result proves that a complete canonical edge occurred once.
+// Collisions can only retain extra keys for the exact reducer. A repeated
+// super-kmer sets the second-occurrence bit on its first weighted visit.
+class CountSingletonFilter {
+ public:
+  void Reset(uint64_t expanded) {
+    size_t bits = 64u;
+    while (bits / 4u < expanded) {
+      if (bits > std::numeric_limits<size_t>::max() / 2u)
+        throw std::length_error("count singleton filter is too large");
+      bits *= 2u;
+    }
+    mask_ = bits - 1u;
+    seen_.assign(bits / 64u, 0u);
+    multiple_.assign(bits / 64u, 0u);
+  }
+  void Add(uint64_t hash, uint64_t count) {
+    const uint64_t slot = hash & mask_;
+    const uint64_t bit = uint64_t{1} << (slot & 63u);
+    if (count > 1u || (seen_[slot >> 6u] & bit) != 0u)
+      multiple_[slot >> 6u] |= bit;
+    seen_[slot >> 6u] |= bit;
+  }
+  bool MayRepeat(uint64_t hash) const {
+    const uint64_t slot = hash & mask_;
+    return (multiple_[slot >> 6u] & (uint64_t{1} << (slot & 63u))) != 0u;
+  }
+
+ private:
+  size_t mask_{0};
+  std::vector<uint64_t> seen_, multiple_;
 };
 
 inline uint32_t LoadCountRunEncodedRead(const uint8_t *record) {
@@ -2211,8 +2444,29 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
     xinfo("External count radix layout: implicit 16-bit biological prefix + "
           "14-byte suffix64/payload records\n");
   }
+  const bool hash_count_eligible =
+      use_suffix64 && opt_.solid_threshold > 0 &&
+      opt_.solid_threshold <= 127 &&
+      std::getenv("MEGAHIT_DISABLE_HASH_COUNT") == nullptr;
+  const bool force_hash_count =
+      std::getenv("MEGAHIT_FORCE_HASH_COUNT") != nullptr ||
+      std::getenv("MEGAHIT_EXPERIMENTAL_HASH_COUNT") != nullptr;
+  if (hash_count_eligible) {
+    xinfo("External count reducer: adaptive exact shard-local hash "
+          "aggregation with deferred endpoint locators\n");
+  }
   const auto shard_sort = SelectSortingFunc(
       NWords, 1, Lv2SortIgnoredLowBytes(), 0);
+
+  struct alignas(64) CountCardinalityStats {
+    uint64_t distinct{0};
+    uint64_t singleton{0};
+    uint64_t doubleton{0};
+    uint64_t repeated_occurrences{0};
+  };
+  const bool diagnose_cardinality =
+      std::getenv("MEGAHIT_DIAGNOSE_COUNT_CARDINALITY") != nullptr;
+  std::vector<CountCardinalityStats> cardinality_stats(n_threads);
 
   auto postprocess_suffix64 =
       [&](CountSuffix64Record *records, uint64_t begin, uint64_t end,
@@ -2225,6 +2479,16 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
           const uint64_t suffix = records[from].suffix;
           while (to < end && records[to].suffix == suffix) ++to;
           const int64_t count = static_cast<int64_t>(to - from);
+          if (diagnose_cardinality) {
+            CountCardinalityStats &stats = cardinality_stats[thread_id];
+            ++stats.distinct;
+            if (count == 1) {
+              ++stats.singleton;
+            } else {
+              stats.repeated_occurrences += static_cast<uint64_t>(count);
+              stats.doubleton += static_cast<uint64_t>(count == 2);
+            }
+          }
           std::fill(count_prev, count_prev + 5, int64_t{0});
           std::fill(count_next, count_next + 5, int64_t{0});
           for (uint64_t i = from; i < to; ++i) {
@@ -2312,6 +2576,9 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
   std::vector<double> prefix_cpu(n_threads, 0.0);
   std::vector<double> sort_cpu(n_threads, 0.0);
   std::vector<double> postprocess_cpu(n_threads, 0.0);
+  std::vector<double> hash_cpu(n_threads, 0.0);
+  std::vector<uint64_t> hash_distinct(n_threads, 0u);
+  std::vector<uint64_t> hash_payloads(n_threads, 0u);
   std::atomic<uint64_t> processed{0};
   const double consume_begin = omp_get_wtime();
   const unsigned low_shards = 1u << spool.low_bits();
@@ -2320,6 +2587,18 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
   std::vector<unsigned> worker_domains(n_threads, 0);
   std::vector<unsigned> domain_workers(num_domains, 0);
   std::vector<CountExternalWorkspace> workspaces(n_threads);
+  std::vector<CountSuffixHashAggregator> hash_aggregators(n_threads);
+  const bool filter_singletons = opt_.solid_threshold >= 2 &&
+      std::getenv("MEGAHIT_EXPERIMENTAL_COUNT_SINGLETON_FILTER") != nullptr;
+  const bool group_exact_runs = filter_singletons ||
+      std::getenv("MEGAHIT_EXPERIMENTAL_COUNT_RUN_GROUPS") != nullptr;
+  std::vector<CountRunGroups> run_groupers(n_threads);
+  std::vector<uint64_t> grouped_run_counts(n_threads, 0u);
+  std::vector<uint64_t> grouped_occurrence_counts(n_threads, 0u);
+  std::vector<double> group_cpu(n_threads, 0.0);
+  std::vector<CountSingletonFilter> singleton_filters(n_threads);
+  std::vector<uint64_t> singleton_rejects(n_threads, 0u);
+  std::vector<double> singleton_filter_cpu(n_threads, 0.0);
 #pragma omp parallel num_threads(n_threads)
   {
     const int tid = omp_get_thread_num();
@@ -2367,8 +2646,56 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
   }
   AsyncCountFileRemover run_file_remover;
 
+  // Hash reduction is substantially cheaper when many occurrences collapse
+  // into each exact key, but a nearly unique data set should retain the radix
+  // path.  Sample the container whose spool volume is closest to the data-set
+  // mean, not a machine- or input-size threshold.  The pilot container is
+  // itself fully and exactly reduced, so probing never adds another data pass.
+  std::vector<unsigned> container_order;
+  container_order.reserve(spool.num_containers());
+  const unsigned hash_pilot_containers =
+      hash_count_eligible && spool.num_containers() != 0u ? 1u : 0u;
+  std::vector<uint8_t> container_is_pilot(spool.num_containers(), 0u);
+  if (hash_pilot_containers != 0u) {
+    long double total_spool_bytes = 0.0L;
+    for (unsigned container = 0; container < spool.num_containers();
+         ++container) {
+      total_spool_bytes += spool.Size(container);
+    }
+    const long double mean_spool_bytes =
+        total_spool_bytes / spool.num_containers();
+    long double closest_distance = std::numeric_limits<long double>::max();
+    unsigned pilot_container = 0u;
+    for (unsigned container = 0; container < spool.num_containers();
+         ++container) {
+      if (total_spool_bytes != 0.0L && spool.Size(container) == 0u) continue;
+      const long double distance =
+          std::fabs(static_cast<long double>(spool.Size(container)) -
+                    mean_spool_bytes);
+      if (distance < closest_distance) {
+        closest_distance = distance;
+        pilot_container = container;
+      }
+    }
+    container_is_pilot[pilot_container] = 1u;
+    container_order.push_back(pilot_container);
+  }
   for (unsigned container = 0; container < spool.num_containers();
        ++container) {
+    if (container_is_pilot[container] == 0u) {
+      container_order.push_back(container);
+    }
+  }
+  bool hash_count_active = hash_count_eligible;
+  uint64_t hash_pilot_occurrences = 0u;
+  uint64_t hash_pilot_distinct = 0u;
+  unsigned hash_pilots_completed = 0u;
+
+  for (unsigned container : container_order) {
+    const bool use_hash_this_container = hash_count_active;
+    const uint64_t hash_distinct_before =
+        std::accumulate(hash_distinct.begin(), hash_distinct.end(),
+                        uint64_t{0});
     const double parse_begin = omp_get_wtime();
     const std::string path = spool.Path(container);
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -2645,6 +2972,290 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
         }
         if (!found) break;
         const uint64_t n_records = occurrence_counts[low];
+        if (use_hash_this_container) {
+          const double hash_begin = omp_get_wtime();
+          CountSuffixHashAggregator &aggregator = hash_aggregators[tid];
+          aggregator.Reset();
+          const uint8_t context_cap = static_cast<uint8_t>(
+              std::min<int>(255, opt_.solid_threshold * 2));
+
+          CountRunGroups &grouper = run_groupers[tid];
+          if (group_exact_runs) {
+            const double group_begin = omp_get_wtime();
+            grouper.Build(mapped, refs.data() + run_offsets[low],
+                            run_offsets[low + 1u] - run_offsets[low], edge_length);
+            group_cpu[tid] += omp_get_wtime() - group_begin;
+            grouped_run_counts[tid] += grouper.groups().size();
+          }
+          const uint64_t iterations = group_exact_runs ? grouper.groups().size()
+              : run_offsets[low + 1u] - run_offsets[low];
+          CountSingletonFilter &singleton_filter = singleton_filters[tid];
+          if (filter_singletons) {
+            const double filter_begin = omp_get_wtime();
+            uint64_t expanded = 0;
+            for (const auto &group : grouper.groups())
+              expanded += mapped[refs[run_offsets[low] + group.first].offset + 6u];
+            singleton_filter.Reset(expanded);
+            for (const auto &group : grouper.groups()) {
+              const uint8_t *record = mapped +
+                  refs[run_offsets[low] + group.first].offset;
+              const uint32_t *bases =
+                  reinterpret_cast<const uint32_t *>(record + 8u);
+              const unsigned length = record[6];
+              Kmer<NWords, uint32_t> edge;
+              edge.InitFromPtr(bases, 0u, edge_length);
+              Kmer<NWords, uint32_t> reverse = edge;
+              reverse.ReverseComplement(edge_length);
+              for (unsigned item = 0; item < length; ++item) {
+                const auto &canonical = reverse.cmp(edge, edge_length) < 0
+                    ? reverse : edge;
+                const uint32_t *words = canonical.data();
+                const uint16_t prefix = words[0] >> 16u;
+                const uint64_t suffix =
+                    (uint64_t(words[0] & 0xFFFFu) << 48u) |
+                    (uint64_t(words[1]) << 16u) | (uint64_t(words[2]) >> 16u);
+                singleton_filter.Add(CountSuffixHashAggregator::KeyHash(
+                    prefix, suffix), group.count);
+                if (item + 1u != length) {
+                  const uint8_t base = SeqPackage::TVector::at(
+                      bases, item + edge_length);
+                  edge.ShiftAppend(base, edge_length);
+                  reverse.ShiftPreappend(3u - base, edge_length);
+                }
+              }
+            }
+            singleton_filter_cpu[tid] += omp_get_wtime() - filter_begin;
+          }
+          uint64_t rejected_here = 0;
+          for (uint64_t iteration = 0; iteration < iterations; ++iteration) {
+            const uint64_t run_index = run_offsets[low] + (group_exact_runs
+                ? grouper.groups()[iteration].first : iteration);
+            const uint64_t multiplicity = group_exact_runs
+                ? grouper.groups()[iteration].count : 1u;
+            const uint8_t *record = mapped + refs[run_index].offset;
+            const uint32_t read_id = DecodeCountRunReadId(
+                record, spool.read_shard_bits());
+            const unsigned start = record[5];
+            const unsigned run_length = record[6];
+            if (group_exact_runs) grouped_occurrence_counts[tid] += run_length;
+            const unsigned boundary_context = record[7] & 0x3Fu;
+            const uint32_t *packed_bases =
+                reinterpret_cast<const uint32_t *>(record + 8u);
+            const auto base_at = [&](unsigned position) -> uint8_t {
+              return static_cast<uint8_t>(
+                  SeqPackage::TVector::at(packed_bases, position));
+            };
+            Kmer<NWords, uint32_t> edge;
+            edge.InitFromPtr(packed_bases, 0, edge_length);
+            Kmer<NWords, uint32_t> reverse = edge;
+            reverse.ReverseComplement(edge_length);
+            uint64_t encoded_offset =
+                (static_cast<uint64_t>(read_id) << read_locator_shift_) |
+                (static_cast<uint64_t>(start) << 1u);
+
+            for (unsigned item = 0; item < run_length; ++item) {
+              const bool is_reverse = reverse.cmp(edge, edge_length) < 0;
+              const auto &canonical = is_reverse ? reverse : edge;
+              const uint32_t *words = canonical.data();
+              const uint16_t prefix = static_cast<uint16_t>(words[0] >> 16u);
+              const uint64_t suffix =
+                  (static_cast<uint64_t>(words[0] & 0xFFFFu) << 48u) |
+                  (static_cast<uint64_t>(words[1]) << 16u) |
+                  (static_cast<uint64_t>(words[2]) >> 16u);
+              const uint64_t key_hash = CountSuffixHashAggregator::KeyHash(
+                  prefix, suffix);
+              if (filter_singletons && !singleton_filter.MayRepeat(key_hash)) {
+                assert(multiplicity == 1u);
+                ++rejected_here;
+              } else {
+                const unsigned previous =
+                    item == 0 ? boundary_context >> 3u : base_at(item - 1u);
+                const unsigned next =
+                    item + edge_length < edge_length + run_length - 1u
+                        ? base_at(item + edge_length)
+                        : boundary_context & 7u;
+                const uint64_t locator =
+                    encoded_offset | static_cast<unsigned>(is_reverse);
+                uint64_t context;
+                if (!is_reverse) {
+                  context = (previous << 3u) | next;
+                } else {
+                  const unsigned canonical_previous =
+                      next == kSentinelValue ? kSentinelValue : 3u - next;
+                  const unsigned canonical_next =
+                      previous == kSentinelValue ? kSentinelValue
+                                                 : 3u - previous;
+                  context = (canonical_previous << 3u) | canonical_next;
+                }
+
+                const uint64_t payload = (locator << 6u) | context;
+                bool inserted = false;
+                const uint32_t entry_id = aggregator.LookupOrInsertHashed(
+                    prefix, suffix, payload, key_hash, &inserted);
+                CountSuffixHashAggregator::Entry &entry =
+                    aggregator.entries()[entry_id];
+                entry.count += multiplicity - static_cast<uint64_t>(inserted);
+
+                const unsigned previous_context =
+                    static_cast<unsigned>(context >> 3u);
+                const unsigned next_context =
+                    static_cast<unsigned>(context & 7u);
+                uint8_t &previous_count =
+                    entry.context_counts[previous_context];
+                uint8_t &next_count =
+                    entry.context_counts[5u + next_context];
+                previous_count = static_cast<uint8_t>(std::min<uint64_t>(
+                    context_cap, previous_count + multiplicity));
+                next_count = static_cast<uint8_t>(std::min<uint64_t>(
+                    context_cap, next_count + multiplicity));
+                if (previous_context < 4u &&
+                    previous_count >= opt_.solid_threshold) {
+                  entry.connected_sides |= 1u;
+                }
+                if (next_context < 4u &&
+                    next_count >= opt_.solid_threshold) {
+                  entry.connected_sides |= 2u;
+                }
+                if (entry.connected_sides == 3u) {
+                  aggregator.DiscardPayloads(&entry);
+                } else if (!group_exact_runs || multiplicity == 1u) {
+                  if (!inserted) aggregator.AppendPayload(&entry, payload);
+                } else {
+                  const auto &group = grouper.groups()[iteration];
+                  for (uint32_t member = group.head;
+                       member != CountRunGroups::kEmpty;
+                       member = grouper.next(member)) {
+                    if (inserted && member == group.first) continue;
+                    const uint8_t *member_record =
+                        mapped + refs[run_offsets[low] + member].offset;
+                    const uint64_t member_read = DecodeCountRunReadId(
+                        member_record, spool.read_shard_bits());
+                    const uint64_t member_locator =
+                        (member_read << read_locator_shift_) |
+                        (uint64_t(member_record[5] + item) << 1u) |
+                        static_cast<unsigned>(is_reverse);
+                    aggregator.AppendPayload(&entry, (member_locator << 6u) | context);
+                  }
+                }
+              }
+
+              if (item + 1u != run_length) {
+                encoded_offset += 2u;
+                const uint8_t c = base_at(item + edge_length);
+                edge.ShiftAppend(c, edge_length);
+                reverse.ShiftPreappend(3u - c, edge_length);
+              }
+            }
+          }
+
+          const int64_t unambiguous_context =
+              std::max<int64_t>(1, opt_.solid_threshold) * 2;
+          uint32_t packed_edge[3];
+          for (const CountSuffixHashAggregator::Entry &entry :
+               aggregator.entries()) {
+            bool has_in = false;
+            bool has_out = false;
+            bool guaranteed_in = false;
+            bool guaranteed_out = false;
+            uint8_t verify_in_mask = 0u;
+            uint8_t verify_out_mask = 0u;
+            for (unsigned base = 0; base < 4u; ++base) {
+              const int64_t count_in = entry.context_counts[base];
+              const int64_t count_out = entry.context_counts[5u + base];
+              has_in |= count_in >= opt_.solid_threshold;
+              has_out |= count_out >= opt_.solid_threshold;
+              guaranteed_in |= count_in >= unambiguous_context;
+              guaranteed_out |= count_out >= unambiguous_context;
+              if (count_in >= opt_.solid_threshold &&
+                  count_in < unambiguous_context) {
+                verify_in_mask |= static_cast<uint8_t>(1u << base);
+              }
+              if (count_out >= opt_.solid_threshold &&
+                  count_out < unambiguous_context) {
+                verify_out_mask |= static_cast<uint8_t>(1u << base);
+              }
+            }
+
+            if ((!has_in || !has_out) &&
+                entry.count >=
+                    static_cast<uint64_t>(opt_.solid_threshold)) {
+              const auto apply_payload = [&](uint64_t payload) {
+                const uint64_t locator = payload >> 6u;
+                const unsigned strand = locator & 1u;
+                const uint32_t offset = static_cast<uint32_t>(
+                    (locator >> 1u) & read_offset_mask_);
+                const uint32_t read_id = static_cast<uint32_t>(
+                    locator >> read_locator_shift_);
+                if ((!has_in && strand == 0u) ||
+                    (!has_out && strand != 0u)) {
+                  UpdateLast0In(read_id, offset);
+                }
+                if ((!has_out && strand == 0u) ||
+                    (!has_in && strand != 0u)) {
+                  UpdateFirst0Out(read_id, offset + 1u);
+                }
+              };
+              apply_payload(entry.first_payload);
+              uint32_t payload_id = entry.payload_head;
+              while (payload_id != CountSuffixHashAggregator::kEmpty) {
+                const CountSuffixHashAggregator::PayloadNode &node =
+                    aggregator.payloads()[payload_id];
+                apply_payload(node.payload);
+                payload_id = node.next;
+              }
+            }
+
+            edge_counter_.Add(static_cast<int64_t>(entry.count), tid);
+            if (entry.count >=
+                static_cast<uint64_t>(opt_.solid_threshold)) {
+              packed_edge[0] =
+                  (static_cast<uint32_t>(entry.prefix) << 16u) |
+                  static_cast<uint32_t>(entry.suffix >> 48u);
+              packed_edge[1] =
+                  static_cast<uint32_t>(entry.suffix >> 16u);
+              packed_edge[2] =
+                  (static_cast<uint32_t>(entry.suffix) << 16u) |
+                  static_cast<uint32_t>(std::min<uint64_t>(
+                      kMaxMul, entry.count));
+              edge_writer_.WriteUnordered(packed_edge, tid);
+              WriteEndpointCandidate(
+                  packed_edge, !has_in, !has_out,
+                  guaranteed_in ? 0u : verify_in_mask,
+                  guaranteed_out ? 0u : verify_out_mask, tid);
+              uint64_t *histogram = seq_bucket_histograms_.data() +
+                                    static_cast<size_t>(tid) * kNumBuckets;
+              const uint16_t key = ExtractCountEdgeWindow8(packed_edge, 1u);
+              const unsigned reverse_window_offset =
+                  opt_.k - kBucketPrefixLength;
+              const uint16_t reverse_key = ReverseComplementCountWindow8(
+                  ExtractCountEdgeWindow8(packed_edge,
+                                          reverse_window_offset));
+              ++histogram[key];
+              ++histogram[reverse_key];
+            }
+            if (diagnose_cardinality) {
+              CountCardinalityStats &stats = cardinality_stats[tid];
+              ++stats.distinct;
+              if (entry.count == 1u) {
+                ++stats.singleton;
+              } else {
+                stats.repeated_occurrences += entry.count;
+                stats.doubleton += static_cast<uint64_t>(entry.count == 2u);
+              }
+            }
+          }
+          hash_distinct[tid] += aggregator.entries().size() + rejected_here;
+          if (diagnose_cardinality) {
+            cardinality_stats[tid].distinct += rejected_here;
+            cardinality_stats[tid].singleton += rejected_here;
+          }
+          singleton_rejects[tid] += rejected_here;
+          edge_counter_.AddSingletons(rejected_here, tid);
+          hash_payloads[tid] += aggregator.payloads().size();
+          hash_cpu[tid] += omp_get_wtime() - hash_begin;
+          processed.fetch_add(n_records, std::memory_order_relaxed);
+          continue;
+        }
         const size_t workspace_bytes =
             static_cast<size_t>(n_records) * (NWords + 1u) *
             sizeof(uint32_t);
@@ -2832,6 +3443,35 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
     }
 
     run_file_remover.Enqueue(spool.Path(container));
+
+    if (use_hash_this_container && container_is_pilot[container] != 0u) {
+      const uint64_t hash_distinct_after =
+          std::accumulate(hash_distinct.begin(), hash_distinct.end(),
+                          uint64_t{0});
+      hash_pilot_distinct += hash_distinct_after - hash_distinct_before;
+      hash_pilot_occurrences +=
+          std::accumulate(occurrence_counts.begin(), occurrence_counts.end(),
+                          uint64_t{0});
+      ++hash_pilots_completed;
+      if (hash_pilots_completed == hash_pilot_containers &&
+          !force_hash_count) {
+        // Around one distinct key per two occurrences, the hash entry/slot
+        // footprint reaches the two materialized radix buffers and no longer
+        // buys enough record compaction to justify random probes.  This is an
+        // algorithmic break-even rule; it does not encode a particular CPU,
+        // cache size, input size, or thread count.
+        hash_count_active = hash_pilot_distinct <=
+                            hash_pilot_occurrences / 2u;
+        xinfo("Exact hash count pilot: {} distinct / {} occurrences "
+              "({.3} pct); {} remaining containers\n",
+              hash_pilot_distinct, hash_pilot_occurrences,
+              hash_pilot_occurrences == 0u
+                  ? 0.0
+                  : 100.0 * static_cast<double>(hash_pilot_distinct) /
+                        hash_pilot_occurrences,
+              hash_count_active ? "hashing" : "using radix sort for");
+      }
+    }
   }
 
   run_file_remover.Finish();
@@ -2844,11 +3484,64 @@ bool KmerCounter::RunExternalSegmentedCountFor() {
     xfatal("External count processed {} of {} records\n",
            processed.load(std::memory_order_relaxed), total_occurrences);
   }
+  if (diagnose_cardinality && use_suffix64) {
+    uint64_t distinct = 0;
+    uint64_t singleton = 0;
+    uint64_t doubleton = 0;
+    uint64_t repeated_occurrences = 0;
+    for (const CountCardinalityStats &stats : cardinality_stats) {
+      distinct += stats.distinct;
+      singleton += stats.singleton;
+      doubleton += stats.doubleton;
+      repeated_occurrences += stats.repeated_occurrences;
+    }
+    xinfo("Exact count cardinality: {} distinct keys; {} singleton keys "
+          "({.3} pct distinct, {.3} pct records); {} doubleton keys; {} "
+          "records belong to repeated keys ({.3} pct)\n",
+          distinct, singleton,
+          distinct == 0 ? 0.0
+                        : 100.0 * static_cast<double>(singleton) / distinct,
+          total_occurrences == 0
+              ? 0.0
+              : 100.0 * static_cast<double>(singleton) / total_occurrences,
+          doubleton, repeated_occurrences,
+          total_occurrences == 0
+              ? 0.0
+              : 100.0 * static_cast<double>(repeated_occurrences) /
+                    total_occurrences);
+  }
+  if (hash_count_eligible) {
+    xinfo("Exact hash count profile: CPU-s reducer={.3}; {} exact keys; "
+          "{} deferred locator nodes\n",
+          std::accumulate(hash_cpu.begin(), hash_cpu.end(), 0.0),
+          std::accumulate(hash_distinct.begin(), hash_distinct.end(),
+                          uint64_t{0}),
+          std::accumulate(hash_payloads.begin(), hash_payloads.end(),
+                          uint64_t{0}));
+  }
+  if (group_exact_runs) {
+    xinfo("Exact run groups: {} groups, {} expanded occurrences; "
+          "grouping {.3} CPU seconds\n",
+          std::accumulate(grouped_run_counts.begin(), grouped_run_counts.end(),
+                            uint64_t{0}),
+          std::accumulate(grouped_occurrence_counts.begin(),
+                            grouped_occurrence_counts.end(), uint64_t{0}),
+          std::accumulate(group_cpu.begin(), group_cpu.end(), 0.0));
+  }
+  if (filter_singletons) {
+    xinfo("Exact singleton certificate: {} unique keys skipped; "
+          "filter construction {.3} CPU seconds\n",
+          std::accumulate(singleton_rejects.begin(), singleton_rejects.end(),
+                            uint64_t{0}),
+          std::accumulate(singleton_filter_cpu.begin(), singleton_filter_cpu.end(),
+                            0.0));
+  }
   double min_worker_compute = std::numeric_limits<double>::max();
   double max_worker_compute = 0;
   for (int thread = 0; thread < n_threads; ++thread) {
     const double compute = materialize_cpu[thread] + prefix_cpu[thread] +
-                           sort_cpu[thread] + postprocess_cpu[thread];
+                           sort_cpu[thread] + postprocess_cpu[thread] +
+                           hash_cpu[thread];
     min_worker_compute = std::min(min_worker_compute, compute);
     max_worker_compute = std::max(max_worker_compute, compute);
   }

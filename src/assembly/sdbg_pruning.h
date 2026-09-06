@@ -31,7 +31,7 @@ using std::vector;
 
 namespace sdbg_pruning {
 
-double InferMinDepth(SDBG &dbg);
+double InferMinDepth(SDBG &dbg, const std::vector<uint64_t> &extra_counts = {});
 
 // tips removal
 uint64_t RemoveTips(SDBG &dbg, int max_tip_len);

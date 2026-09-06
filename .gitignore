@@ -38,3 +38,12 @@ clang
 sanitizer
 cov
 tsan
+
+# Local build and performance experiments
+/build-*/
+/benchmark-results/
+/shared-policy-smoke.*/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

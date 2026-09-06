@@ -21,12 +21,14 @@
 
 
 import errno
+import ctypes
 import getopt
 import glob
 import json
 import logging
 import multiprocessing
 import os
+import stat
 import shutil
 import signal
 import subprocess
@@ -36,6 +38,7 @@ import time
 import math
 
 logger = logging.getLogger(__name__)
+_numa_reservation = None
 
 _usage_message = '''
 contact: Dinghua Li <voutcn@gmail.com>
@@ -84,10 +87,15 @@ Optional Arguments:
 
   Hardware options:
     -m/--memory              <float>        max memory in byte to be used in SdBG construction
-                                            (if set between 0-1, fraction of the machine's total memory) [0.9]
+                                            (if set between 0-1, fraction of the selected NUMA domain,
+                                            or of the machine when automatic placement is unavailable) [0.9]
     --mem-flag               <int>          SdBG builder memory mode. 0: minimum; 1: moderate;
                                             others: use all memory specified by '-m/--memory' [1]
     -t/--num-cpu-threads     <int>          number of CPU threads [# of logical processors]
+    --numa-node              <int|auto|off> explicit CPU/private-memory binding; off disables automatic placement
+                                            default: coordinate local CPU placement with other instances
+    --jobs-per-node          <int>          RabbitMA jobs sharing the same CPU/cache/memory allocation [1]
+    --memory-budget-per-job  <float>        explicit memory cap in bytes for this job [auto]
     --no-hw-accel                           run RabbitMA without BMI2 and POPCNT hardware instructions
 
   Output options:
@@ -106,8 +114,18 @@ Other Arguments:
 '''
 
 
+def launch_process(*args, **kwargs):
+    # A core process must retain its CPU reservation even if the launcher is
+    # killed. flock releases the reservation after the last inheriting process
+    # exits, without PID files, stale-process detection or a background daemon.
+    if _numa_reservation is not None:
+        kwargs['pass_fds'] = tuple(sorted(set(kwargs.get('pass_fds', ())) |
+                                          set(_numa_reservation.fds)))
+    return subprocess.Popen(*args, **kwargs)
+
+
 def check_output(cmd):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    p = launch_process(cmd, stdout=subprocess.PIPE)
     out, _ = p.communicate()
     out = out.rstrip().decode('utf-8')
     assert p.wait() == 0
@@ -146,7 +164,7 @@ class SoftwareInfo(object):
 
     @property
     def megahit_version(self):
-        return 'RabbitMA 0.1.0 (MEGAHIT core %s)' % check_output([self.megahit_core, 'dumpversion'])
+        return 'RabbitMA 0.2.0 (MEGAHIT core %s)' % check_output([self.megahit_core, 'dumpversion'])
 
     @property
     def max_k_allowed(self):
@@ -184,6 +202,9 @@ class Options:
         self.prune_level = 2
         self.prune_depth = 2
         self.num_cpu_threads = 0
+        self.numa_node = None
+        self.jobs_per_node = 1
+        self.memory_budget_per_job = 0
         self.disconnect_ratio = 0.1
         self.low_local_ratio = 0.2
         self.cleaning_rounds = 5
@@ -232,13 +253,18 @@ class Options:
             raise Usage('Please specify a positive number for -m flag.')
         elif self.memory < 1:
             try:
-                total_mem = detect_available_mem()
-                return math.floor(total_mem * self.memory)
+                total_mem = (_numa_reservation.memory_capacity
+                             if _numa_reservation is not None else
+                             detect_available_mem(
+                                 None if self.numa_node == 'off' else self.numa_node))
+                base_budget = math.floor(total_mem * self.memory)
             except Exception:
                 raise Usage('Failed to detect available memory size, '
                             'please specify memory size in byte via -m option')
         else:
-            return math.floor(self.memory)
+            base_budget = math.floor(self.memory)
+        return resolve_job_memory_budget(
+            base_budget, self.jobs_per_node, self.memory_budget_per_job)
 
     def dump(self):
         with open(self.option_file_name, 'w') as f:
@@ -284,6 +310,7 @@ class Checkpoint:
 software_info = SoftwareInfo()
 opt = Options()
 check_point = Checkpoint()
+iterate_index_plan = None
 
 
 def check_bin():
@@ -301,6 +328,9 @@ def parse_option(argv):
                                     'out-dir=',
                                     'min-contig-len=',
                                     'num-cpu-threads=',
+                                    'numa-node=',
+                                    'jobs-per-node=',
+                                    'memory-budget-per-job=',
                                     'kmin-1pass',
                                     'k-min=',
                                     'k-max=',
@@ -354,6 +384,19 @@ def parse_option(argv):
             opt.num_cpu_threads = int(value)
             if opt.num_cpu_threads <= 0:
                 raise Usage('--num-cpu-threads must be greater than 0.')
+        elif option == '--numa-node':
+            if value in ('auto', 'off'):
+                opt.numa_node = value
+            else:
+                try:
+                    opt.numa_node = int(value)
+                except ValueError:
+                    raise Usage('--numa-node must be "auto", "off" or a non-negative '
+                                'Linux NUMA node ID.')
+        elif option == '--jobs-per-node':
+            opt.jobs_per_node = int(value)
+        elif option == '--memory-budget-per-job':
+            opt.memory_budget_per_job = float(value)
         elif option == '--kmin-1pass':
             opt.kmin_1pass = True
         elif option == '--k-min':
@@ -491,6 +534,15 @@ def check_and_correct_option():
     # set mode
     if opt.memory < 0:
         raise Usage('-m cannot be less than 0!')
+    if (opt.numa_node not in (None, 'auto', 'off') and
+            opt.numa_node < 0):
+        raise Usage('--numa-node must be a non-negative Linux NUMA node ID.')
+    if opt.jobs_per_node <= 0:
+        raise Usage('--jobs-per-node must be greater than 0.')
+    if (not math.isfinite(opt.memory_budget_per_job) or
+            opt.memory_budget_per_job < 0):
+        raise Usage('--memory-budget-per-job must be a finite non-negative '
+                    'number of bytes.')
 
     if opt.presets != '':
         opt.auto_k = True
@@ -565,7 +617,13 @@ def check_and_correct_option():
         logger.warning('Number of thread is reset to the %d.' % len(os.sched_getaffinity(0)))
         opt.num_cpu_threads = len(os.sched_getaffinity(0))
     if opt.num_cpu_threads == 0:
-        opt.num_cpu_threads = len(os.sched_getaffinity(0))
+        # In explicit NUMA-local mode, default to one worker per physical core.
+        # Using every logical CPU would silently enable SMT and is rarely a
+        # good default for the bandwidth-bound graph kernels.
+        physical_cores = available_physical_cores()
+        opt.num_cpu_threads = (
+            physical_cores if opt.numa_node not in (None, 'off') and
+            physical_cores is not None else len(os.sched_getaffinity(0)))
     if opt.prune_depth < 0 and opt.prune_level < 3:
         opt.prune_depth = opt.min_count
     if opt.bubble_level < 0:
@@ -604,6 +662,388 @@ def check_reads():
             raise Usage('Cannot find file ' + r)
 
 
+def parse_linux_index_list(text):
+    """Parse Linux cpulist/nodelist syntax such as ``0-3,8,10-11``."""
+    result = set()
+    for item in text.strip().split(','):
+        if not item:
+            continue
+        bounds = item.split('-', 1)
+        try:
+            first = int(bounds[0])
+            last = int(bounds[1]) if len(bounds) == 2 else first
+        except ValueError:
+            raise ValueError('invalid Linux index list: %s' % text.strip())
+        if first < 0 or last < first:
+            raise ValueError('invalid Linux index list: %s' % text.strip())
+        result.update(range(first, last + 1))
+    return result
+
+
+def format_linux_index_list(indices):
+    """Return a compact, deterministic Linux cpulist representation."""
+    values = sorted(set(indices))
+    ranges = []
+    begin = None
+    previous = None
+    for value in values:
+        if begin is None:
+            begin = previous = value
+        elif value == previous + 1:
+            previous = value
+        else:
+            ranges.append(str(begin) if begin == previous else
+                          '%d-%d' % (begin, previous))
+            begin = previous = value
+    if begin is not None:
+        ranges.append(str(begin) if begin == previous else
+                      '%d-%d' % (begin, previous))
+    return ','.join(ranges)
+
+
+def process_allowed_memory_nodes(status_path='/proc/self/status'):
+    """Read the scheduler/cgroup memory-node allowance when Linux exposes it."""
+    try:
+        with open(status_path) as status:
+            for line in status:
+                if line.startswith('Mems_allowed_list:'):
+                    return parse_linux_index_list(line.split(':', 1)[1])
+    except (IOError, OSError, ValueError):
+        pass
+    return None
+
+
+def discover_numa_cpu_sets(sysfs_root='/sys/devices/system/node',
+                           status_path='/proc/self/status', affinity=None):
+    """Map usable Linux NUMA IDs to CPUs in this process's current cpuset."""
+    if affinity is None:
+        try:
+            affinity = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            return {}
+    affinity = set(affinity)
+    allowed_memory = process_allowed_memory_nodes(status_path)
+    result = {}
+    for directory in glob.glob(os.path.join(sysfs_root, 'node[0-9]*')):
+        suffix = os.path.basename(directory)[4:]
+        if not suffix.isdigit():
+            continue
+        node = int(suffix)
+        if allowed_memory is not None and node not in allowed_memory:
+            continue
+        try:
+            with open(os.path.join(directory, 'cpulist')) as cpulist:
+                cpus = parse_linux_index_list(cpulist.read()) & affinity
+        except (IOError, OSError, ValueError):
+            continue
+        if cpus:
+            result[node] = cpus
+    return result
+
+
+def detect_numa_node_memory(node,
+                            sysfs_root='/sys/devices/system/node'):
+    """Return one NUMA node's physical memory capacity in bytes."""
+    path = os.path.join(sysfs_root, 'node%d' % node, 'meminfo')
+    with open(path) as meminfo:
+        for line in meminfo:
+            fields = line.split()
+            if 'MemTotal:' not in fields:
+                continue
+            index = fields.index('MemTotal:')
+            value = int(fields[index + 1])
+            unit = fields[index + 2].lower() if len(fields) > index + 2 else ''
+            if unit == 'kb':
+                return value * 1024
+            if unit == 'mb':
+                return value * 1024 * 1024
+            if unit in ('', 'b'):
+                return value
+            raise ValueError('unsupported NUMA memory unit: %s' % unit)
+    raise ValueError('MemTotal is missing from %s' % path)
+
+
+def load_numa_library(library=None):
+    """Use the relocatable release runtime, or the source install's system lib."""
+    if library is None:
+        bundled = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                               '..', 'lib', 'libnuma.so.1')
+        library = bundled if os.path.isfile(bundled) else 'libnuma.so.1'
+    return ctypes.CDLL(library, use_errno=True)
+
+
+def bind_process_memory_to_numa_node(node, library=None, preferred=False):
+    """Install a Linux memory policy before workers exist; children inherit it."""
+    if sys.platform.find('linux') == -1:
+        raise OSError('NUMA memory policy is only supported on Linux')
+    try:
+        libnuma = load_numa_library(library)
+        set_mempolicy = libnuma.set_mempolicy
+    except (OSError, AttributeError) as error:
+        raise OSError('libnuma set_mempolicy is unavailable: %s' % error)
+
+    bits_per_word = ctypes.sizeof(ctypes.c_ulong) * 8
+    word_count = node // bits_per_word + 1
+    mask_type = ctypes.c_ulong * word_count
+    mask = mask_type()
+    mask[node // bits_per_word] = 1 << (node % bits_per_word)
+    set_mempolicy.argtypes = [ctypes.c_int,
+                              ctypes.POINTER(ctypes.c_ulong),
+                              ctypes.c_ulong]
+    set_mempolicy.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    # Explicit placement is strict. Automatic placement prefers local memory
+    # but allows remote allocation when local memory is under pressure.
+    if set_mempolicy(1 if preferred else 2, mask, word_count * bits_per_word) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def current_memory_policy(library=None):
+    libnuma = load_numa_library(library)
+    get_mempolicy = libnuma.get_mempolicy
+    get_mempolicy.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_void_p,
+                              ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
+    get_mempolicy.restype = ctypes.c_int
+    mode = ctypes.c_int()
+    if get_mempolicy(ctypes.byref(mode), None, 0, None, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return mode.value
+
+
+def physical_core_cpu_sets(cpus, sysfs_root='/sys/devices/system/cpu'):
+    """Keep SMT siblings together when reserving or counting physical cores."""
+    result = {}
+    for cpu in sorted(cpus):
+        root = os.path.join(sysfs_root, 'cpu%d' % cpu, 'topology')
+        with open(os.path.join(root, 'physical_package_id')) as stream:
+            package = int(stream.read())
+        with open(os.path.join(root, 'core_id')) as stream:
+            core = int(stream.read())
+        result.setdefault((package, core), set()).add(cpu)
+    return result
+
+
+class NumaReservation:
+    """Cooperative physical-core leases, shared by this user's local instances.
+
+    Lock files stay in place: unlinking an idle lock could create two distinct
+    locking inodes. No process IDs are used; kernel file-description lifetime
+    also covers children surviving an interrupted launcher.
+    """
+
+    def __init__(self, node, cpus, fds, memory_capacity):
+        self.node = node
+        self.cpus = cpus
+        self.fds = fds
+        self.memory_capacity = memory_capacity
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+    @classmethod
+    def acquire(cls, nodes, threads, capacities, minimum_memory=0, directory=None):
+        import fcntl
+        if directory is None:
+            # /dev/shm is host-local on Linux; do not put coordination files
+            # in a possibly shared job output directory or $TMPDIR.
+            if not os.path.isdir('/dev/shm'):
+                return None
+            directory = '/dev/shm/rabbitma-numa-%d' % os.getuid()
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        locked, retained, guard = [], set(), None
+
+        def open_lock(name):
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory_fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o077):
+                os.close(fd)
+                raise OSError('unsafe NUMA reservation file')
+            return fd
+
+        try:
+            info = os.fstat(directory_fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise OSError('NUMA reservation directory must be private to this user')
+            guard = open_lock('allocation.lock')
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return None
+                    time.sleep(0.01)
+            candidates = []
+            for node, cores in sorted(nodes.items()):
+                if len(cores) < threads or capacities[node] < minimum_memory:
+                    continue
+                free = []
+                for key, cpus in sorted(cores.items()):
+                    fd = open_lock('core-%d-%d.lock' % key)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        os.close(fd)
+                        continue
+                    except Exception:
+                        os.close(fd)
+                        raise
+                    locked.append(fd)
+                    free.append((fd, cpus))
+                if len(free) >= threads:
+                    # Prefer an unused NUMA domain, then the least occupied
+                    # domain. The coordinator serializes simultaneous starts.
+                    candidates.append((len(cores) - len(free), node, free))
+            if not candidates:
+                return None
+            _, node, free = min(candidates, key=lambda row: row[:2])
+            selected = free[:threads]
+            cpus = set().union(*(entry[1] for entry in selected))
+            reservation = cls(node, cpus, [entry[0] for entry in selected], capacities[node])
+            retained.update(reservation.fds)
+            return reservation
+        finally:
+            for fd in locked:
+                if fd not in retained:
+                    os.close(fd)
+            if guard is not None:
+                os.close(guard)
+            os.close(directory_fd)
+
+
+def configure_automatic_numa_runtime():
+    """Place an explicitly sized job inside its inherited CPU allocation."""
+    global _numa_reservation
+    if (not sys.platform.startswith('linux') or opt.num_cpu_threads <= 0
+            or opt.jobs_per_node != 1 or _numa_reservation is not None
+            or os.environ.get('MEGAHIT_DISABLE_AUTO_NUMA', '0') not in ('', '0')):
+        return
+    # Preserve explicit external CPU IDs and memory policies. Generic OpenMP
+    # places (cores/threads/sockets) still work within the reserved CPU mask.
+    places = os.environ.get('OMP_PLACES', '').strip().lower()
+    if (places not in ('', 'cores', 'threads', 'sockets')
+            or any(os.environ.get(name) for name in
+                   ('GOMP_CPU_AFFINITY', 'KMP_AFFINITY', 'MEGAHIT_NUMA_NODE'))
+            or os.environ.get('OMP_PROC_BIND', '').lower() == 'false'):
+        logger.info('Automatic NUMA placement: preserving explicit CPU configuration')
+        return
+    reservation = None
+    original_cpus = None
+    affinity_changed = False
+    try:
+        if current_memory_policy() != 0:
+            logger.info('Automatic NUMA placement: preserving inherited memory policy')
+            return
+        original_cpus = set(os.sched_getaffinity(0))
+        cpu_sets = discover_numa_cpu_sets(affinity=original_cpus)
+        nodes = {node: physical_core_cpu_sets(cpus) for node, cpus in cpu_sets.items()}
+        threads = opt.num_cpu_threads
+        capacities = {}
+        for node, cores in nodes.items():
+            with open('/sys/devices/system/node/node%d/cpulist' % node) as stream:
+                all_cores = physical_core_cpu_sets(parse_linux_index_list(stream.read()))
+            share = detect_numa_node_memory(node) * threads // len(all_cores)
+            capacities[node] = min(share, detect_available_mem())
+        minimum_memory = opt.memory if opt.memory >= 1 else 0
+        if opt.memory_budget_per_job > 0:
+            minimum_memory = min(minimum_memory or opt.memory_budget_per_job,
+                                 opt.memory_budget_per_job)
+        reservation = NumaReservation.acquire(nodes, threads, capacities, minimum_memory)
+        if reservation is None:
+            logger.info('Automatic NUMA placement: no single-node reservation fits; '
+                        'keeping inherited CPU and memory placement')
+            return
+        os.sched_setaffinity(0, reservation.cpus)
+        affinity_changed = True
+        bind_process_memory_to_numa_node(reservation.node, preferred=True)
+    except (OSError, AttributeError, ValueError, ImportError) as error:
+        if reservation is not None:
+            if affinity_changed:
+                try:
+                    os.sched_setaffinity(0, original_cpus)
+                except OSError as restore_error:
+                    # If a changing cpuset prevents rollback, retain the
+                    # lease so another instance cannot reserve these cores.
+                    _numa_reservation = reservation
+                    logger.warning('Automatic NUMA memory placement unavailable: %s; '
+                                   'retaining CPU reservation because restoring '
+                                   'inherited affinity failed: %s' % (error, restore_error))
+                    return
+            reservation.close()
+        logger.warning('Automatic NUMA placement unavailable: %s; '
+                       'using inherited placement' % error)
+        return
+    _numa_reservation = reservation
+    logger.info('Automatic NUMA placement: node %d, %d physical cores, CPUs %s; '
+                'private memory prefers this node (remote fallback allowed); '
+                'memory capacity for this CPU share %d bytes' %
+                (reservation.node, threads, format_linux_index_list(reservation.cpus),
+                 reservation.memory_capacity))
+
+
+def resolve_numa_node(requested_node, available_nodes):
+    if requested_node == 'auto':
+        if len(available_nodes) != 1:
+            raise ValueError('--numa-node auto requires the scheduler CPU '
+                             'mask to intersect exactly one NUMA node; found '
+                             '%d' % len(available_nodes))
+        return next(iter(available_nodes))
+    return requested_node
+
+
+def configure_numa_runtime():
+    """Restrict this launcher and all children to one explicit NUMA domain."""
+    if opt.numa_node is None:
+        configure_automatic_numa_runtime()
+        return
+    if opt.numa_node == 'off':
+        return
+    if opt.numa_node != 'auto' and opt.numa_node < 0:
+        raise Usage('--numa-node must be a non-negative Linux NUMA node ID.')
+
+    nodes = discover_numa_cpu_sets()
+    try:
+        opt.numa_node = resolve_numa_node(opt.numa_node, nodes)
+    except ValueError as error:
+        raise Usage(str(error))
+    if opt.numa_node not in nodes:
+        available = ','.join(map(str, sorted(nodes))) if nodes else 'none'
+        raise Usage('NUMA node %d is not available in this job\'s CPU and '
+                    'memory allocation (available nodes: %s).' %
+                    (opt.numa_node, available))
+    try:
+        os.sched_setaffinity(0, nodes[opt.numa_node])
+        selected_cpus = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError) as error:
+        raise Usage('Failed to bind CPUs to NUMA node %d: %s' %
+                    (opt.numa_node, error))
+    if not selected_cpus:
+        raise Usage('NUMA node %d has no CPUs in this job\'s allocation.' %
+                    opt.numa_node)
+
+    try:
+        bind_process_memory_to_numa_node(opt.numa_node)
+    except OSError as error:
+        raise Usage('Failed to bind memory to NUMA node %d: %s' %
+                    (opt.numa_node, error))
+
+    os.environ['MEGAHIT_NUMA_NODE'] = str(opt.numa_node)
+    logger.info('NUMA binding: node %d, CPUs %s; private allocations are '
+                'restricted to this memory node' %
+                (opt.numa_node, format_linux_index_list(selected_cpus)))
+
+
 def _read_finite_memory_limit(path):
     try:
         with open(path) as memory_file:
@@ -617,10 +1057,6 @@ def _read_finite_memory_limit(path):
         value = int(text)
     except ValueError:
         return None
-
-    # cgroup v1 uses a value close to INT64_MAX to represent no limit.
-    # Treat anything above one exbibyte as unlimited; it cannot be a real
-    # memory allocation budget on a supported host.
     if value <= 0 or value >= (1 << 60):
         return None
     return value
@@ -681,7 +1117,7 @@ def detect_cgroup_memory_limit(cgroup_file='/proc/self/cgroup',
     return min(limits) if limits else None
 
 
-def detect_available_mem():
+def detect_available_mem(numa_node=None):
     try:
         psize = os.sysconf('SC_PAGE_SIZE')
         pcount = os.sysconf('SC_PHYS_PAGES')
@@ -699,10 +1135,25 @@ def detect_available_mem():
             raise
 
     if sys.platform.find("linux") != -1:
+        if numa_node is not None:
+            total_memory = min(total_memory,
+                               detect_numa_node_memory(numa_node))
         cgroup_limit = detect_cgroup_memory_limit()
         if cgroup_limit is not None:
             total_memory = min(total_memory, cgroup_limit)
     return total_memory
+
+
+def resolve_job_memory_budget(base_budget, jobs_per_node,
+                              memory_budget_per_job=0):
+    """Resolve the explicit per-process shared-resource memory contract."""
+    base_budget = int(base_budget)
+    jobs_per_node = int(jobs_per_node)
+    if base_budget <= 0 or jobs_per_node <= 0:
+        raise ValueError('memory budget and jobs per node must be positive')
+    if memory_budget_per_job > 0:
+        return max(1, min(base_budget, math.floor(memory_budget_per_job)))
+    return max(1, base_budget // jobs_per_node)
 
 
 def cpu_dispatch():
@@ -764,6 +1215,25 @@ def configure_openmp_runtime():
                 (os.environ['OMP_PLACES'], os.environ['OMP_PROC_BIND']))
 
 
+def configure_shared_node_runtime():
+    memory_budget = opt.host_mem
+    os.environ['MEGAHIT_JOBS_PER_NODE'] = str(opt.jobs_per_node)
+    os.environ['MEGAHIT_MEMORY_BUDGET_PER_JOB'] = str(memory_budget)
+    physical_cores = available_physical_cores()
+    logger.info('Resource policy: %d job(s) share the visible resource '
+                'domain; per-job memory budget %d bytes' %
+                (opt.jobs_per_node, memory_budget))
+    # This mask belongs to one process. Scheduler jobs often have disjoint
+    # masks, so multiplying it by jobs_per_node would invent oversubscription.
+    if (physical_cores is not None and
+            opt.num_cpu_threads > physical_cores):
+        logger.warning(
+            '%d threads exceed this job\'s %d visible physical cores; SMT '
+            'or CPU oversubscription is expected. RabbitMA will not '
+            'silently change the requested thread count.' %
+            (opt.num_cpu_threads, physical_cores))
+
+
 def graph_prefix(kmer_k):
     mkdir_if_not_exists(os.path.join(opt.temp_dir, 'k' + str(kmer_k)))
     return os.path.join(opt.temp_dir, 'k' + str(kmer_k), str(kmer_k))
@@ -788,6 +1258,10 @@ def remove_temp_after_assemble(kmer_k):
         remove_if_exists(graph_prefix(kmer_k) + '.' + extension)
     for i in range(opt.num_cpu_threads):
         remove_if_exists(graph_prefix(kmer_k) + '.sdbg.' + str(i))
+    for extension in ['', '.info', '.mgb']:
+        remove_if_exists(graph_prefix(kmer_k) + '.isolated.fa' + extension)
+        remove_if_exists(graph_prefix(kmer_k) + '.bridges.fa' + extension)
+    remove_if_exists(graph_prefix(kmer_k) + '.bridges.meta')
 
 
 def inpipe_cmd(file_name):
@@ -801,11 +1275,40 @@ def inpipe_cmd(file_name):
 
 
 def quote_library_path(file_name):
-    # The internal read-library reader accepts quoted and historical unquoted
-    # paths.  Quoting keeps spaces and shell metacharacters as ordinary data.
+    # The internal reader accepts quoted and historical unquoted paths.
+    # Quoting keeps spaces and shell metacharacters as ordinary path data.
     if '\n' in file_name or '\r' in file_name:
         raise Usage('Input and temporary paths cannot contain newlines.')
     return '"' + file_name.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def planned_iterate_anchor_geometry():
+    """Choose an exact-index geometry before the library has been decoded.
+
+    Anchor length affects representation size and speed, never which reads are
+    accepted after exact verification.  The aggregate regular-input extent is
+    therefore a safe early order-of-magnitude estimate of the key population;
+    unlike CPU or cache probing, it keeps the choice portable across hosts.
+    Unknown-size streams simply use the established post-build planner.
+    """
+    if (os.environ.get('MEGAHIT_DISABLE_ITERATE_INDEX') is not None or
+            len(opt.k_list) < 2):
+        return None
+    window_len = min(64, opt.k_min + 1)
+    input_bytes = 0
+    saw_regular_input = False
+    for path in opt.pe12 + opt.pe1 + opt.pe2 + opt.se:
+        try:
+            if os.path.isfile(path):
+                input_bytes += os.path.getsize(path)
+                saw_regular_input = True
+        except OSError:
+            pass
+    if not saw_regular_input or input_bytes <= 0:
+        return None
+    information_bits = max(1, input_bytes.bit_length())
+    anchor_len = min(31, window_len, (information_bits + 1) // 2)
+    return anchor_len, window_len
 
 
 @check_point
@@ -848,6 +1351,9 @@ def create_library_file():
 def build_library():
     cmd = [opt.megahit_core, 'buildlib', opt.read_lib_path, opt.read_lib_path,
            str(opt.num_cpu_threads)]
+    early_geometry = planned_iterate_anchor_geometry()
+    if early_geometry is not None:
+        cmd.extend([str(early_geometry[0]), str(early_geometry[1])])
     fifos = list()
     fifo_commands = list()
     pipes = list()
@@ -860,9 +1366,9 @@ def build_library():
         fifo_commands.append((fifo_path, command))
 
     def start_fifo_writers(build_process):
-        # buildlib is already running by the time this callback executes, so
-        # opening a FIFO writer synchronizes with its reader without a shell
-        # redirection or an O_RDWR anchor that can lose early decoder output.
+        # Start decoders only after buildlib is alive.  Opening the writer then
+        # synchronizes with the real reader without a shell or an O_RDWR FIFO
+        # anchor that can lose early decoder output.
         for fifo_path, command in fifo_commands:
             while True:
                 try:
@@ -882,7 +1388,7 @@ def build_library():
                             'buildlib exited before opening ' + fifo_path)
                     time.sleep(0.01)
             try:
-                p = subprocess.Popen(command, stdout=fifo_fd,
+                p = launch_process(command, stdout=fifo_fd,
                                      start_new_session=True)
             finally:
                 os.close(fifo_fd)
@@ -946,6 +1452,185 @@ def set_max_k_by_lib():
         return True
 
 
+def prepare_iterate_index():
+    """Build one exact read-occurrence index and fuse the first k transition.
+
+    The representation is derived from the actual k schedule and library
+    cardinality.  The index builder and the first iterative join consume the
+    same decoded read stream, eliminating a complete library traversal.  All
+    later rounds query the same exact index.  There is deliberately no fixed
+    workload- or machine-specific k threshold.
+    """
+    global iterate_index_plan
+    iterate_index_plan = None
+    if os.environ.get('MEGAHIT_DISABLE_ITERATE_INDEX') is not None:
+        logger.info('Reusable iterate index disabled by environment')
+        return
+    if len(opt.k_list) < 2:
+        return
+
+    # Exact verification currently uses a four-word packed window.  This is a
+    # representation limit, not a workload-tuned threshold.
+    max_exact_window = 64
+    window_len = min(max_exact_window, opt.k_min + 1)
+    eligible_rounds = sum(1 for k in opt.k_list[:-1]
+                          if k + 1 >= window_len)
+    if eligible_rounds == 0:
+        logger.info('Reusable iterate index skipped: no eligible later k round')
+        return
+
+    try:
+        with open(opt.read_lib_path + '.lib_info') as read_info:
+            fields = read_info.readline().split()
+            total_bases = int(fields[0])
+        packed_bytes = os.path.getsize(opt.read_lib_path + '.bin')
+    except (IOError, OSError, ValueError, IndexError):
+        logger.warning('Reusable iterate index skipped: read metadata unavailable')
+        return
+
+    # An exact a-mer has 2a information bits.  Pick the smallest domain whose
+    # cardinality covers the input base population, capped only by the 64-bit
+    # key representation and the exact window itself.  This yields a=19 for a
+    # 100-Gbp library without naming that dataset or consulting CPU topology.
+    early_geometry = planned_iterate_anchor_geometry()
+    if early_geometry is None:
+        information_bits = max(1, total_bases.bit_length())
+        anchor_len = min(31, window_len, (information_bits + 1) // 2)
+    else:
+        anchor_len, early_window_len = early_geometry
+        if early_window_len != window_len:
+            raise RuntimeError('iterate-index geometry changed after buildlib')
+    minimizer_span = window_len - anchor_len + 1
+
+    # Construction briefly holds the external occurrence stream and compact
+    # index together.  A conservative minimizer-density estimate avoids
+    # exhausting a small temporary filesystem; insufficient space simply
+    # preserves the exact full-scan implementation.
+    expected_anchors = (2 * total_bases + minimizer_span) // \
+                       (minimizer_span + 1)
+    estimated_workspace = packed_bytes + expected_anchors * 16
+    try:
+        fs = os.statvfs(opt.temp_dir)
+        free_bytes = fs.f_bavail * fs.f_frsize
+    except (AttributeError, OSError):
+        free_bytes = estimated_workspace
+    if estimated_workspace > free_bytes:
+        logger.warning('Reusable iterate index skipped: estimated workspace '
+                       '%d bytes exceeds %d free bytes' %
+                       (estimated_workspace, free_bytes))
+        return
+
+    # Bound scratch by both the user's global limit and the problem size.  The
+    # builder internally allocates memory tokens per partition, so this is a
+    # resource budget rather than a dataset-specific mode switch.
+    memory_budget = max(1, min(opt.host_mem, max(1, packed_bytes // 2)))
+    prefix = os.path.join(opt.temp_dir, 'iterate.read_index')
+    ready_path = prefix + '.ready'
+    read_stat = os.stat(opt.read_lib_path + '.bin')
+    signature = {
+        'read_size': read_stat.st_size,
+        'read_mtime_ns': getattr(read_stat, 'st_mtime_ns',
+                                 int(read_stat.st_mtime * 1000000000)),
+        'anchor_len': anchor_len,
+        'window_len': window_len,
+        'first_k': opt.k_min,
+        'first_step': opt.k_list[1] - opt.k_min,
+        'fused_first_iteration': True,
+    }
+
+    ready = False
+    prefetched_first_iteration = False
+    try:
+        with open(ready_path) as ready_file:
+            ready_metadata = json.load(ready_file)
+            ready = (all(ready_metadata.get(key) == value
+                         for key, value in signature.items()) and
+                     os.path.exists(prefix + '.ridx.info'))
+            prefetched_first_iteration = (
+                ready and ready_metadata.get('prefetched_first_iteration') and
+                os.path.exists(graph_prefix(opt.k_list[1]) + '.edges.info') and
+                os.path.exists(graph_prefix(opt.k_list[1]) + '.edges.0'))
+    except (IOError, OSError, ValueError):
+        pass
+
+    if not ready:
+        for path in glob.glob(prefix + '.ridx.*') + [ready_path]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        build_cmd = [opt.megahit_core, 'read-index',
+                     '-r', opt.read_lib_path + '.bin',
+                     '-o', prefix,
+                     '-c', contig_prefix(opt.k_min) + '.contigs.fa',
+                     '-b', contig_prefix(opt.k_min) + '.bubble_seq.fa',
+                     '-a', str(anchor_len),
+                     '-w', str(window_len),
+                     '-k', str(opt.k_min),
+                     '-s', str(opt.k_list[1] - opt.k_min),
+                     '-e', graph_prefix(opt.k_list[1]),
+                     '-t', str(opt.num_cpu_threads),
+                     '-m', str(memory_budget)]
+        ret_code = run_sub_command_status(
+            build_cmd,
+            'Build reusable exact read index and fuse k = %d to %d ' %
+            (opt.k_min, opt.k_list[1]))
+        if ret_code != 0:
+            logger.warning('Fused index construction failed; retrying the '
+                           'persistent index without first-round fusion')
+            for path in (glob.glob(prefix + '.ridx.*') +
+                         glob.glob(prefix + '.ridx.tmp*') +
+                         glob.glob(graph_prefix(opt.k_list[1]) + '.edges.*')):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            build_cmd = [opt.megahit_core, 'read-index',
+                         '-r', opt.read_lib_path + '.bin',
+                         '-o', prefix,
+                         '-a', str(anchor_len),
+                         '-w', str(window_len),
+                         '-t', str(opt.num_cpu_threads),
+                         '-m', str(memory_budget)]
+            ret_code = run_sub_command_status(
+                build_cmd,
+                'Build reusable exact read index for %d eligible k rounds ' %
+                eligible_rounds)
+            if ret_code != 0:
+                logger.warning('Reusable iterate index construction failed; '
+                               'using exact full-read scans')
+                for path in (glob.glob(prefix + '.ridx.*') +
+                             glob.glob(prefix + '.ridx.tmp*')):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                return
+        else:
+            prefetched_first_iteration = True
+        ready_metadata = dict(signature)
+        ready_metadata['prefetched_first_iteration'] = \
+            prefetched_first_iteration
+        with open(ready_path, 'w') as ready_file:
+            json.dump(ready_metadata, ready_file)
+    else:
+        logger.info('Reusing completed exact read index%s' %
+                    (' and first iterative edge set'
+                     if prefetched_first_iteration else ''))
+
+    iterate_index_plan = {
+        'prefix': prefix,
+        'anchor_len': anchor_len,
+        'window_len': window_len,
+        'memory_budget': memory_budget,
+        'prefetched_first_k': (opt.k_min if prefetched_first_iteration
+                               else None),
+    }
+    logger.info('Iterate join planner: exact index window %d, anchor %d, '
+                '%d eligible rounds, memory budget %d bytes' %
+                (window_len, anchor_len, eligible_rounds, memory_budget))
+
+
 @check_point
 def build_first_graph_1pass(option):
     cmd = [opt.megahit_core, 'read2sdbg'] + option
@@ -990,6 +1675,10 @@ def build_graph(kmer_k, kmer_from):
                       '--kmer_from', str(kmer_from)]
 
     build_cmd = [opt.megahit_core, 'seq2sdbg'] + build_comm_opt
+    if os.environ.get('MEGAHIT_EXPERIMENTAL_CONTIG_BRIDGES') == '1':
+        build_cmd.append('--bridge_contigs')
+    elif os.environ.get('MEGAHIT_EXPERIMENTAL_STABLE_CONTIGS') == '1':
+        build_cmd.append('--carry_stable_contigs')
 
     file_size = 0
 
@@ -1028,6 +1717,40 @@ def build_graph(kmer_k, kmer_from):
 @check_point
 def iterate(cur_k, step):
     next_k = cur_k + step
+    if (iterate_index_plan is not None and
+            iterate_index_plan.get('prefetched_first_k') == cur_k and
+            os.path.exists(graph_prefix(next_k) + '.edges.info') and
+            os.path.exists(graph_prefix(next_k) + '.edges.0')):
+        logger.info('Reusing iterative edges fused into read-index build from '
+                    'k = %d to %d' % (cur_k, next_k))
+        return
+    if (iterate_index_plan is not None and
+            cur_k + 1 >= iterate_index_plan['window_len']):
+        index_cmd = [opt.megahit_core, 'read-index',
+                     '-r', opt.read_lib_path + '.bin',
+                     '--index_prefix', iterate_index_plan['prefix'],
+                     '-c', contig_prefix(cur_k) + '.contigs.fa',
+                     '-b', contig_prefix(cur_k) + '.bubble_seq.fa',
+                     '-t', str(opt.num_cpu_threads),
+                     '-a', str(iterate_index_plan['anchor_len']),
+                     '-w', str(iterate_index_plan['window_len']),
+                     '-k', str(cur_k),
+                     '-s', str(step),
+                     '-m', str(iterate_index_plan['memory_budget']),
+                     '-e', graph_prefix(next_k)]
+        ret_code = run_sub_command_status(
+            index_cmd,
+            'Query reusable read index from k = %d to %d ' %
+            (cur_k, next_k))
+        if ret_code == 0:
+            return
+        # The index is only a different exact join order.  Resource pressure,
+        # an unexpectedly dense candidate set, or a damaged temporary index
+        # must not make assembly fail when the original streaming join remains
+        # available.
+        logger.warning('Indexed iterate join failed for k = %d; falling back '
+                       'to exact full-read scan' % cur_k)
+
     iterate_cmd = [opt.megahit_core, 'iterate',
                    '-c', contig_prefix(cur_k) + '.contigs.fa',
                    '-b', contig_prefix(cur_k) + '.bubble_seq.fa',
@@ -1099,26 +1822,17 @@ def merge_final(final_k):
     if opt.out_prefix != '':
         final_contig_name = os.path.join(opt.out_dir, opt.out_prefix + '.contigs.fa')
 
+    final_inputs = sorted(glob.glob(os.path.join(opt.contig_dir, '*.final.contigs.fa')))
+    final_inputs.append(contig_prefix(final_k) + '.contigs.fa')
     with open(final_contig_name, 'w') as final_contigs:
-        merge_cmd = [opt.megahit_core, 'filterbylen', str(opt.min_contig_len)]
-        p = subprocess.Popen(merge_cmd, stdin=subprocess.PIPE,
-                             stdout=final_contigs, stderr=subprocess.PIPE)
-        input_files = sorted(glob.glob(
-            os.path.join(opt.contig_dir, '*.final.contigs.fa')))
-        input_files.append(contig_prefix(final_k) + '.contigs.fa')
-        try:
-            for input_file in input_files:
-                with open(input_file, 'rb') as source:
-                    shutil.copyfileobj(source, p.stdin)
-        except BrokenPipeError:
-            pass
-        except Exception:
-            p.stdin.close()
-            p.terminate()
-            p.wait()
-            raise
-        p.stdin.close()
-        log = p.stderr.read()
+        # Internal contigs may be stored in a compact .mgb sidecar with an
+        # empty FASTA completion marker.  Let filterbylen open each logical
+        # path so early termination and normal final-k merging share the same
+        # packed/plain streaming path.  Passing argv directly also avoids the
+        # shell wildcard and quoting ambiguities of the historical pipeline.
+        merge_cmd = [opt.megahit_core, 'filterbylen', str(opt.min_contig_len)] + final_inputs
+        p = launch_process(merge_cmd, stdout=final_contigs, stderr=subprocess.PIPE)
+        _, log = p.communicate()
         logger.info(log.rstrip().decode('utf-8'))
         ret_code = p.wait()
 
@@ -1128,13 +1842,13 @@ def merge_final(final_k):
         exit(ret_code)
 
 
-def run_sub_command(cmd, msg, verbose=False, on_started=None):
+def run_sub_command_status(cmd, msg, verbose=False, on_started=None):
     if opt.verbose:
         verbose = True
     logger.info(msg)
     logger.debug('command %s' % ' '.join(cmd))
 
-    p = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    p = launch_process(cmd, stderr=subprocess.PIPE)
 
     try:
         if on_started is not None:
@@ -1151,11 +1865,7 @@ def run_sub_command(cmd, msg, verbose=False, on_started=None):
                     logger.debug(line)
 
         ret_code = p.wait()
-
-        if ret_code != 0:
-            logger.error('Error occurs, please refer to %s for detail' % opt.log_file_name)
-            logger.error('Command: %s; Exit code %d' % (' '.join(cmd), ret_code))
-            exit(ret_code)
+        return ret_code
     except KeyboardInterrupt:
         p.terminate()
         p.wait()
@@ -1166,7 +1876,16 @@ def run_sub_command(cmd, msg, verbose=False, on_started=None):
         raise
 
 
+def run_sub_command(cmd, msg, verbose=False, on_started=None):
+    ret_code = run_sub_command_status(cmd, msg, verbose, on_started)
+    if ret_code != 0:
+        logger.error('Error occurs, please refer to %s for detail' % opt.log_file_name)
+        logger.error('Command: %s; Exit code %d' % (' '.join(cmd), ret_code))
+        exit(ret_code)
+
+
 def main(argv=None):
+    global _numa_reservation
     if argv is None:
         argv = sys.argv
 
@@ -1177,11 +1896,13 @@ def main(argv=None):
         setup_output_dir()
         setup_logger()
 
+        configure_numa_runtime()
         check_and_correct_option()
 
         check_reads()
         cpu_dispatch()
         configure_openmp_runtime()
+        configure_shared_node_runtime()
         opt.dump()
 
         create_library_file()
@@ -1196,6 +1917,7 @@ def main(argv=None):
 
         build_first_graph()
         assemble(opt.k_min)
+        prepare_iterate_index()
 
         cur_k = opt.k_min
         next_k_idx = 0
@@ -1232,6 +1954,10 @@ def main(argv=None):
     except Usage as usg:
         print(sys.argv[0].split('/')[-1] + ': ' + str(usg.msg), file=sys.stderr)
         exit(1)
+    finally:
+        if _numa_reservation is not None:
+            _numa_reservation.close()
+            _numa_reservation = None
 
 
 if __name__ == '__main__':

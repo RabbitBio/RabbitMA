@@ -12,11 +12,24 @@
 #include <limits>
 #include <sys/stat.h>
 #include "sequence/io/fastx_reader.h"
+#include "sequence/io/contig/packed_contig.h"
 
 class ContigReader : public FastxReader {
  public:
   explicit ContigReader(const std::string &file_name)
-      : FastxReader(file_name), file_name_(file_name) {}
+      : FastxReader(file_name), file_name_(file_name) {
+    packed_input_.open(packed_contig::Path(file_name_),
+                       std::ios::binary | std::ios::in);
+    if (packed_input_.is_open()) {
+      packed_contig::FileHeader header{};
+      packed_input_.read(reinterpret_cast<char *>(&header), sizeof(header));
+      if (!packed_input_ || !packed_contig::IsValid(header)) {
+        xfatal("Invalid packed contig file: {s}\n",
+               packed_contig::Path(file_name_).c_str());
+      }
+      packed_mode_ = true;
+    }
+  }
   ContigReader *SetMinLen(unsigned min_len) {
     min_len_ = min_len;
     return this;
@@ -28,6 +41,10 @@ class ContigReader : public FastxReader {
   }
   ContigReader *SetDiscardFlag(unsigned flag) {
     discard_flag_ = flag;
+    return this;
+  }
+  ContigReader *SetFlagVector(std::vector<unsigned> *flags) {
+    flags_ = flags;
     return this;
   }
 
@@ -83,6 +100,10 @@ class ContigReader : public FastxReader {
   int64_t ReadWithMultiplicity(SeqPackage *pkg, std::vector<TMul> *mul,
                                int64_t max_num, int64_t max_num_bases,
                                bool reverse) {
+    if (packed_mode_) {
+      return ReadPackedWithMultiplicity(pkg, mul, max_num, max_num_bases,
+                                        reverse);
+    }
     bool extend_loop = k_from_ < k_to_ && !(discard_flag_ & contig_flag::kLoop);
 
     int64_t num_bases = 0;
@@ -125,6 +146,7 @@ class ContigReader : public FastxReader {
         if (mul) {
           mul->push_back(GetMultiplicity<TMul>(record->comment.s));
         }
+        if (flags_ != nullptr) flags_->push_back(flag);
 
         num_bases += record->seq.l;
         if (num_bases >= max_num_bases) {
@@ -148,11 +170,86 @@ class ContigReader : public FastxReader {
     }
   }
 
+  template <typename TMul>
+  int64_t ReadPackedWithMultiplicity(SeqPackage *pkg,
+                                     std::vector<TMul> *mul,
+                                     int64_t max_num,
+                                     int64_t max_num_bases, bool reverse) {
+    const bool extend_loop =
+        k_from_ < k_to_ && !(discard_flag_ & contig_flag::kLoop);
+    int64_t accepted = 0;
+    int64_t num_bases = 0;
+    while (accepted < max_num) {
+      packed_contig::RecordHeader header{};
+      packed_input_.read(reinterpret_cast<char *>(&header), sizeof(header));
+      if (packed_input_.gcount() == 0 && packed_input_.eof()) return accepted;
+      if (!packed_input_) {
+        xfatal("Truncated packed contig header: {s}\n", file_name_.c_str());
+      }
+      const size_t words = (static_cast<size_t>(header.length) + 15u) / 16u;
+      packed_words_.resize(words);
+      packed_input_.read(reinterpret_cast<char *>(packed_words_.data()),
+                         words * sizeof(uint32_t));
+      if (!packed_input_) {
+        xfatal("Truncated packed contig sequence: {s}\n",
+               file_name_.c_str());
+      }
+      if (header.length < min_len_ ||
+          (discard_flag_ & static_cast<unsigned>(header.flag)) != 0u) {
+        continue;
+      }
+
+      if (extend_loop &&
+          (static_cast<unsigned>(header.flag) & contig_flag::kLoop) != 0u) {
+        if (header.length < k_to_ + 1u) continue;
+        packed_ascii_.resize(header.length);
+        static const char bases[] = {'A', 'C', 'G', 'T'};
+        for (uint32_t i = 0; i < header.length; ++i) {
+          packed_ascii_[i] = bases[(packed_words_[i >> 4u] >>
+                                    ((15u - (i & 15u)) << 1u)) &
+                                   3u];
+        }
+        for (unsigned i = k_from_; i < k_to_; ++i) {
+          packed_ascii_.push_back(packed_ascii_[i]);
+        }
+        if (reverse) {
+          pkg->AppendReversedStringSequence(packed_ascii_.data(),
+                                            packed_ascii_.size());
+        } else {
+          pkg->AppendStringSequence(packed_ascii_.data(),
+                                    packed_ascii_.size());
+        }
+      } else if (reverse) {
+        pkg->AppendReversedCompactSequence(packed_words_.data(),
+                                           header.length);
+      } else {
+        pkg->AppendCompactSequence(packed_words_.data(), header.length);
+      }
+      if (mul != nullptr) {
+        if (std::is_integral<TMul>::value) {
+          mul->push_back(static_cast<TMul>(header.multiplicity + .5f));
+        } else {
+          mul->push_back(static_cast<TMul>(header.multiplicity));
+        }
+      }
+      ++accepted;
+      if (flags_ != nullptr) flags_->push_back(static_cast<unsigned>(header.flag));
+      num_bases += header.length;
+      if (num_bases >= max_num_bases) return accepted;
+    }
+    return accepted;
+  }
+
  private:
   unsigned min_len_{0};
   unsigned k_from_{0}, k_to_{0};
   unsigned discard_flag_{0};
+  std::vector<unsigned> *flags_{nullptr};
   std::string file_name_;
+  bool packed_mode_{false};
+  std::ifstream packed_input_;
+  std::vector<uint32_t> packed_words_;
+  std::string packed_ascii_;
 };
 
 #endif  // MEGAHIT_CONTIG_READER_H

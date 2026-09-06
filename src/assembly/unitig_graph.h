@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include "parallel_hashmap/phmap.h"
+#include "contig_bridges.h"
 #include "sdbg/sdbg.h"
 #include "unitig_graph_vertex.h"
 #include "utils/mutex.h"
@@ -25,7 +26,7 @@ class UnitigGraph {
   static const size_type kNullVertexID = kMaxNumVertices + 1;
 
  public:
-  explicit UnitigGraph(SDBG *sdbg);
+  explicit UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity = false);
   UnitigGraph(const UnitigGraph &) = delete;
   UnitigGraph(const UnitigGraph &&) = delete;
   ~UnitigGraph() = default;
@@ -41,6 +42,12 @@ class UnitigGraph {
 
  public:
   void Refresh(bool mark_changed = false);
+  // Unitig-first initial tip removal can create circular components during
+  // Refresh().  Recompute their depth with the historical fresh-constructor
+  // convention (the lowest-ID loop seed is counted twice), then release the
+  // raw per-edge multiplicities retained specifically for this operation.
+  void FinalizeInitialTipCompression();
+  void AttachBridges(std::shared_ptr<ContigBridges> bridges);
   std::string VertexToDNAString(VertexAdapter adapter);
 
  public:
@@ -134,7 +141,7 @@ class UnitigGraph {
         return degree;
       }
       uint64_t next_starts[4];
-      int degree = graph_->sdbg_->OutgoingEdges(adapter.e(), next_starts);
+      int degree = graph_->RawOutgoingEdges(adapter.e(), next_starts);
       if (out) {
         for (int i = 0; i < degree; ++i) {
           out[i] = MakeVertexAdapterWithSdbgId(next_starts[i]);
@@ -176,7 +183,7 @@ class UnitigGraph {
         }
         return next[0];
       }
-      uint64_t next_sdbg_id = graph_->sdbg_->NextSimplePathEdge(adapter.e());
+      uint64_t next_sdbg_id = graph_->RawNextEdge(adapter.e());
       if (next_sdbg_id != SDBG::kNullID) {
         return MakeVertexAdapterWithSdbgId(next_sdbg_id);
       } else {
@@ -215,7 +222,21 @@ class UnitigGraph {
   void EnsureDirectAdjacency(size_type id);
   void BuildDirectAdjacency(size_type id);
   void InvalidateDirectAdjacency();
-  uint64_t SimpleNextForMaterialization(uint64_t edge) const;
+  uint64_t SimpleNextForMaterialization(uint64_t edge,
+                                      const ContigBridges::Link **gap = nullptr) const;
+  int RawOutgoingEdges(uint64_t edge, uint64_t *out) const;
+  uint64_t RawNextEdge(uint64_t edge) const;
+  uint64_t RawPreviousEdge(uint64_t edge) const;
+  uint64_t RawUniquePreviousEdge(uint64_t edge) const;
+  void AddBridgeSpan(uint64_t from, uint64_t to, uint32_t *length, uint64_t *depth) const;
+  struct LoopMeasurement {
+    uint64_t total{0};
+    ContigBridges::Minimum minimum;
+    bool has_gap{false};
+  };
+  LoopMeasurement MeasureBridgedLoop(VertexAdapter adapter) const;
+  std::shared_ptr<ContigBridges> bridges_;
+  std::unordered_map<size_type, std::string> initial_bridge_loop_origins_;
   void ReplaceVertexIdForSdbgId(uint64_t old_sdbg_id,
                                 uint64_t new_sdbg_id,
                                 size_type unitig_id) {
@@ -518,6 +539,7 @@ class UnitigGraph {
   // semantics.
   std::unique_ptr<uint8_t[]> materialization_simple_codes_;
   std::unique_ptr<uint32_t[]> materialization_simple_bases_;
+  std::unique_ptr<uint32_t[]> materialization_simple_next_;
   uint64_t materialization_simple_edge_count_{0};
   std::unique_ptr<DirectAdjacency[]> direct_adjacency_;
   std::vector<AtomicWrapper<uint32_t>> direct_adjacency_epoch_;

@@ -99,20 +99,13 @@ static void ParseIterOptions(int argc, char *argv[]) {
     if (opt.num_cpu_threads == 0) {
       opt.num_cpu_threads = omp_get_max_threads();
     }
-    int compute_threads = std::max(1, opt.num_cpu_threads - 1);
-    const char *physical_cores_env = std::getenv("MEGAHIT_PHYSICAL_CORES");
-    if (physical_cores_env != nullptr) {
-      char *end = nullptr;
-      errno = 0;
-      const long physical_cores =
-          std::strtol(physical_cores_env, &end, 10);
-      if (errno == 0 && end != physical_cores_env && *end == '\0' &&
-          physical_cores > 0 && compute_threads > physical_cores) {
-        compute_threads = static_cast<int>(physical_cores);
-        xinfo("Iterate SMT cap: {} compute workers plus asynchronous reader\n",
-              compute_threads);
-      }
-    }
+    // Honour the thread count selected by the caller.  The old physical-core
+    // cap silently turned `-t 128` into 64 compute workers on an SMT machine.
+    // Whether sibling hardware threads help is kernel- and architecture-
+    // dependent; a library stage must not replace the user's resource limit
+    // with a topology-specific policy.  Reserve only the one worker that the
+    // asynchronous input pipeline actually needs.
+    const int compute_threads = std::max(1, opt.num_cpu_threads - 1);
     omp_set_num_threads(compute_threads);
   } catch (std::exception &e) {
     std::cerr << e.what() << std::endl;
@@ -136,9 +129,10 @@ static bool ReadReadsAndProcessKernel(const LocalAsmOption &opt,
   BinaryReader binary_reader(opt.read_file);
   AsyncSequenceReader reader(&binary_reader);
   KmerCollector<KmerType> collector(opt.kmer_k + opt.step + 1,
-                                    opt.output_prefix);
+                                    opt.output_prefix, true);
   int64_t num_aligned_reads = 0;
   int64_t num_total_reads = 0;
+  uint64_t num_generated_edges = 0;
   SimpleTimer scan_timer;
   scan_timer.start();
 
@@ -147,10 +141,12 @@ static bool ReadReadsAndProcessKernel(const LocalAsmOption &opt,
     if (read_pkg.seq_count() == 0) {
       break;
     }
-    num_aligned_reads += index.FindNextKmersFromReads(read_pkg, &collector);
+    num_aligned_reads += index.FindNextKmersFromReads(
+        read_pkg, &collector, &num_generated_edges);
+    collector.CommitBatch();
     num_total_reads += read_pkg.seq_count();
     xinfo("Processed: {}, aligned: {}. Iterative edges: {}\n", num_total_reads,
-          num_aligned_reads, collector.collection().size());
+          num_aligned_reads, collector.size());
   }
   scan_timer.stop();
   xinfo("Read scanning and edge collection time elapsed: {.6}\n",
@@ -161,7 +157,13 @@ static bool ReadReadsAndProcessKernel(const LocalAsmOption &opt,
   flush_timer.stop();
   xinfo("Iterative edge output time elapsed: {.6}\n", flush_timer.elapsed());
   xinfo("Total: {}, aligned: {}. Iterative edges: {}\n", num_total_reads,
-        num_aligned_reads, collector.collection().size());
+        num_aligned_reads, collector.size());
+  xinfo("Generated edge records before global deduplication: {} ({.3}x)\n",
+        num_generated_edges,
+        collector.empty()
+            ? 0.0
+            : static_cast<double>(num_generated_edges) /
+                  collector.size());
   return true;
 }
 

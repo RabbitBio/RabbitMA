@@ -22,15 +22,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "definitions.h"
 #include "utils/cpu_dispatch.h"
+#include "utils/startup_affinity.h"
 #include "utils/utils.h"
 
 int main_assemble(int argc, char **argv);
 int main_local(int argc, char **argv);
 int main_iterate(int argc, char **argv);
 int main_build_lib(int argc, char **argv);
+int main_read_index(int argc, char **argv);
 
 int main_kmer_count(int argc, char **argv);
 int main_read2sdbg(int argc, char **argv);
@@ -49,6 +52,7 @@ void show_help(const char *program_name) {
       "       local          local asssembly\n"
       "       iterate        extract iterative edges\n"
       "       buildlib       build read library\n"
+      "       read-index     profile/build reusable read occurrence index\n"
       "       count          kmer counting\n"
       "       read2sdbg      build sdbg from reads\n"
       "       seq2sdbg       build sdbg from megahit contigs + edges\n"
@@ -71,6 +75,12 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
+  std::string numa_error;
+  if (!ConfigureProcessNumaMemoryPolicy(&numa_error)) {
+    fprintf(stderr, "RabbitMA NUMA binding error: %s\n", numa_error.c_str());
+    return 1;
+  }
+
   if (strcmp(argv[1], "assemble") == 0) {
     return main_assemble(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "local") == 0) {
@@ -79,6 +89,8 @@ int main(int argc, char **argv) {
     return main_iterate(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "buildlib") == 0) {
     return main_build_lib(argc - 1, argv + 1);
+  } else if (strcmp(argv[1], "read-index") == 0) {
+    return main_read_index(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "count") == 0) {
     return main_kmer_count(argc - 1, argv + 1);
   } else if (strcmp(argv[1], "read2sdbg") == 0) {

@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 
+#include <algorithm>
 #include <istream>
 #include <ostream>
 #include <string>
@@ -104,6 +105,36 @@ class Sequence {
     return *this;
   }
 
+  // Append a slice of the reverse-complemented view without first
+  // materializing that complete temporary Sequence.  Local graph cleaning
+  // repeatedly concatenates short oriented unitigs, so resize once and fill
+  // the destination directly.
+  const Sequence &AppendReverseComplement(
+      const Sequence &seq, size_t offset = 0,
+      size_t length = std::string::npos) {
+    if (&seq == this) {
+      const Sequence copy(seq);
+      return AppendReverseComplement(copy, offset, length);
+    }
+    if (offset > seq.bases_.size()) offset = seq.bases_.size();
+    const size_t available = seq.bases_.size() - offset;
+    const size_t count = std::min(length, available);
+    const size_t old_size = bases_.size();
+    bases_.resize(old_size + count);
+    for (size_t i = 0; i < count; ++i) {
+      const uint8_t base = static_cast<uint8_t>(
+          seq.bases_[seq.bases_.size() - 1u - offset - i]);
+      bases_[old_size + i] = static_cast<char>(base < 4u ? 3u - base : base);
+    }
+    return *this;
+  }
+
+  const Sequence &AssignReverseComplement(const Sequence &seq) {
+    if (&seq == this) return ReverseComplement();
+    bases_.clear();
+    return AppendReverseComplement(seq);
+  }
+
   const Sequence &ReverseComplement();
   bool IsValid() const;
   bool IsPalindrome() const;
@@ -115,6 +146,9 @@ class Sequence {
     return (uint8_t &)bases_[index];
   }
   uint8_t get_base(uint32_t index) const { return (uint8_t)bases_[index]; }
+  const uint8_t *encoded_data() const {
+    return reinterpret_cast<const uint8_t *>(bases_.data());
+  }
   void set_base(uint32_t index, uint8_t ch) { bases_[index] = ch; }
 
   void swap(Sequence &seq) {
@@ -123,6 +157,7 @@ class Sequence {
 
   uint32_t size() const { return bases_.size(); }
   void resize(int new_size) { bases_.resize(new_size); }
+  void reserve(size_t capacity) { bases_.reserve(capacity); }
   bool empty() const { return bases_.size() == 0; }
 
   void clear() { bases_.clear(); }

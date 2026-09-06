@@ -76,6 +76,7 @@ class UnitigGraphVertex {
     }
     bool IsLoop() const { return vertex_->is_looped; }
     bool IsPalindrome() const { return vertex_->is_palindrome; }
+    void SetPalindrome(bool value) { vertex_->is_palindrome = value; }
     bool IsChanged() const { return vertex_->is_changed; }
     uint8_t strand() const { return strand_; }
     void ToUniqueFormat() {
