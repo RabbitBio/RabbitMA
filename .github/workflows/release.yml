@@ -3,8 +3,12 @@ name: Publish release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - ".github/release-build-target"
 
 concurrency:
   group: publish-release
@@ -119,7 +123,7 @@ jobs:
                 -DLIBDEFLATE_INCLUDE_DIR=/opt/rabbitma-deps/include \
                 -DLIBDEFLATE_LIBRARY=/opt/rabbitma-deps/lib/libdeflate.so \
                 ..
-              cmake --build . -- -j2
+              cmake --build . -- -j4
               DESTDIR="${package_dir}" cmake --build . --target install
 
               # Keep one public CLI name.  The megahit_core variants and
@@ -248,7 +252,20 @@ jobs:
                 -czf "${package_name}.tar.gz" "${package_name}"
               sha256sum "${package_name}.tar.gz" \
                 > "${package_name}.tar.gz.sha256"
-            '
+            ' 2>&1 | tee release-build.log
+
+      - name: Report portable build failure
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('release-build.log')
+          if path.exists():
+              tail = '\n'.join(path.read_text(errors='replace').splitlines()[-80:])[-16000:]
+              escaped = tail.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Portable package build log::' + escaped)
+          PY
 
       - name: Test on the glibc 2.17 runtime baseline
         env:
