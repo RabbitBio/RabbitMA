@@ -92,7 +92,7 @@ jobs:
                 gcc g++ make cmake objdump readelf strings file python3 \
                 gzip bzip2 tar
 
-              rm -rf /tmp/libdeflate-1.9 /opt/rabbitma-deps
+              rm -rf /tmp/libdeflate-1.9 /tmp/numactl-2.0.19 /opt/rabbitma-deps
               tar -xzf /src/release-deps/libdeflate-v1.9.tar.gz -C /tmp
               make -C /tmp/libdeflate-1.9 -j2 \
                 PREFIX=/opt/rabbitma-deps
@@ -102,7 +102,9 @@ jobs:
               (
                 cd /tmp/numactl-2.0.19
                 ./configure --prefix=/opt/rabbitma-deps --disable-static CFLAGS=-O2
-                make -j2 libnuma.la
+                # x86_64 atomics are inlined; the configure probe adds an
+                # unnecessary out-of-line libatomic dependency on this toolchain.
+                make -j2 libnuma.la LIBS=
               )
               install -d /opt/rabbitma-deps/libgomp-static
               printf "%s\\n" \
@@ -184,7 +186,7 @@ jobs:
                 echo "Platform: Linux x86_64, glibc 2.17 or newer"
                 echo "Build baseline: manylinux2014 (CentOS 7 ABI)"
                 echo "Source commit: $(git -C /src rev-parse HEAD)"
-                echo "libnuma: numactl 2.0.19, configure --disable-static CFLAGS=-O2; make libnuma.la"
+                echo "libnuma: numactl 2.0.19, configure --disable-static CFLAGS=-O2; make libnuma.la LIBS="
                 gcc --version | head -n 1
                 cmake --version | head -n 1
                 echo
