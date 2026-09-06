@@ -164,7 +164,7 @@ class SoftwareInfo(object):
 
     @property
     def megahit_version(self):
-        return 'RabbitMA 0.2.0 (MEGAHIT core %s)' % check_output([self.megahit_core, 'dumpversion'])
+        return 'RabbitMA 0.2.1 (MEGAHIT core %s)' % check_output([self.megahit_core, 'dumpversion'])
 
     @property
     def max_k_allowed(self):

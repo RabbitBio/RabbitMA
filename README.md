@@ -42,8 +42,8 @@ to change their command lines.
 ### Prebuilt Linux package (recommended)
 
 The quickest way to use RabbitMA is to download the prebuilt
-`RabbitMA-v0.2.0-linux-x86_64.tar.gz` package from the
-[v0.2.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.2.0).
+`RabbitMA-v0.2.1-linux-x86_64.tar.gz` package from the
+[v0.2.1 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.2.1).
 It requires Linux x86_64 with glibc 2.17 or newer, Python 3.6 or newer, gzip,
 and bzip2;
 CMake and a compiler are not needed. The package exposes `megahit` as its only
@@ -51,9 +51,9 @@ public command and includes the internal CPU core variants, test data, and
 required non-glibc runtime libraries.
 
 ```bash
-wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.2.0/RabbitMA-v0.2.0-linux-x86_64.tar.gz
-tar -xzf RabbitMA-v0.2.0-linux-x86_64.tar.gz
-cd RabbitMA-v0.2.0-linux-x86_64
+wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.2.1/RabbitMA-v0.2.1-linux-x86_64.tar.gz
+tar -xzf RabbitMA-v0.2.1-linux-x86_64.tar.gz
+cd RabbitMA-v0.2.1-linux-x86_64
 ./megahit --test -t 4
 ```
 
@@ -63,7 +63,7 @@ Python driver selects a supported variant at run time.
 The binary package retains the CentOS 7 / glibc 2.17 baseline and includes
 `libnuma` for automatic NUMA placement. There is no need to upgrade glibc or
 set `LD_LIBRARY_PATH`. Python 3.6 or newer must be available as `python3`;
-CentOS 7's default Python 2 alone is insufficient. The v0.2.0 launcher also
+CentOS 7's default Python 2 alone is insufficient. The v0.2.1 launcher also
 detects cgroup v1/v2 memory limits automatically, including inside containers
 and scheduler jobs.
 
@@ -124,10 +124,10 @@ to `OUT_DIR/final.contigs.fa`.
 
 ### Automatic NUMA placement
 
-RabbitMA v0.2.0 automatically coordinates concurrent jobs from the same
+RabbitMA v0.2.1 automatically coordinates concurrent jobs from the same
 Linux user when each job specifies `-t` and fits within one available NUMA
 domain. No extra `numactl` command or NUMA option is needed. This behavior is
-included in both the source and the v0.2.0 binary package. Upgrade older
+included in both the source and the v0.2.1 binary package. Upgrade older
 binary packages to use it.
 
 For example, on a machine with **72 available physical cores, split into two

@@ -8,7 +8,7 @@ on:
     tags:
       - "v*"
     paths:
-      - ".github/release-build-target"
+      - ".github/release-rebuild-target"
 
 concurrency:
   group: publish-release
@@ -33,6 +33,9 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            release_tag="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
+              .github/release-rebuild-target)"
           else
             release_tag="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' \
               .github/release-build-target)"
@@ -246,6 +249,13 @@ jobs:
               /src/.release-package-docs/audit-release-package.sh \
                 "${package_dir}"
 
+              cd /src
+              for core in megahit_core megahit_core_popcnt megahit_core_no_hw_accel
+              do
+                MEGAHIT_TEST_CORE="${package_dir}/bin/${core}" \
+                  python3 -B tests/test_low_memory_pipeline.py -v
+              done
+
               mkdir -p /tmp/megahit-release-smoke
               cd /tmp/megahit-release-smoke
               unset LD_LIBRARY_PATH
@@ -279,6 +289,7 @@ jobs:
         run: |
           package_dir="${GITHUB_WORKSPACE}/dist/RabbitMA-${RELEASE_TAG}-linux-x86_64"
           docker run --rm \
+            --memory 1g --cpus 2 \
             -v "${package_dir}:/opt/RabbitMA:ro" \
             "${MANYLINUX_IMAGE}" \
             bash -euxo pipefail -c '

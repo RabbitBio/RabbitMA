@@ -59,6 +59,8 @@ done
   fail "unexpected second public CLI: bin/rabbitma"
 [[ $(sed -n '1p' "$package_dir/bin/megahit") == '#!/usr/bin/env python3' ]] ||
   fail "megahit must use the portable python3 env shebang"
+grep -Eq '^Source commit: [0-9a-f]{40}$' "$package_dir/BUILD_INFO.txt" ||
+  fail "BUILD_INFO.txt must record the immutable source commit"
 
 while IFS= read -r -d '' link; do
   resolved=$(readlink -f "$link")

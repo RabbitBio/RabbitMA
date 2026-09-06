@@ -2325,8 +2325,13 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
     // capability check, not a workload- or machine-specific threshold.
     const bool has_supplemental_sequences =
         bases_to_reserve != 0 || num_contigs_to_reserve != 0;
+    // Even a partial stream needs the direct engine's bookkeeping reserve.
+    // Below that budget, keep resident edges so compact locators remain valid.
+    const bool stream_workspace_available =
+        direct_fits(0, estimate_data_bytes(0));
     const bool stream_layout_supported =
-        !has_supplemental_sequences || loaded_direct_fits;
+        stream_workspace_available &&
+        (!has_supplemental_sequences || loaded_direct_fits);
     if (stream_semantically_available && stream_layout_supported) {
       stream_input_edges_ = ConfigureStreamedEdgeInput(edge_metadata);
       stream_requires_mercy_index =
@@ -2903,8 +2908,12 @@ int64_t SeqToSdbg::Lv1DirectMemoryLimit() const {
     // per-bucket merges without encoding a socket/core topology.  It scales
     // with the user-visible RSS envelope and is intentionally independent of
     // the current input's coverage or a named machine.
-    const uint64_t untracked_headroom = std::max<uint64_t>(
-        uint64_t{1} << 30u, rss_target / 10u);
+    // A fixed 1 GiB reserve can consume an entire small budget and force
+    // streamed edges into the unsupported compact-locator representation.
+    // Keep the existing reserve for targets >= 2 GiB and scale below it.
+    const uint64_t untracked_headroom = std::min<uint64_t>(
+        std::max<uint64_t>(uint64_t{1} << 30u, rss_target / 10u),
+        rss_target / 2u);
     if (retained >= rss_target ||
         untracked_headroom >= rss_target - retained) {
       return 0;
