@@ -8,6 +8,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "tools/compare_contigs.py"
       - "test_data/**"
       - "CMakeLists.txt"
       - ".github/workflows/launcher-tests.yml"
@@ -15,6 +16,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "tools/compare_contigs.py"
       - "test_data/**"
       - "CMakeLists.txt"
       - ".github/workflows/launcher-tests.yml"
@@ -31,6 +33,8 @@ jobs:
         run: |
           python3 -B tests/test_megahit_driver.py -v
           python3 -B tests/test_auto_numa.py -v
+      - name: Test standalone contig comparison
+        run: python3 -B tests/test_compare_contigs.py -v
 
   core-tests:
     runs-on: ubuntu-latest

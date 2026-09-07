@@ -291,6 +291,70 @@ contigs.
 See [BENCHMARKS.md](BENCHMARKS.md) for the CAMI III reference measurement and
 its scope.
 
+### Compare outputs with an original MEGAHIT run
+
+The standalone [tools/compare_contigs.py](tools/compare_contigs.py) compares
+two contig files using Python 3.6 or newer and the standard library. Download
+the script from this repository or use a source checkout; no assembler build,
+third-party Python package, or machine-specific configuration is needed.
+It accepts plain FASTA and little-endian MEGAHIT `MGCTG01` version 1 packed
+contigs (`.fa.mgb`). Pass the actual `.mgb` path when using a packed output.
+
+To compare final contigs while allowing reverse complements and different
+origins of the same circular sequence:
+
+```bash
+python3 tools/compare_contigs.py \
+  original_out/final.contigs.fa rabbitma_out/final.contigs.fa \
+  --circular-loops --metadata
+```
+
+IDs and record order are ignored; duplicate record counts are preserved.
+Full sequence strings are compared, not just contig counts, lengths, or
+sequence hashes. FASTA line wrapping and letter case are normalized. Parsed
+`flag` values are always compared; `--metadata` additionally requires and
+compares `k` and coverage (`multi`) at the packed format's float32 precision.
+For `lc_...` local-assembly records, which have no k field, k is represented
+as zero. Generic FASTA without MEGAHIT metadata can be compared by omitting
+`--metadata`; absent flags are then treated as zero.
+
+| Mode | Reverse complements | Circular origins |
+| --- | --- | --- |
+| Default | Equivalent | Must match |
+| `--circular-loops` | Equivalent | Equivalent for validated, flagged loops |
+| `--literal` | Must match | Must match |
+
+Circular normalization requires the loop flag (`flag & 2`), a positive k,
+and a terminal overlap of exactly k bases: the first and last k bases must
+match. The comparator removes the final k bases and selects the smallest
+rotation across the forward sequence and its reverse complement. It does
+not infer circularity from arbitrary unmarked FASTA. A marked loop whose
+overlap cannot be validated is an input error in this mode.
+
+For a strict sequence-and-metadata check of final or intermediate records:
+
+```bash
+python3 tools/compare_contigs.py \
+  original_out/intermediate_contigs/k39.addi.fa \
+  rabbitma_out/intermediate_contigs/k39.addi.fa.mgb \
+  --literal --metadata
+```
+
+The JSON result contains `equal`, `missing_records`, `added_records`, and
+record/base totals. Exit status **0** means equal under the selected mode,
+**1** means different, and **2** means invalid arguments, unreadable files,
+or malformed input. An empty file matches another empty file. The comparison
+holds both files' unique records in memory, so memory use grows with their
+sequence content.
+
+Circular sequence equivalence does not establish identical intermediate
+evidence: rotating `k*.addi.fa` can change the finite windows passed to the
+next k round. Use `--literal --metadata` for that check and report it
+separately from normalized final-sequence equivalence. Coverage differences
+also remain differences with `--metadata`, even if circular sequences match.
+See the [reference definition](docs/compatibility-v0.1.0.md#reference-and-comparison)
+when choosing an old-version baseline.
+
 ## Attribution
 
 RabbitMA is a derivative work, not an official MEGAHIT release. Please retain
