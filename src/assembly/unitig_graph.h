@@ -274,6 +274,12 @@ class UnitigGraph {
     const uint64_t rhs_key = LegacyOrderKey(rhs);
     return lhs_key != rhs_key ? lhs_key < rhs_key : lhs < rhs;
   }
+  bool SerialMergeOrderLess(size_type lhs, size_type rhs) const {
+    return serial_merge_order_.empty()
+               ? LegacyOrderLess(lhs, rhs)
+               : serial_merge_order_[lhs] < serial_merge_order_[rhs];
+  }
+  void RestoreLegacyInitialOrder();
   void SetVertexIdForSdbgId(uint64_t sdbg_id, size_type unitig_id) {
     if (use_dense_id_map_) {
       assert(sdbg_id < dense_id_map_.size());
@@ -531,6 +537,9 @@ class UnitigGraph {
   std::vector<UnitigGraphVertex> vertices_;
   std::vector<size_type> active_ids_;
   std::vector<uint64_t> legacy_order_keys_;
+  // Emission order of v0.1.0's single-worker forward builder. Linear merges
+  // follow this order; circular-component ownership uses legacy_order_keys_.
+  std::vector<size_type> serial_merge_order_;
   // The block-compressed simple-successor snapshot is built anyway while
   // finding unitigs.  Retaining it lets sequence materialization reuse that
   // work instead of issuing another dependent rank/select traversal for

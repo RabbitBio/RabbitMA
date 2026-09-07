@@ -2448,13 +2448,10 @@ SeqToSdbg::MemoryStat SeqToSdbg::Initialize() {
 
   if (!opt_.addi_contig.empty()) {
     ContigReader reader(opt_.addi_contig);
-    // addi records are changed unitigs emitted at k_from.  Circular records
-    // carry only the old k-base overlap, just like regular contigs, so extend
-    // them to the target k before enumerating (k+1)-mers.  Otherwise the
-    // linear cut drops k-k_from circular windows and makes the next graph
-    // depend on the thread-dependent loop origin chosen in the previous
-    // round.
-    reader.SetExtendLoop(opt_.k_from, opt_.k)->SetMinLen(opt_.k + 1);
+    // Preserve v0.1.0's finite-window semantics for change-only evidence.
+    // Extending a circular addi record adds k-k_from new windows and can
+    // change the next graph.  Only primary contigs above extend their loops.
+    reader.SetMinLen(opt_.k + 1);
     bool contig_reverse = true;
     auto n_read = reader.ReadAllWithMultiplicity(&seq_pkg_, &multiplicity,
                                                  contig_reverse);

@@ -14,6 +14,7 @@
 #include <memory>
 #include <new>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1916,6 +1917,7 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
         terminal_key |
         (VertexAdapter(vertices_[i]).IsLoop() ? (uint64_t{1} << 63u) : 0u);
   }
+  if (!retain_sdbg_multiplicity) RestoreLegacyInitialOrder();
 
   // Direct handles require one orientation bit in addition to the stable
   // 32-bit slot ID.  For larger theoretical graphs retain the exact SDBG +
@@ -2065,7 +2067,106 @@ void UnitigGraph::AttachBridges(std::shared_ptr<ContigBridges> bridges) {
   }
 }
 
+void UnitigGraph::RestoreLegacyInitialOrder() {
+  // The v0.1.0 one-worker block builder advances 32 forward walks together.
+  // Opposite strands can both be admitted before either walk finishes. In
+  // that case its endpoint tie-break chooses the owner; otherwise the first
+  // start claims both strands. Reproduce those admission/completion events
+  // from lengths and endpoints, without repeating any SDBG edge traversal.
+  std::vector<uint64_t> starts;
+  starts.reserve(active_ids_.size() * 2u);
+  for (const size_type id : active_ids_) {
+    auto adapter = MakeSudoAdapter(id);
+    if (adapter.IsLoop()) continue;
+    starts.push_back(uint64_t{id} << 1u);
+    if (adapter.b() != adapter.rb()) {
+      starts.push_back((uint64_t{id} << 1u) | 1u);
+    }
+    legacy_order_keys_[id] = vertices_[id].TerminalOrderKey();
+  }
+  std::sort(starts.begin(), starts.end(), [this](uint64_t lhs, uint64_t rhs) {
+    return MakeSudoAdapter(lhs >> 1u, lhs & 1u).b() <
+           MakeSudoAdapter(rhs >> 1u, rhs & 1u).b();
+  });
+
+  struct Event {
+    uint64_t time;
+    uint64_t handle;
+    unsigned slot;
+    unsigned phase;  // 0: admit; 1: forward end; 2: reverse end
+    bool operator<(const Event &other) const {
+      if (time != other.time) return time > other.time;
+      const bool completion = phase != 0;
+      const bool other_completion = other.phase != 0;
+      if (completion != other_completion) return completion > other_completion;
+      return slot > other.slot;
+    }
+  };
+  std::priority_queue<Event> events;
+  for (unsigned slot = 0; slot < std::min<size_t>(32u, starts.size()); ++slot) {
+    events.push({0, 0, slot, 0});
+  }
+  std::vector<uint8_t> claims(vertices_.size(), 0);
+  std::vector<uint8_t> selected_strand(vertices_.size(), 0);
+  serial_merge_order_.assign(vertices_.size(),
+                             std::numeric_limits<size_type>::max());
+  size_t input = 0;
+  size_type output_rank = 0;
+  while (!events.empty()) {
+    Event event = events.top();
+    events.pop();
+    if (event.phase == 0) {
+      while (input < starts.size()) {
+        event.handle = starts[input++];
+        const size_type id = event.handle >> 1u;
+        const uint8_t mask = 1u << (event.handle & 1u);
+        if (claims[id] & mask) continue;
+        claims[id] |= mask;
+        event.time += MakeSudoAdapter(id).GetLength() - 1u;
+        event.phase = 1;
+        events.push(event);
+        break;
+      }
+      continue;
+    }
+    const size_type id = event.handle >> 1u;
+    const unsigned strand = event.handle & 1u;
+    auto adapter = MakeSudoAdapter(id, strand);
+    bool emit = true;
+    if (event.phase == 1) {
+      const uint8_t reverse_mask = 1u << (strand ^ 1u);
+      if (adapter.b() != adapter.rb() && !(claims[id] & reverse_mask)) {
+        claims[id] |= reverse_mask;
+        event.time += adapter.GetLength();
+        event.phase = 2;
+        events.push(event);
+        continue;
+      }
+      emit = std::max(adapter.b(), adapter.e()) >=
+             std::max(adapter.rb(), adapter.re());
+    }
+    if (emit) {
+      selected_strand[id] = strand;
+      serial_merge_order_[id] = output_rank++;
+    }
+    events.push({event.time + 1u, 0, event.slot, 0});
+  }
+#pragma omp parallel for schedule(static)
+  for (size_t active_index = 0; active_index < active_ids_.size();
+       ++active_index) {
+    const size_type id = active_ids_[active_index];
+    auto adapter = MakeSudoAdapter(id);
+    if (!adapter.IsLoop() && selected_strand[id]) {
+      adapter.SetBeginEnd(adapter.rb(), adapter.re(), adapter.b(), adapter.e());
+    }
+  }
+  InvalidateDirectAdjacency();
+}
+
 void UnitigGraph::FinalizeInitialTipCompression() {
+  // Reconstruct the reference metadata after initial pruning, where v0.1.0
+  // first built its raw unitigs. Early compression may have moved endpoints.
+  RestoreLegacyInitialOrder();
   if (bridges_) {
 #pragma omp parallel for schedule(dynamic, 16)
     for (size_t i = 0; i < active_ids_.size(); ++i) {
@@ -2517,11 +2618,13 @@ void UnitigGraph::RefreshDelta(bool set_changed,
     }
 
     const size_type back_id = linear_path.back().UnitigId();
-    if (back_id != id && !locks.try_lock(back_id)) {
-      if (LegacyOrderLess(id, back_id)) {
+    if (back_id != id) {
+      if (SerialMergeOrderLess(back_id, id)) {
         locks.unlock(id);
         continue;
       }
+      // The first legacy endpoint owns the chain, independently of which
+      // worker arrives first. The opposite traversal releases its lock.
       locks.lock(back_id);
     }
 
@@ -2844,13 +2947,12 @@ void UnitigGraph::Refresh(bool set_changed) {
       }
 
       size_type back_id = linear_path.back().UnitigId();
-      if (back_id != i && !locks.try_lock(back_id)) {
-        if (LegacyOrderLess(i, back_id)) {
+      if (back_id != i) {
+        if (SerialMergeOrderLess(back_id, i)) {
           locks.unlock(i);
           break;
-        } else {
-          locks.lock(back_id);
         }
+        locks.lock(back_id);
       }
 
       auto new_length = adapter.GetLength();

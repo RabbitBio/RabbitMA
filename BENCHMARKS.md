@@ -45,6 +45,12 @@ run time and does not encode the CAMI input size or a particular socket layout.
 
 ## v0.2.0 NUMA experiment and synchronization checks
 
+These measurements precede the circular-evidence compatibility corrections in
+the consolidated v0.2.0 publication. They measure the resource-placement change
+on its then-validated computation core, not a fresh performance comparison of
+the consolidated binary. See the [compatibility audit](docs/compatibility-v0.1.0.md)
+for the subsequent exact-output checks.
+
 Two concurrent jobs each assembled the same merged 20-sample CAMI III input
 on a machine with two NUMA domains and 32 physical cores per domain. Each job
 used `-t 32`. The comparison held the validated computation core fixed and

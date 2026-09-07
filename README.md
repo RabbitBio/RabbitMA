@@ -16,6 +16,13 @@ costs that dominate large multi-sample and single-file workloads.
 The supported command is `megahit`, so existing MEGAHIT pipelines do not need
 to change their command lines.
 
+The consolidated v0.2.0 source and binary package include [v0.1.0 output
+compatibility fixes](docs/compatibility-v0.1.0.md) for circular intermediate
+evidence and parallel path ownership. This publication replaces the earlier
+v0.2.0 and v0.2.1 packages. See the reference definition in those notes when
+comparing versions: v0.1.0's parallel runs can themselves produce different
+outputs.
+
 ## Highlights
 
 - Parallel multi-library input and adaptive intra-file gzip decompression. The
@@ -42,8 +49,8 @@ to change their command lines.
 ### Prebuilt Linux package (recommended)
 
 The quickest way to use RabbitMA is to download the prebuilt
-`RabbitMA-v0.2.1-linux-x86_64.tar.gz` package from the
-[v0.2.1 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.2.1).
+`RabbitMA-v0.2.0-linux-x86_64.tar.gz` package from the
+[v0.2.0 release](https://github.com/RabbitBio/RabbitMA/releases/tag/v0.2.0).
 It requires Linux x86_64 with glibc 2.17 or newer, Python 3.6 or newer, gzip,
 and bzip2;
 CMake and a compiler are not needed. The package exposes `megahit` as its only
@@ -51,9 +58,9 @@ public command and includes the internal CPU core variants, test data, and
 required non-glibc runtime libraries.
 
 ```bash
-wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.2.1/RabbitMA-v0.2.1-linux-x86_64.tar.gz
-tar -xzf RabbitMA-v0.2.1-linux-x86_64.tar.gz
-cd RabbitMA-v0.2.1-linux-x86_64
+wget https://github.com/RabbitBio/RabbitMA/releases/download/v0.2.0/RabbitMA-v0.2.0-linux-x86_64.tar.gz
+tar -xzf RabbitMA-v0.2.0-linux-x86_64.tar.gz
+cd RabbitMA-v0.2.0-linux-x86_64
 ./megahit --test -t 4
 ```
 
@@ -63,7 +70,7 @@ Python driver selects a supported variant at run time.
 The binary package retains the CentOS 7 / glibc 2.17 baseline and includes
 `libnuma` for automatic NUMA placement. There is no need to upgrade glibc or
 set `LD_LIBRARY_PATH`. Python 3.6 or newer must be available as `python3`;
-CentOS 7's default Python 2 alone is insufficient. The v0.2.1 launcher also
+CentOS 7's default Python 2 alone is insufficient. The v0.2.0 launcher also
 detects cgroup v1/v2 memory limits automatically, including inside containers
 and scheduler jobs.
 
@@ -124,10 +131,10 @@ to `OUT_DIR/final.contigs.fa`.
 
 ### Automatic NUMA placement
 
-RabbitMA v0.2.1 automatically coordinates concurrent jobs from the same
+RabbitMA v0.2.0 automatically coordinates concurrent jobs from the same
 Linux user when each job specifies `-t` and fits within one available NUMA
 domain. No extra `numactl` command or NUMA option is needed. This behavior is
-included in both the source and the v0.2.1 binary package. Upgrade older
+included in both the source and the v0.2.0 binary package. Upgrade older
 binary packages to use it.
 
 For example, on a machine with **72 available physical cores, split into two
@@ -152,6 +159,27 @@ respects inherited CPU and memory allowances and keeps SMT siblings in the
 same reservation. **72 logical CPUs are not necessarily 72 physical cores.**
 If the scheduler grants only 18 physical cores on each domain, a 36-thread
 job cannot be moved onto 36 cores of one domain.
+
+Three 16-thread jobs on two 32-core domains can each stay within one domain.
+Starting with no existing reservations, the first two use different domains
+and the third reserves the remaining 16 cores on the first domain. Their CPU
+sets do not overlap, but the two jobs in that domain share its memory bandwidth.
+Assignment follows reservation order and still requires a sufficient memory
+share for each job.
+
+Three 24-thread jobs on two 36-core domains cannot each occupy a separate
+domain. If all three launchers see the whole machine and memory permits, the
+first two can reserve 24 cores on different domains. The third has no single
+domain with 24 free cores and keeps its inherited placement; it does not
+automatically reserve the remaining 12 cores from each domain. Disjoint CPU
+masks assigned by Slurm remain respected in either case.
+
+An absolute `--memory` budget must also fit the domain's memory share for the
+requested physical cores and the job's available-memory limit. For example,
+24 of 36 cores with `--memory 360000000000` require at least 540,000,000,000
+bytes reported for that NUMA domain, plus a sufficient job memory allowance.
+Otherwise automatic placement falls back to the inherited CPU and memory
+policy. The program's `--memory` option does not request memory from Slurm.
 
 Automatic placement uses local-preferred memory, allowing remote allocation
 when local memory is exhausted. Fractional `-m` budgets are based on the

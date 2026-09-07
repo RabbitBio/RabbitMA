@@ -53,6 +53,7 @@ jobs:
           mkdir -p .release-package-docs
           cp README.md BENCHMARKS.md .release-package-docs/
           cp "docs/releases/${release_tag}.md" .release-package-docs/RELEASE_NOTES.md
+          cp docs/compatibility-v0.1.0.md .release-package-docs/
           cp .github/scripts/audit-release-package.sh .release-package-docs/
           chmod 755 .release-package-docs/audit-release-package.sh
 
@@ -166,6 +167,9 @@ jobs:
                 /src/.release-package-docs/RELEASE_NOTES.md \
                 /src/LICENSE /src/NOTICE \
                 "${package_dir}/"
+              install -d "${package_dir}/docs"
+              install -m 644 /src/.release-package-docs/compatibility-v0.1.0.md \
+                "${package_dir}/docs/"
               install -d "${package_dir}/share/licenses"
               install -d "${package_dir}/share/licenses/libnuma"
               install -m 644 \
@@ -253,7 +257,7 @@ jobs:
               for core in megahit_core megahit_core_popcnt megahit_core_no_hw_accel
               do
                 MEGAHIT_TEST_CORE="${package_dir}/bin/${core}" \
-                  python3 -B tests/test_low_memory_pipeline.py -v
+                  python3 -B -m unittest discover -s tests -v
               done
 
               mkdir -p /tmp/megahit-release-smoke
@@ -311,12 +315,24 @@ jobs:
         shell: bash
         run: |
           asset="RabbitMA-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          # One-time owner-requested consolidation. Match the retired release
+          # ID so a retry cannot remove the newly published replacement.
+          if [[ "${RELEASE_TAG}" == v0.2.0 ]]; then
+            release_id=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq '.[] | select(.tag_name == "v0.2.0") | .id')
+            if [[ "${release_id}" == 383555041 ]]; then
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+            fi
+          fi
           if ! gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1
           then
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
+              --draft \
               --title "RabbitMA ${RELEASE_TAG}" \
               --notes-file .release-package-docs/RELEASE_NOTES.md
           fi
@@ -324,3 +340,36 @@ jobs:
             "dist/${asset}" "dist/${asset}.sha256" \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --latest \
+            --title "RabbitMA ${RELEASE_TAG}" \
+            --notes-file .release-package-docs/RELEASE_NOTES.md
+
+      - name: Retire the superseded v0.2.1 release and tag
+        if: steps.release.outputs.tag == 'v0.2.0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # Only the exact objects authorized for this consolidation qualify.
+          # A later release that reuses this version must never be removed.
+          release_id=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '.[] | select(.tag_name == "v0.2.1") | .id')
+          tag_sha=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v0.2.1" \
+            --jq '.[] | select(.ref == "refs/tags/v0.2.1") | .object.sha')
+          if [[ -n "${release_id}" && "${release_id}" != 383564149 ]] || \
+             [[ -n "${tag_sha}" && "${tag_sha}" != cf3b9db3b03de595cc284cf68cdc56a8af37fc00 ]]; then
+            echo "The v0.2.1 release or tag has changed; preserving it."
+            exit 0
+          fi
+          if [[ -n "${release_id}" ]]; then
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          fi
+          if [[ -n "${tag_sha}" ]]; then
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/v0.2.1"
+          fi
