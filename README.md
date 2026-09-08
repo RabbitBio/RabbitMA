@@ -355,6 +355,27 @@ also remain differences with `--metadata`, even if circular sequences match.
 See the [reference definition](docs/compatibility-v0.1.0.md#reference-and-comparison)
 when choosing an old-version baseline.
 
+### Run controlled performance experiments
+
+The [benchmark scripts](benchmarks/README.md) compare an original MEGAHIT
+run with a RabbitMA release at 24 threads, then test 2–6 concurrent RabbitMA
+jobs sharing 64 physical cores. Each job-count configuration has NUMA-local
+and spread placement controls with disjoint CPU masks. A configuration file
+specifies the input, binaries, memory budget and a new output directory.
+
+Preview without launching assemblers, then run both experiments sequentially
+when the machine is available:
+
+```bash
+python3 benchmarks/run_experiments.py --config /path/to/config.json --dry-run
+python3 benchmarks/run_experiments.py --config /path/to/config.json
+```
+
+The scripts record full-pipeline timings, throughput, sampled memory use,
+binary/input hashes and final-output comparisons. Preparation and comparison
+are outside the timed interval. They do not establish a performance claim
+until the configured experiments have actually run.
+
 ## Attribution
 
 RabbitMA is a derivative work, not an official MEGAHIT release. Please retain

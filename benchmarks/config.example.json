@@ -1,0 +1,23 @@
+{
+  "input": "/path/to/CAMI3/sample_0_reads/anonymous_reads.fq.gz",
+  "output_root": "/path/to/new/benchmark_results",
+  "programs": {
+    "rabbitma": {
+      "launcher": "/path/to/RabbitMA-release/bin/megahit",
+      "label": "RabbitMA release: record the tag and source commit here"
+    },
+    "original": {
+      "launcher": "/path/to/original-MEGAHIT/bin/megahit",
+      "label": "Official MEGAHIT v1.2.9"
+    }
+  },
+  "total_cpus": 64,
+  "single_threads": 24,
+  "repetitions": 2,
+  "concurrency_levels": [2, 3, 4, 5, 6],
+  "placements": ["numa", "spread"],
+  "k_list": [39, 49, 59, 69, 79, 89, 99, 109, 119, 129, 139, 141],
+  "memory_budget_gib": 192,
+  "warm_input": true,
+  "independent_inputs": true
+}
