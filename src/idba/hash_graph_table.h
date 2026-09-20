@@ -213,8 +213,8 @@ class HashGraphVertexTable {
 
   // Reductions such as coverage histograms have no traversal-order
   // semantics.  Stream the compact vertex array instead of following legacy
-  // bucket chains; Assemble() continues to use for_each() above for exact tie
-  // behavior.
+  // bucket chains; Assemble() uses the order-preserving unlocked traversal
+  // above for exact tie behavior.
   template <typename UnaryProc>
   UnaryProc &for_each_value(UnaryProc &op) {
     for (HashGraphVertex &value : values_) op(value);
