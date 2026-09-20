@@ -122,6 +122,11 @@ contigs matched the same complete graph-edge sets.
   bounded live working sets.
 - Cached SDBG topology, parallel unitig traversal, and compact unitig
   adjacency/endpoint lookup.
+- Experimental event-driven local-low-depth pruning skips repeated full-graph
+  passes only after a pass removes no unitigs. It advances along the original
+  1.1x threshold sequence to the next possible deletion event. Enable it with
+  `MEGAHIT_EXPERIMENTAL_LOW_DEPTH_EVENT_SKIP=1`; full-scale timing is still
+  required before considering it a default optimization.
 - Sharded local-assembly mapping/index structures and compact mapping-result
   collection.
 - Sharded iterative flank indexes and parallel edge collection.

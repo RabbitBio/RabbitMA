@@ -3,7 +3,10 @@
 //
 
 #include "low_depth_remover.h"
+
 #include <cstdlib>
+#include <limits>
+
 #include "unitig_graph.h"
 #include "utils/utils.h"
 
@@ -34,6 +37,56 @@ double LocalDepth(UnitigGraph &graph, UnitigGraph::VertexAdapter &adapter,
   } else {
     return total_depth / num_added_edges;
   }
+}
+
+// This is called only after a pruning pass removed nothing, so the graph is
+// unchanged. Find the smallest unitig depth that can become removable as the
+// global threshold increases. A unitig can cross a future threshold only
+// when its depth is below its fixed local threshold.
+bool FindNextLocalLowDepthEvent(UnitigGraph &graph, uint32_t max_len,
+                                uint32_t local_width, double local_ratio,
+                                double *event_depth) {
+  double next_event = std::numeric_limits<double>::infinity();
+
+#pragma omp parallel for reduction(min : next_event)
+  for (UnitigGraph::size_type active_index = 0; active_index < graph.size();
+       ++active_index) {
+    auto adapter = graph.MakeVertexAdapter(graph.active_id(active_index));
+    if (adapter.IsStandalone() || adapter.GetLength() > max_len) continue;
+    int indegree = graph.InDegree(adapter);
+    int outdegree = graph.OutDegree(adapter);
+    if (indegree + outdegree == 0) continue;
+    if ((indegree <= 1 && outdegree <= 1) || indegree == 0 || outdegree == 0) {
+      const double depth = adapter.GetAvgDepth();
+      const double local_threshold =
+          LocalDepth(graph, adapter, local_width) * local_ratio;
+      if (depth < local_threshold && depth < next_event) next_event = depth;
+    }
+  }
+
+  *event_depth = next_event;
+  return next_event < std::numeric_limits<double>::infinity();
+}
+
+// Keep the original sequence t, 1.1*t, 1.1^2*t, ... exactly.  Returning the
+// first member strictly above event_depth preserves the pass on which the
+// strict depth < threshold predicate first becomes true.
+bool AdvanceToLocalLowDepthEvent(double current_threshold, double event_depth,
+                                 double *next_threshold,
+                                 uint32_t *num_noop_thresholds) {
+  double next = current_threshold * 1.1;
+  uint32_t skipped = 0;
+  while (next < kMaxMul && next <= event_depth) {
+    const double previous = next;
+    next *= 1.1;
+    ++skipped;
+    if (next <= previous) {
+      return false;
+    }
+  }
+  *next_threshold = next;
+  *num_noop_thresholds = skipped;
+  return next < kMaxMul;
 }
 
 }  // namespace
@@ -95,6 +148,8 @@ uint32_t IterateLocalLowDepth(UnitigGraph &graph, double min_depth,
   uint32_t iteration = 0;
   static const bool profile_iterations =
       std::getenv("MEGAHIT_PROFILE_LOW_DEPTH") != nullptr;
+  static const bool event_skip_enabled =
+      std::getenv("MEGAHIT_EXPERIMENTAL_LOW_DEPTH_EVENT_SKIP") != nullptr;
   while (min_depth < kMaxMul) {
     ++iteration;
     SimpleTimer timer;
@@ -112,7 +167,39 @@ uint32_t IterateLocalLowDepth(UnitigGraph &graph, double min_depth,
       break;
     }
     total_removed += num_removed;
-    min_depth *= 1.1;
+    if (event_skip_enabled && num_removed == 0) {
+      double event_depth = 0;
+      if (!FindNextLocalLowDepthEvent(graph, min_len, local_width, local_ratio,
+                                      &event_depth)) {
+        if (profile_iterations) {
+          xinfo(
+              "Low-depth event skip: no future deletion event; stop after "
+              "no-op iteration {}\n",
+              iteration);
+        }
+        break;
+      }
+      double next_threshold = min_depth;
+      uint32_t skipped_thresholds = 0;
+      if (!AdvanceToLocalLowDepthEvent(min_depth, event_depth, &next_threshold,
+                                       &skipped_thresholds)) {
+        if (profile_iterations) {
+          xinfo(
+              "Low-depth event skip: next deletion event is outside the "
+              "threshold range\n");
+        }
+        break;
+      }
+      if (profile_iterations && skipped_thresholds > 0) {
+        xinfo(
+            "Low-depth event skip: skipped={} no-op thresholds, "
+            "next={.4}, trigger_depth={.4}\n",
+            skipped_thresholds, next_threshold, event_depth);
+      }
+      min_depth = next_threshold;
+    } else {
+      min_depth *= 1.1;
+    }
   }
   return total_removed;
 }
