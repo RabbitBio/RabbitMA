@@ -63,10 +63,23 @@ def match_int(pattern, line):
     return int(match.group(1)) if match else None
 
 
+def profile_fields(text):
+    fields = {}
+    for key, value in re.findall(r'(\w+)=([^\s\'\"]+)', text):
+        if re.match(r'^\d+$', value):
+            fields[key] = int(value)
+        elif re.match(r'^\d+\.\d+$', value):
+            fields[key] = float(value)
+        else:
+            fields[key] = value
+    return fields
+
+
 def parse_log(path):
     per_k = defaultdict(empty_k)
     rounds = defaultdict(dict)
     read_index = []
+    local_mapping = []
     pending_phase = None
     build_k = None
     assemble_k = None
@@ -76,16 +89,10 @@ def parse_log(path):
         for line in stream:
             marker = 'Read-index profile: '
             if marker in line:
-                fields = {}
-                for key, value in re.findall(r'(\w+)=([^\s\'\"]+)',
-                                             line.split(marker, 1)[1]):
-                    if re.match(r'^\d+$', value):
-                        fields[key] = int(value)
-                    elif re.match(r'^\d+\.\d+$', value):
-                        fields[key] = float(value)
-                    else:
-                        fields[key] = value
-                read_index.append(fields)
+                read_index.append(profile_fields(line.split(marker, 1)[1]))
+            marker = 'Local-mapping profile: '
+            if marker in line:
+                local_mapping.append(profile_fields(line.split(marker, 1)[1]))
             match = re.search(r'Extract solid .* for k = (\d+)', line)
             if match:
                 pending_phase = (int(match.group(1)), 'count')
@@ -226,7 +233,7 @@ def parse_log(path):
     return (dict(per_k),
             {k: list(rounds[k][number] for number in sorted(rounds[k]))
              for k in sorted(rounds)},
-            read_index)
+            read_index, local_mapping)
 
 
 def number(value):
@@ -237,7 +244,7 @@ def seconds(value):
     return '%.4f' % value
 
 
-def markdown(per_k, rounds, read_index):
+def markdown(per_k, rounds, read_index, local_mapping):
     lines = [
         '| k | graph build | assemble | cleaning | refresh | local assembly | iterate | low-depth |',
         '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
@@ -313,6 +320,47 @@ def markdown(per_k, rounds, read_index):
                     number(row.get('required_budget_bytes')),
                     number(row.get('budget_bytes')),
                     number(row.get('full_scan_bytes_avoided'))))
+    if local_mapping:
+        lines += [
+            '',
+            '| outer k → next | mapper build | read lib | insert size | endpoint filter | mapping | collation | compaction | endpoint assembly |',
+            '| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        ]
+        for row in local_mapping:
+            lines.append(
+                '| %s → %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+                    row.get('k', '-'), row.get('next_k', '-'),
+                    seconds(row.get('mapper_build_time', 0.0)),
+                    seconds(row.get('read_lib_time', 0.0)),
+                    seconds(row.get('insert_size_time', 0.0)),
+                    seconds(row.get('endpoint_filter_time', 0.0)),
+                    seconds(row.get('mapping_time', 0.0)),
+                    seconds(row.get('collation_time', 0.0)),
+                    seconds(row.get('compaction_time', 0.0)),
+                    seconds(row.get('endpoint_assembly_time', 0.0))))
+        lines += [
+            '',
+            '| outer k → next | source | library reads | insert visited / TryMap | mapping visited | candidate reads / pairs | gate attempts | selected pairs / reads | TryMap | aligned | added | retained |',
+            '| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        ]
+        for row in local_mapping:
+            lines.append(
+                '| %s → %s | %s | %s | %s / %s | %s | %s / %s | %s | %s / %s | %s | %s | %s | %s |' % (
+                    row.get('k', '-'), row.get('next_k', '-'),
+                    row.get('candidate_source', '-'),
+                    number(row.get('library_reads')),
+                    number(row.get('insert_reads_visited')),
+                    number(row.get('insert_try_map_attempts')),
+                    number(row.get('mapping_reads_visited')),
+                    number(row.get('candidate_reads')),
+                    number(row.get('candidate_pairs')),
+                    number(row.get('endpoint_gate_attempts')),
+                    number(row.get('endpoint_selected_pairs')),
+                    number(row.get('endpoint_selected_reads')),
+                    number(row.get('try_map_attempts')),
+                    number(row.get('aligned_reads')),
+                    number(row.get('added_mappings')),
+                    number(row.get('retained_mappings'))))
     return '\n'.join(lines) + '\n'
 
 
@@ -321,13 +369,14 @@ def main():
     parser.add_argument('log', help='RabbitMA output log')
     parser.add_argument('--json', action='store_true', help='emit JSON')
     args = parser.parse_args()
-    per_k, rounds, read_index = parse_log(args.log)
+    per_k, rounds, read_index, local_mapping = parse_log(args.log)
     if args.json:
         print(json.dumps({'per_k': per_k, 'cleaning_rounds': rounds,
-                          'read_index': read_index},
+                          'read_index': read_index,
+                          'local_mapping': local_mapping},
                          indent=2, sort_keys=True))
     else:
-        print(markdown(per_k, rounds, read_index), end='')
+        print(markdown(per_k, rounds, read_index, local_mapping), end='')
 
 
 if __name__ == '__main__':

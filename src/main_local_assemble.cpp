@@ -42,6 +42,8 @@ LocalAsmOption ParseLocalAsmOptions(int argc, char *argv[]) {
   desc.AddOption("step", "", opt.step, "");
   desc.AddOption("seed_kmer", "", opt.seed_kmer,
                  "kmer size for seeding alignments");
+  desc.AddOption("outer_k", "", opt.outer_k,
+                 "source outer k for structured profiling");
   desc.AddOption("min_contig_len", "", opt.min_contig_len, "");
   desc.AddOption("min_mapping_len", "", opt.min_mapping_len, "");
   desc.AddOption("sparsity", "", opt.sparsity, "sparsity of hash mapper");

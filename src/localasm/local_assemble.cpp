@@ -1959,8 +1959,26 @@ void LaunchIDBA(LocalPackedReads &reads,
 
 }
 
+struct InsertSizeProfile {
+  uint64_t reads_visited{0};
+  uint64_t mapping_attempts{0};
+};
+
+struct LocalMappingProfile {
+  uint64_t reads_visited{0};
+  uint64_t candidate_reads{0};
+  uint64_t candidate_pairs{0};
+  uint64_t endpoint_gate_attempts{0};
+  uint64_t endpoint_selected_pairs{0};
+  uint64_t endpoint_selected_reads{0};
+  uint64_t mapping_attempts{0};
+  uint64_t aligned_reads{0};
+  uint64_t added_mappings{0};
+};
+
 std::vector<TInsertSize> EstimateInsertSize(
-    const HashMapper &mapper, const SequenceLibCollection &lib_collection) {
+    const HashMapper &mapper, const SequenceLibCollection &lib_collection,
+    InsertSizeProfile *profile) {
   std::vector<TInsertSize> insert_sizes(lib_collection.size());
   for (unsigned lib_id = 0; lib_id < lib_collection.size(); ++lib_id) {
     auto lib = lib_collection.GetLib(lib_id);
@@ -1974,6 +1992,7 @@ std::vector<TInsertSize> EstimateInsertSize(
         omp_get_max_threads());
     const size_t min_hist_size_for_estimation = 1u << 18;
     size_t processed_reads = 0;
+    uint64_t mapping_attempts = 0;
 
     while (insert_hist.size() < min_hist_size_for_estimation &&
            processed_reads < lib.seq_count()) {
@@ -1985,7 +2004,7 @@ std::vector<TInsertSize> EstimateInsertSize(
         local_hist.clear();
       }
 
-#pragma omp parallel for
+#pragma omp parallel for reduction(+ : mapping_attempts)
       for (size_t i = start_read_id; i < processed_reads; i += 2) {
         auto seq1 = lib.GetSequenceView(i);
         auto seq2 = lib.GetSequenceView(i + 1);
@@ -1998,6 +2017,7 @@ std::vector<TInsertSize> EstimateInsertSize(
         if (!endpoint1 && !endpoint2) {
           continue;
         }
+        mapping_attempts += 2u;
         auto rec1 = mapper.TryMap(seq1, witness1.valid ? &witness1 : nullptr);
         auto rec2 = mapper.TryMap(seq2, witness2.valid ? &witness2 : nullptr);
         if (rec1.valid && rec2.valid) {
@@ -2026,6 +2046,8 @@ std::vector<TInsertSize> EstimateInsertSize(
     }
 
     insert_hist.Trim(0.01);
+    profile->reads_visited += processed_reads;
+    profile->mapping_attempts += mapping_attempts;
     insert_sizes[lib_id] = TInsertSize(insert_hist.mean(), insert_hist.sd());
 
     xinfo("Lib {}, insert size: {.2} sd: {.2}\n", lib_id,
@@ -2037,7 +2059,7 @@ std::vector<TInsertSize> EstimateInsertSize(
 
 std::vector<TInsertSize> EstimateInsertSizeMapped(
     const HashMapper &mapper, const SequenceLibCollection &lib_collection,
-    const MappedReadFile &reads) {
+    const MappedReadFile &reads, InsertSizeProfile *profile) {
   const size_t num_libs = lib_collection.size();
   const int num_threads = std::max(1, omp_get_max_threads());
   std::vector<TInsertSize> insert_sizes(num_libs);
@@ -2177,6 +2199,11 @@ std::vector<TInsertSize> EstimateInsertSizeMapped(
     xinfo("Lib {}, insert size: {.2} sd: {.2}\n", lib_id,
           insert_sizes[lib_id].first, insert_sizes[lib_id].second);
   }
+  for (size_t lib_id = 0; lib_id < num_libs; ++lib_id) {
+    if (!lib_collection.GetLib(lib_id).IsPaired()) continue;
+    profile->reads_visited += processed_reads[lib_id];
+    profile->mapping_attempts += processed_reads[lib_id];
+  }
   return insert_sizes;
 }
 
@@ -2218,28 +2245,37 @@ unsigned LegacySingleEndMappingCopies() {
 void MapToContigs(const HashMapper &mapper,
                   const SequenceLibCollection &lib_collection,
                   const std::vector<TInsertSize> &insert_sizes,
-                  MappingResultCollector *collector) {
+                  MappingResultCollector *collector,
+                  LocalMappingProfile *profile) {
   for (unsigned lib_id = 0; lib_id < lib_collection.size(); ++lib_id) {
     auto &lib = lib_collection.GetLib(lib_id);
     int32_t local_range = LocalRange(lib, insert_sizes[lib_id]);
     bool is_paired = lib.IsPaired();
 
-    size_t num_added = 0, num_mapped = 0;
+    uint64_t num_added = 0, num_mapped = 0;
+    uint64_t gate_attempts = 0, selected_pairs = 0, selected_reads = 0;
+    uint64_t mapping_attempts = 0;
 
     if (is_paired) {
-#pragma omp parallel for reduction(+ : num_added, num_mapped)
+#pragma omp parallel for reduction(+ : num_added, num_mapped, gate_attempts, \
+                                       selected_pairs, mapping_attempts)
       for (size_t i = 0; i < lib.seq_count(); i += 2) {
         auto seq1 = lib.GetSequenceView(i);
         auto seq2 = lib.GetSequenceView(i + 1);
         HashMapper::EndpointSeedWitness witness1;
         HashMapper::EndpointSeedWitness witness2;
+        ++gate_attempts;
         const bool endpoint1 = mapper.MayMapToEndpoint(seq1, &witness1);
-        const bool endpoint2 =
-            endpoint1 ? false
-                      : mapper.MayMapToEndpoint(seq2, &witness2);
+        bool endpoint2 = false;
+        if (!endpoint1) {
+          ++gate_attempts;
+          endpoint2 = mapper.MayMapToEndpoint(seq2, &witness2);
+        }
         if (!endpoint1 && !endpoint2) {
           continue;
         }
+        ++selected_pairs;
+        mapping_attempts += 2u;
         auto rec1 = mapper.TryMap(seq1, witness1.valid ? &witness1 : nullptr);
         auto rec2 = mapper.TryMap(seq2, witness2.valid ? &witness2 : nullptr);
 
@@ -2262,14 +2298,18 @@ void MapToContigs(const HashMapper &mapper,
         }
       }
     } else {
-#pragma omp parallel reduction(+ : num_added, num_mapped)
+#pragma omp parallel reduction(+ : num_added, num_mapped, gate_attempts, \
+                                selected_reads, mapping_attempts)
       {
         const unsigned mapping_copies = LegacySingleEndMappingCopies();
 #pragma omp for
         for (size_t i = 0; i < lib.seq_count(); ++i) {
           auto seq = lib.GetSequenceView(i);
           HashMapper::EndpointSeedWitness witness;
+          ++gate_attempts;
           if (!mapper.MayMapToEndpoint(seq, &witness)) continue;
+          ++selected_reads;
+          ++mapping_attempts;
           auto rec = mapper.TryMap(seq, &witness);
 
           if (rec.valid) {
@@ -2289,6 +2329,15 @@ void MapToContigs(const HashMapper &mapper,
         "Lib {}: total {} reads, aligned {}, added {} reads to local "
         "assembly\n",
         lib_id, lib.seq_count(), num_mapped, num_added);
+    profile->reads_visited += lib.seq_count();
+    profile->candidate_reads += lib.seq_count();
+    profile->candidate_pairs += is_paired ? lib.seq_count() / 2u : 0u;
+    profile->endpoint_gate_attempts += gate_attempts;
+    profile->endpoint_selected_pairs += selected_pairs;
+    profile->endpoint_selected_reads += selected_reads;
+    profile->mapping_attempts += mapping_attempts;
+    profile->aligned_reads += num_mapped;
+    profile->added_mappings += num_added;
   }
 }
 
@@ -2299,7 +2348,8 @@ void MapToContigsMapped(const HashMapper &mapper,
                         const MappedLocalCandidateFile *candidate_file,
                         const LocalSeedPositions *seed_positions,
                         bool mapped_assembly,
-                        MappingResultCollector *collector) {
+                        MappingResultCollector *collector,
+                        LocalMappingProfile *profile) {
   const auto &chunks = reads.index().chunks;
   const size_t num_libs = lib_collection.size();
   std::vector<uint64_t> lib_begins(num_libs);
@@ -2322,6 +2372,16 @@ void MapToContigsMapped(const HashMapper &mapper,
   std::vector<uint64_t> thread_mapping_attempts(
       static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
   std::vector<uint64_t> thread_selected_pairs(
+      static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
+  std::vector<uint64_t> thread_visited_reads(
+      static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
+  std::vector<uint64_t> thread_candidate_reads(
+      static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
+  std::vector<uint64_t> thread_candidate_pairs(
+      static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
+  std::vector<uint64_t> thread_gate_attempts(
+      static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
+  std::vector<uint64_t> thread_selected_reads(
       static_cast<size_t>(omp_get_max_threads()) * thread_stride, 0u);
   const bool validate_gate =
       std::getenv("MEGAHIT_VALIDATE_LOCAL_MINIMIZER_GATE") != nullptr;
@@ -2367,11 +2427,26 @@ void MapToContigsMapped(const HashMapper &mapper,
             thread_mapping_attempts[thread_offset + lib_id];
         uint64_t &selected_pairs =
             thread_selected_pairs[thread_offset + lib_id];
+        uint64_t &visited_reads =
+            thread_visited_reads[thread_offset + lib_id];
+        uint64_t &candidate_reads =
+            thread_candidate_reads[thread_offset + lib_id];
+        uint64_t &candidate_pairs =
+            thread_candidate_pairs[thread_offset + lib_id];
+        uint64_t &gate_attempts =
+            thread_gate_attempts[thread_offset + lib_id];
+        uint64_t &selected_reads =
+            thread_selected_reads[thread_offset + lib_id];
         const int32_t local_range = local_ranges[lib_id];
 
         if (paired[lib_id] != 0u) {
           if (((first - lib_begin) & 1u) != 0u) ++first;
           if (first >= end) continue;
+          visited_reads += end - first;
+          if (candidate_file == nullptr) {
+            candidate_reads += end - first;
+            candidate_pairs += (end - first) / 2u;
+          }
           const uint32_t *cursor = reads.LocateRead(chunk, first);
           auto candidate_range =
               candidate_file == nullptr
@@ -2442,17 +2517,26 @@ void MapToContigsMapped(const HashMapper &mapper,
             const bool select1 = is_candidate(seq1_word_offset);
             const bool select2 = is_candidate(seq2_word_offset);
             if (!select1 && !select2) continue;
+            if (candidate_file != nullptr) {
+              candidate_reads += static_cast<uint64_t>(select1) +
+                                 static_cast<uint64_t>(select2);
+              ++candidate_pairs;
+            }
             HashMapper::EndpointSeedWitness witness1;
             HashMapper::EndpointSeedWitness witness2;
+            ++gate_attempts;
             const bool endpoint1 = endpoint_gate(seq1, read_id, &witness1);
-            const bool endpoint2 =
-                endpoint1
-                    ? false
-                    : endpoint_gate(seq2, read_id + 1u, &witness2);
+            bool endpoint2 = false;
+            if (!endpoint1) {
+              ++gate_attempts;
+              endpoint2 = endpoint_gate(seq2, read_id + 1u, &witness2);
+            }
             if (!endpoint1 && !endpoint2) continue;
             map_pair(seq1, seq2, read_id, witness1, witness2);
           }
         } else {
+          visited_reads += end - first;
+          if (candidate_file == nullptr) candidate_reads += end - first;
           const uint32_t *cursor = reads.LocateRead(chunk, first);
           auto candidate_range =
               candidate_file == nullptr
@@ -2479,10 +2563,13 @@ void MapToContigsMapped(const HashMapper &mapper,
                 static_cast<uint64_t>(cursor - reads.words());
             const PackedReadRecord seq = MappedReadFile::Next(&cursor);
             if (!is_candidate(word_offset)) continue;
+            if (candidate_file != nullptr) ++candidate_reads;
             HashMapper::EndpointSeedWitness witness;
+            ++gate_attempts;
             if (!endpoint_gate(seq, read_id, &witness)) {
               continue;
             }
+            ++selected_reads;
             ++mapping_attempts;
             const MappingRecord rec =
                 mapper.TryMap(seq.words, seq.length,
@@ -2512,12 +2599,22 @@ void MapToContigsMapped(const HashMapper &mapper,
     uint64_t num_mapped = 0;
     uint64_t mapping_attempts = 0;
     uint64_t selected_pairs = 0;
+    uint64_t visited_reads = 0;
+    uint64_t candidate_reads = 0;
+    uint64_t candidate_pairs = 0;
+    uint64_t gate_attempts = 0;
+    uint64_t selected_reads = 0;
     for (int thread = 0; thread < omp_get_max_threads(); ++thread) {
       const size_t index = static_cast<size_t>(thread) * thread_stride + lib_id;
       num_added += thread_added[index];
       num_mapped += thread_mapped[index];
       mapping_attempts += thread_mapping_attempts[index];
       selected_pairs += thread_selected_pairs[index];
+      visited_reads += thread_visited_reads[index];
+      candidate_reads += thread_candidate_reads[index];
+      candidate_pairs += thread_candidate_pairs[index];
+      gate_attempts += thread_gate_attempts[index];
+      selected_reads += thread_selected_reads[index];
     }
     const auto &lib = lib_collection.GetLib(lib_id);
     xinfo(
@@ -2530,6 +2627,15 @@ void MapToContigsMapped(const HashMapper &mapper,
           lib.seq_count() == 0
               ? 0.0
               : 100.0 * mapping_attempts / lib.seq_count());
+    profile->reads_visited += visited_reads;
+    profile->candidate_reads += candidate_reads;
+    profile->candidate_pairs += candidate_pairs;
+    profile->endpoint_gate_attempts += gate_attempts;
+    profile->endpoint_selected_pairs += selected_pairs;
+    profile->endpoint_selected_reads += selected_reads;
+    profile->mapping_attempts += mapping_attempts;
+    profile->aligned_reads += num_mapped;
+    profile->added_mappings += num_added;
   }
 }
 void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
@@ -3006,6 +3112,7 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
                       opt.sparsity);
   mapper.SetMappingThreshold(opt.min_mapping_len, opt.similarity);
   timer.stop();
+  const double mapper_build_seconds = timer.elapsed();
   xinfo("Hash mapper construction time elapsed: {}\n", timer.elapsed());
 
   timer.reset();
@@ -3040,15 +3147,19 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
           mapped_candidates.size());
   }
   timer.stop();
+  const double read_lib_seconds = timer.elapsed();
   xinfo("Read lib time elapsed: {}\n", timer.elapsed());
 
   timer.reset();
   timer.start();
+  InsertSizeProfile insert_profile;
   const auto insert_sizes =
       use_mapped_stream
-          ? EstimateInsertSizeMapped(mapper, lib_collection, mapped_reads)
-          : EstimateInsertSize(mapper, lib_collection);
+          ? EstimateInsertSizeMapped(mapper, lib_collection, mapped_reads,
+                                     &insert_profile)
+          : EstimateInsertSize(mapper, lib_collection, &insert_profile);
   timer.stop();
+  const double insert_size_seconds = timer.elapsed();
   xinfo("Insert size estimation time elapsed: {}\n", timer.elapsed());
 
   const int32_t max_local_range =
@@ -3080,6 +3191,7 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
     if (seed_position_pointer == nullptr) mapper.ReleaseEndpointMinimizerGate();
   }
   timer.stop();
+  const double endpoint_filter_seconds = timer.elapsed();
   xinfo("Endpoint seed filter construction time elapsed: {}\n",
         timer.elapsed());
 
@@ -3099,17 +3211,20 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
       (local_memory_budget == 0u ||
        mapped_reads.total_words() <= local_memory_budget / 8u) &&
       std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_MAPPED_ASSEMBLY") != nullptr;
+  LocalMappingProfile mapping_profile;
   if (use_mapped_stream) {
     MapToContigsMapped(mapper, lib_collection, insert_sizes, mapped_reads,
                        opt.candidate_file.empty() ? nullptr
                                                   : &mapped_candidates,
                        seed_position_pointer,
                        mapped_assembly,
-                       &collector);
+                       &collector, &mapping_profile);
   } else {
-    MapToContigs(mapper, lib_collection, insert_sizes, &collector);
+    MapToContigs(mapper, lib_collection, insert_sizes, &collector,
+                 &mapping_profile);
   }
   timer.stop();
+  const double mapping_seconds = timer.elapsed();
   xinfo("Mapping time elapsed: {}\n", timer.elapsed());
   mapper.ReportPhaseCertificateStats();
 
@@ -3117,12 +3232,42 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
   timer.start();
   collector.Finalize();
   timer.stop();
+  const double collation_seconds = timer.elapsed();
+  const uint64_t retained_mappings = collector.size();
   xinfo("Mapping result collation time elapsed: {}, retained {} mappings\n",
-        timer.elapsed(), collector.size());
+        timer.elapsed(), retained_mappings);
 
   mapper.ReleaseIndex();
   seed_positions.Release();
   mapped_candidates.Close();
+
+  const auto report_profile = [&](double compaction_seconds,
+                                  double endpoint_assembly_seconds) {
+    xinfo(
+        "Local-mapping profile: k={} next_k={} mapped_stream={} "
+        "candidate_source={s} mapper_build_time={.6} read_lib_time={.6} "
+        "insert_size_time={.6} endpoint_filter_time={.6} mapping_time={.6} "
+        "collation_time={.6} compaction_time={.6} "
+        "endpoint_assembly_time={.6} library_reads={} "
+        "insert_reads_visited={} insert_try_map_attempts={} "
+        "mapping_reads_visited={} candidate_reads={} candidate_pairs={} "
+        "endpoint_gate_attempts={} endpoint_selected_pairs={} "
+        "endpoint_selected_reads={} try_map_attempts={} aligned_reads={} "
+        "added_mappings={} retained_mappings={}\n",
+        opt.outer_k, opt.kmax, use_mapped_stream ? 1 : 0,
+        opt.candidate_file.empty() ? "all" : "index", mapper_build_seconds,
+        read_lib_seconds, insert_size_seconds, endpoint_filter_seconds,
+        mapping_seconds, collation_seconds, compaction_seconds,
+        endpoint_assembly_seconds, read_size.num_reads,
+        insert_profile.reads_visited, insert_profile.mapping_attempts,
+        mapping_profile.reads_visited, mapping_profile.candidate_reads,
+        mapping_profile.candidate_pairs,
+        mapping_profile.endpoint_gate_attempts,
+        mapping_profile.endpoint_selected_pairs,
+        mapping_profile.endpoint_selected_reads,
+        mapping_profile.mapping_attempts, mapping_profile.aligned_reads,
+        mapping_profile.added_mappings, retained_mappings);
+  };
 
   if (mapped_assembly) {
     const double prepare_begin = omp_get_wtime();
@@ -3131,12 +3276,17 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
     xinfo("Mapped endpoint reads: {} exact records, maximum length {}, "
           "preparation {.4} seconds; selected reads are not repacked\n",
           collector.size(), maximum, omp_get_wtime() - prepare_begin);
+    const double compaction_seconds = omp_get_wtime() - prepare_begin;
     timer.reset();
     timer.start();
     AssembleAndOutput(mapper, read_pkg, collector, opt.output_file,
                         max_local_range, opt, mapped_reads.words(), maximum);
     timer.stop();
+    const double endpoint_assembly_seconds = timer.elapsed();
     xinfo("Local assembly time elapsed: {}\n", timer.elapsed());
+    if (std::getenv("MEGAHIT_PROFILE_PHASES") != nullptr) {
+      report_profile(compaction_seconds, endpoint_assembly_seconds);
+    }
     return;
   }
 
@@ -3179,6 +3329,7 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
   read_pkg = std::move(selected_read_pkg);
   std::vector<uint64_t>().swap(selected_read_ids);
   timer.stop();
+  const double compaction_seconds = timer.elapsed();
   xinfo("Compacted referenced reads: {} / {} reads, {} -> {} bytes "
         "(length gap index {} bits), elapsed {}\n",
         read_pkg.seq_count(), original_read_count, original_read_bytes,
@@ -3189,5 +3340,9 @@ void RunLocalAssembly(const LocalAsmOption &opt) {
   AssembleAndOutput(mapper, read_pkg, collector, opt.output_file,
                     max_local_range, opt);
   timer.stop();
+  const double endpoint_assembly_seconds = timer.elapsed();
   xinfo("Local assembly time elapsed: {}\n", timer.elapsed());
+  if (std::getenv("MEGAHIT_PROFILE_PHASES") != nullptr) {
+    report_profile(compaction_seconds, endpoint_assembly_seconds);
+  }
 }

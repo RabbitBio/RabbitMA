@@ -1811,6 +1811,7 @@ def local_assemble(cur_k, kmer_to):
               '-l', opt.read_lib_path,
               '-t', str(opt.num_cpu_threads),
               '-o', contig_prefix(cur_k) + '.local.fa',
+              '--outer_k', str(cur_k),
               '--kmax', str(kmer_to)]
     fingerprint_spec = os.environ.get('MEGAHIT_LOCAL_INPUT_FINGERPRINT')
     if fingerprint_spec:

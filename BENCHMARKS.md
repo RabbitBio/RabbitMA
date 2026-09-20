@@ -51,6 +51,17 @@ not additional top-level time. Reusable read-index construction and queries
 are charged to the source k's iteration time; JSON output retains the index
 build component separately.
 
+The same phase flag adds one structured `Local-mapping profile:` record per
+outer-k transition. It separates mapper construction, read-library opening,
+insert-size estimation, endpoint-filter construction, mapping, collation,
+referenced-read compaction and endpoint assembly. Its counters distinguish
+insert-size reads and `TryMap` calls from the main mapping traversal, then
+report visited reads, candidate reads/pairs, endpoint-gate work, exact mapping
+attempts, aligned reads and retained mappings. The Markdown and JSON reports
+include both the timing breakdown and this read-selection funnel. When no
+candidate file is supplied, `candidate_source=all`; this makes the repeated
+full-library traversal explicit rather than estimating candidate savings.
+
 Read-index build and query commands also emit one machine-readable
 `Read-index profile:` record. It reports the current and next k, build/query
 time, total and matched index occurrences, replay candidate count, required
