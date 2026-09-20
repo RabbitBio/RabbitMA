@@ -62,6 +62,22 @@ disjoint read-order waves through one persistent edge collector. Thus total
 candidate volume no longer forces a full-read scan; genuine index failures
 still retain the exact fallback path and are reported as `status=fallback`.
 
+Local assembly can record its existing endpoint/read fingerprints separately
+for every outer-k transition. Give the environment variable a directory (the
+trailing slash is significant when the directory does not exist yet):
+
+```bash
+MEGAHIT_LOCAL_INPUT_FINGERPRINT=/path/to/fingerprints/ megahit ...
+python3 benchmarks/cross_outer_local_reuse.py /path/to/fingerprints/
+```
+
+The driver creates files such as `local_k39_to_k59.tsv`. The analyzer joins
+adjacent transitions as multisets and reports full-input matches, ordered-read
+matches, shared inner-k rounds and repeated raw-k-mer work. This is a
+diagnostic opportunity measurement: the 128-bit fingerprints do not enable a
+cache or alter local assembly. A filename template containing `{from_k}` and
+`{to_k}` can be used instead of a directory; `--json` emits structured output.
+
 ## Scaling policy
 
 Use the 1-million-pair CAMI2 strain-madness subset only for fast correctness

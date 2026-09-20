@@ -51,6 +51,8 @@ LocalAsmOption ParseLocalAsmOptions(int argc, char *argv[]) {
   desc.AddOption("output_file", "o", opt.output_file, "");
   desc.AddOption("candidate_file", "", opt.candidate_file,
                  "exact persistent-index candidate read offsets");
+  desc.AddOption("input_fingerprint", "", opt.input_fingerprint_file,
+                 "diagnostic local-input fingerprint output");
 
   try {
     desc.Parse(argc, argv);
