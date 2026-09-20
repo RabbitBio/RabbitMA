@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -145,6 +146,8 @@ void ParseAsmOption(int argc, char *argv[]) {
 int main_assemble(int argc, char **argv) {
   AutoMaxRssRecorder recorder;
   ParseAsmOption(argc, argv);
+  const bool profile_phases =
+      std::getenv("MEGAHIT_PROFILE_PHASES") != nullptr;
 
   // Loading consists of independent SDBG shards, so configure the requested
   // OpenMP team before constructing the graph rather than after it is loaded.
@@ -289,11 +292,20 @@ int main_assemble(int argc, char **argv) {
   // graph cleaning
   for (int round = 1; round <= opt.cleaning_rounds; ++round) {
     xinfo("Graph cleaning round {}\n", round);
+    if (profile_phases) {
+      xinfo("Cleaning round input: k={}, round={}, active_unitigs={}\n",
+            dbg.k(), round, graph.size());
+    }
     bool changed = false;
+    uint32_t num_tips = 0;
+    uint32_t num_bubbles = 0;
+    uint32_t num_complex_bubbles = 0;
+    uint32_t num_disconnected = 0;
+    uint32_t num_excessive_pruned = 0;
     if (round > 1) {
       timer.reset();
       timer.start();
-      uint32_t num_tips = RemoveTips(graph, opt.max_tip_len);
+      num_tips = RemoveTips(graph, opt.max_tip_len);
       changed |= num_tips > 0;
       timer.stop();
       xinfo("Tips removed: {}, time: {.3}\n", num_tips, timer.elapsed());
@@ -302,7 +314,7 @@ int main_assemble(int argc, char **argv) {
     if (opt.bubble_level >= 1) {
       timer.reset();
       timer.start();
-      uint32_t num_bubbles = naiver_bubble_remover.PopBubbles(graph, true);
+      num_bubbles = naiver_bubble_remover.PopBubbles(graph, true);
       timer.stop();
       xinfo("Number of bubbles removed: {}, Time elapsed(sec): {.3}\n",
             num_bubbles, timer.elapsed());
@@ -312,25 +324,24 @@ int main_assemble(int argc, char **argv) {
     if (opt.bubble_level >= 2) {
       timer.reset();
       timer.start();
-      uint32_t num_bubbles = complex_bubble_remover.PopBubbles(graph, true);
+      num_complex_bubbles =
+          complex_bubble_remover.PopBubbles(graph, true);
       timer.stop();
       xinfo("Number of complex bubbles removed: {}, Time elapsed(sec): {}\n",
-            num_bubbles, timer.elapsed());
-      changed |= num_bubbles > 0;
+            num_complex_bubbles, timer.elapsed());
+      changed |= num_complex_bubbles > 0;
     }
 
     // disconnect
     timer.reset();
     timer.start();
-    uint32_t num_disconnected =
-        DisconnectWeakLinks(graph, opt.disconnect_ratio);
+    num_disconnected = DisconnectWeakLinks(graph, opt.disconnect_ratio);
     timer.stop();
     xinfo("Number unitigs disconnected: {}, time: {.3}\n", num_disconnected,
           timer.elapsed());
     changed |= num_disconnected > 0;
 
     // excessive pruning
-    uint32_t num_excessive_pruned = 0;
     if (opt.prune_level >= 3) {
       timer.reset();
       timer.start();
@@ -351,6 +362,18 @@ int main_assemble(int argc, char **argv) {
       timer.stop();
       xinfo("Unitigs removed in excessive pruning: {}, time: {.3}\n",
             num_excessive_pruned, timer.elapsed());
+    }
+    if (profile_phases) {
+      const uint64_t changed_operations =
+          static_cast<uint64_t>(num_tips) + num_bubbles +
+          num_complex_bubbles + num_disconnected + num_excessive_pruned;
+      xinfo(
+          "Cleaning round result: k={}, round={}, active_unitigs={}, "
+          "changed={}, tips={}, bubbles={}, complex_bubbles={}, "
+          "disconnected={}, low_depth={}\n",
+          dbg.k(), round, graph.size(), changed_operations, num_tips,
+          num_bubbles, num_complex_bubbles, num_disconnected,
+          num_excessive_pruned);
     }
     if (!changed) break;
   }

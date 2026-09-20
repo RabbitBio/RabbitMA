@@ -31,6 +31,66 @@ public commit and its resource configuration remains necessary for a current
 release comparison; component tests or timings with experimental switches
 should not be presented as default end-to-end performance.
 
+## Per-k phase profiling
+
+Set `MEGAHIT_PROFILE_PHASES=1` to add the active-unitig count and combined
+change count at the beginning and end of every graph-cleaning round. The
+ordinary log already records subprocess wall times, graph input volume,
+per-cleaner time and change counts, and the local-low-depth stage. Convert
+these records into per-k Markdown tables with:
+
+```bash
+MEGAHIT_PROFILE_PHASES=1 MEGAHIT_PROFILE_LOW_DEPTH=1 \
+MEGAHIT_PROFILE_GRAPH_REFRESH=1 megahit ...
+python3 benchmarks/profile_phase_breakdown.py /path/to/output/log
+```
+
+The report separates top-level graph construction, assembly, local assembly,
+and iteration. Cleaning and local-low-depth timings are subsets of assembly,
+not additional top-level time. Reusable read-index construction and queries
+are charged to the source k's iteration time; JSON output retains the index
+build component separately.
+
+Read-index build and query commands also emit one machine-readable
+`Read-index profile:` record. It reports the current and next k, build/query
+time, total and matched index occurrences, replay candidate count, required
+and available replay budget, exact replay reads and packed bytes, fallback
+reads and reason, and packed full-scan bytes avoided. The latter is logical
+traffic in `reads.lib.bin`, not compressed FASTQ bytes. A query whose total
+candidate set exceeds the replay budget reports `status=chunked` and processes
+disjoint read-order waves through one persistent edge collector. Thus total
+candidate volume no longer forces a full-read scan; genuine index failures
+still retain the exact fallback path and are reported as `status=fallback`.
+
+## Scaling policy
+
+Use the 1-million-pair CAMI2 strain-madness subset only for fast correctness
+and mechanism checks. Compare final and per-k contigs with metadata and
+circular equivalence before promoting a change to performance experiments.
+Do not use its speedup or phase percentages to rank large-data work.
+
+Performance decisions use nested inputs derived once from the same complete
+CAMI III workload at approximately 1%, 5%, 10%, 25%, 50%, and 100%. Input
+preparation is outside the timed run; record each input's byte count, read-pair
+count, base count, and SHA-256 digest. Keep the k schedule, thread placement,
+memory policy, software build, and storage path fixed across the curve.
+
+For every scale, retain at least these measurements:
+
+| Area | Measurements |
+| --- | --- |
+| Whole run | wall time, peak RSS, output equivalence |
+| Read index | build/query time, occurrences, replay bytes, avoided scan bytes, fallback k/reason, required/available budget |
+| Graph | per-k input windows/sequences/bases, output edges, build time and RSS |
+| Stable paths | candidate/carried bases, omitted oriented windows, certificate time |
+| Local assembly | index preparation, candidate lookup, read collection, local graph/assembly, output time |
+| Assembly | per-k total, cleaning, refresh, low-depth, active unitigs and changed operations |
+
+Evaluate an optimization by how its eliminated work grows with input size and
+whether it reduces the problem size of later stages. The full 100-Gbp run is
+the release-level result; intermediate scales explain the growth curve and
+help catch memory or fallback thresholds before that run.
+
 The measured workload can be reproduced with a command of this form:
 
 ```bash

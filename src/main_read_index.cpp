@@ -1599,6 +1599,7 @@ struct ReadIndexBuildScratch {
   std::vector<size_t> cursors;
   uint64_t replay_candidate_reads{0};
   uint64_t replay_candidate_windows{0};
+  uint64_t replay_candidate_bytes{0};
   uint64_t replay_aligned_reads{0};
   uint64_t replay_generated_edges{0};
   size_t buffered_record_bytes{0};
@@ -2278,6 +2279,7 @@ bool ReplayCandidateEdgesForNextType(
     const CandidateBuckets &candidate_buckets, const uint32_t *read_words,
     uint64_t window_filter_hits, unsigned working_threads,
     const ContigFlankIndex<FlankKmerType> &flank_index,
+    uint64_t *candidate_reads_out, uint64_t *replay_bytes_out,
     uint64_t *aligned_reads_out) {
   if (NextKmerType::max_size() <
       static_cast<unsigned>(options.kmer_k + options.step + 1)) {
@@ -2288,10 +2290,12 @@ bool ReplayCandidateEdgesForNextType(
   const uint64_t position_mask =
       (uint64_t{1} << metadata.position_bits) - 1u;
   uint64_t candidate_reads = 0;
+  uint64_t replay_bytes = 0;
   uint64_t aligned_reads = 0;
   SimpleTimer replay_timer;
   replay_timer.start();
-#pragma omp parallel for schedule(dynamic, 1) reduction(+ : candidate_reads, aligned_reads) \
+#pragma omp parallel for schedule(dynamic, 1) \
+    reduction(+ : candidate_reads, replay_bytes, aligned_reads) \
     num_threads(working_threads)
   for (int64_t bucket = 0;
        bucket < static_cast<int64_t>(candidate_buckets.size()); ++bucket) {
@@ -2322,6 +2326,10 @@ bool ReplayCandidateEdgesForNextType(
         aligned_reads += flank_index.FindNextKmersFromReadCandidates(
             read, positions, &collector, &kmer_state);
         ++candidate_reads;
+        replay_bytes +=
+            (uint64_t{1} + DivCeiling(static_cast<uint64_t>(read_len),
+                                      SeqPackage::kBasesPerWord)) *
+            sizeof(uint32_t);
       }
       begin = end;
     }
@@ -2339,6 +2347,8 @@ bool ReplayCandidateEdgesForNextType(
         window_filter_hits, metadata.window_len, candidate_reads, aligned_reads,
         collector.collection().size(), replay_timer.elapsed(),
         flush_timer.elapsed());
+  *candidate_reads_out = candidate_reads;
+  *replay_bytes_out = replay_bytes;
   *aligned_reads_out = aligned_reads;
   return true;
 }
@@ -2349,6 +2359,7 @@ bool ReplayCandidateEdgesForFlankType(
     const CandidateBuckets &candidate_buckets, const uint32_t *read_words,
     uint64_t window_filter_hits, unsigned working_threads,
     PreparedFlankIndexBase *prepared_index,
+    uint64_t *candidate_reads_out, uint64_t *replay_bytes_out,
     uint64_t *aligned_reads_out) {
   if (FlankKmerType::max_size() <
       static_cast<unsigned>(options.kmer_k + 1)) {
@@ -2371,7 +2382,7 @@ bool ReplayCandidateEdgesForFlankType(
   if (ReplayCandidateEdgesForNextType<FlankKmerType, __VA_ARGS__>(           \
           options, metadata, candidate_buckets, read_words,                   \
           window_filter_hits, working_threads, *flank_index,                 \
-          aligned_reads_out)) {                                              \
+          candidate_reads_out, replay_bytes_out, aligned_reads_out)) {       \
     return true;                                                             \
   }
   TRY_NEXT_KMER(Kmer<1, uint64_t>)
@@ -2393,12 +2404,14 @@ void ReplayCandidateEdges(const ReadIndexOptions &options,
                           uint64_t window_filter_hits,
                           unsigned working_threads,
                           PreparedFlankIndexBase *prepared_index,
+                          uint64_t *candidate_reads_out,
+                          uint64_t *replay_bytes_out,
                           uint64_t *aligned_reads_out) {
 #define TRY_FLANK_KMER(...)                                                   \
   if (ReplayCandidateEdgesForFlankType<__VA_ARGS__>(                         \
           options, metadata, candidate_buckets, read_words,                  \
           window_filter_hits, working_threads, prepared_index,               \
-          aligned_reads_out)) {                                              \
+          candidate_reads_out, replay_bytes_out, aligned_reads_out)) {       \
     return;                                                                  \
   }
   TRY_FLANK_KMER(Kmer<1, uint64_t>)
@@ -2424,6 +2437,10 @@ class FusedEdgeReplayBase {
                           const std::vector<uint32_t> &candidate_positions,
                           std::vector<uint32_t> *state_scratch,
                           uint64_t *generated_edges) = 0;
+  virtual bool ReplayCandidateRead(
+      const uint32_t *sequence, unsigned length,
+      const std::vector<uint32_t> &candidate_positions,
+      std::vector<uint32_t> *state_scratch) = 0;
   virtual uint64_t CommitBatch() = 0;
   virtual size_t candidate_record_bytes() const = 0;
   virtual uint64_t batch_unique_candidates() const = 0;
@@ -2456,6 +2473,15 @@ class FusedEdgeReplay final : public FusedEdgeReplayBase {
     return index_.FindNextKmersFromRead(
         MappedReadView(sequence, length), &collector_, state_scratch,
         generated_edges, &candidate_positions);
+  }
+
+  bool ReplayCandidateRead(
+      const uint32_t *sequence, unsigned length,
+      const std::vector<uint32_t> &candidate_positions,
+      std::vector<uint32_t> *state_scratch) override {
+    return index_.FindNextKmersFromReadCandidates(
+        MappedReadView(sequence, length), candidate_positions, &collector_,
+        state_scratch);
   }
 
   uint64_t CommitBatch() override { return collector_.CommitBatch(); }
@@ -3055,7 +3081,372 @@ StreamedLocalCandidateStats QueryLocalCandidatesInReadOrderWaves(
   return stats;
 }
 
+struct StreamedEdgeReplayStats {
+  uint64_t unique_candidates{0};
+  uint64_t window_filter_hits{0};
+  uint64_t candidate_reads{0};
+  uint64_t replay_bytes{0};
+  uint64_t aligned_reads{0};
+  uint64_t unique_edges{0};
+  size_t waves{0};
+  double count_seconds{0};
+  double gather_seconds{0};
+  double sort_seconds{0};
+  double verify_seconds{0};
+  double replay_seconds{0};
+  double flush_seconds{0};
+};
+
+// Retain only one bounded read-order slice of candidate starts at a time.
+// Read-order buckets are disjoint, so candidate deduplication remains local
+// to a bucket.  The edge collector lives across every wave and is flushed
+// once, preserving global edge deduplication and the original exact replay
+// semantics without making total candidate volume a fallback condition.
+StreamedEdgeReplayStats QueryEdgesInReadOrderWaves(
+    const ReadIndexOptions &options, const ReadIndexMetadata &metadata,
+    ReadIndexShardFiles *index_files,
+    const std::vector<std::vector<MatchedPostingGroup>> &groups_by_file,
+    const uint32_t *read_words, const ActiveQuerySet &active_queries,
+    const ActiveWindowSet &active_windows, uint64_t candidate_upper_bound,
+    uint64_t requested_memory, unsigned num_read_order_buckets,
+    PreparedFlankIndexBase *prepared_flank_index) {
+  StreamedEdgeReplayStats stats;
+  const uint64_t position_mask =
+      (uint64_t{1} << metadata.position_bits) - 1u;
+  const unsigned locator_value_bits =
+      metadata.position_bits +
+      BitsNeeded(metadata.parsed_words == 0 ? 0 : metadata.parsed_words - 1u);
+  const uint64_t locator_value_mask = LowBitMask(locator_value_bits);
+  const uint64_t locator_context_mask =
+      LowBitMask(metadata.locator_context_bits);
+  const uint64_t read_order_bucket_words = std::max<uint64_t>(
+      1u, DivCeiling(metadata.parsed_words,
+                     static_cast<uint64_t>(num_read_order_buckets)));
+  const uint64_t candidate_wave_bytes =
+      std::max<uint64_t>(sizeof(uint64_t), requested_memory / 4u * 3u);
+  const uint64_t candidate_wave_items =
+      std::max<uint64_t>(1u, candidate_wave_bytes / sizeof(uint64_t));
+  const int worker_count = std::max(1, options.num_threads);
+
+  std::vector<std::atomic<uint64_t>> atomic_bucket_counts(
+      num_read_order_buckets);
+  for (auto &count : atomic_bucket_counts) {
+    count.store(0u, std::memory_order_relaxed);
+  }
+  std::atomic<bool> scan_ok(true);
+  SimpleTimer count_timer;
+  count_timer.start();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(options.num_threads)
+  for (int file_id = 0; file_id < static_cast<int>(metadata.num_files);
+       ++file_id) {
+    const unsigned file = static_cast<unsigned>(file_id);
+    std::vector<uint8_t> posting_buffer;
+    for (const MatchedPostingGroup &group : groups_by_file[file]) {
+      if (!scan_ok.load(std::memory_order_relaxed)) break;
+      const uint64_t posting_file_size = index_files->posting_size(file);
+      const uint64_t group_bytes = group.count * metadata.locator_bytes;
+      if (group.posting_byte_offset > posting_file_size ||
+          group_bytes > posting_file_size - group.posting_byte_offset) {
+        scan_ok.store(false, std::memory_order_relaxed);
+        break;
+      }
+      posting_buffer.resize(static_cast<size_t>(group_bytes));
+      if (!posting_buffer.empty() &&
+          !PreadFully(index_files->posting_fd(file), posting_buffer.data(),
+                      posting_buffer.size(), group.posting_byte_offset)) {
+        scan_ok.store(false, std::memory_order_relaxed);
+        break;
+      }
+      const uint8_t *postings = posting_buffer.data();
+      for (uint64_t posting = 0; posting < group.count; ++posting) {
+        const uint64_t encoded = LoadLowBytes(
+            postings + posting * metadata.locator_bytes,
+            metadata.locator_bytes);
+        const uint64_t locator = encoded & locator_value_mask;
+        const uint8_t locator_context = static_cast<uint8_t>(
+            (encoded >> locator_value_bits) & locator_context_mask);
+        const uint64_t anchor_pos = locator & position_mask;
+        const uint64_t word_offset = locator >> metadata.position_bits;
+        uint64_t offsets = group.offset_mask;
+        while (offsets != 0u) {
+          const unsigned offset =
+              static_cast<unsigned>(__builtin_ctzll(offsets));
+          offsets &= offsets - 1u;
+          if (!active_queries.MayMatchContext(
+                  group.anchor_key, offset, locator_context) ||
+              anchor_pos < offset || word_offset >= metadata.parsed_words) {
+            continue;
+          }
+          const unsigned bucket = std::min(
+              static_cast<unsigned>(word_offset / read_order_bucket_words),
+              num_read_order_buckets - 1u);
+          if (atomic_bucket_counts[bucket].fetch_add(
+                  1u, std::memory_order_relaxed) ==
+              std::numeric_limits<uint64_t>::max()) {
+            scan_ok.store(false, std::memory_order_relaxed);
+          }
+        }
+      }
+    }
+  }
+  if (!scan_ok.load(std::memory_order_relaxed)) {
+    throw std::runtime_error("failed while counting streamed edge candidates");
+  }
+  std::vector<uint64_t> bucket_counts(num_read_order_buckets);
+#pragma omp parallel for schedule(static) num_threads(options.num_threads)
+  for (int64_t bucket = 0;
+       bucket < static_cast<int64_t>(num_read_order_buckets); ++bucket) {
+    bucket_counts[static_cast<size_t>(bucket)] =
+        atomic_bucket_counts[static_cast<size_t>(bucket)].load(
+            std::memory_order_relaxed);
+  }
+  std::vector<std::atomic<uint64_t>>().swap(atomic_bucket_counts);
+  if (!scan_ok.load(std::memory_order_relaxed)) {
+    throw std::length_error("streamed edge candidate count overflow");
+  }
+
+  std::vector<std::pair<unsigned, unsigned>> waves;
+  for (unsigned begin = 0; begin < num_read_order_buckets;) {
+    unsigned end = begin;
+    uint64_t items = 0u;
+    while (end < num_read_order_buckets) {
+      const uint64_t count = bucket_counts[end];
+      if (count > candidate_wave_items) {
+        throw std::runtime_error(
+            "one read-order bucket exceeds streamed edge budget");
+      }
+      if (end != begin && count > candidate_wave_items - items) break;
+      items += count;
+      ++end;
+    }
+    waves.emplace_back(begin, end);
+    begin = end;
+  }
+  count_timer.stop();
+  stats.count_seconds = count_timer.elapsed();
+  stats.waves = waves.size();
+  xinfo("Bounded edge replay plan: {} read-order buckets in {} waves, "
+        "at most {.3} GiB candidates per wave; counting {.4} s\n",
+        num_read_order_buckets, waves.size(),
+        static_cast<double>(candidate_wave_items * sizeof(uint64_t)) /
+            static_cast<double>(uint64_t{1} << 30u),
+        stats.count_seconds);
+
+  std::unique_ptr<FusedEdgeReplayBase> replay =
+      MakeFusedEdgeReplay(options, prepared_flank_index);
+  const uint64_t workers = static_cast<uint64_t>(worker_count);
+  const uint64_t requested_stage_items =
+      requested_memory / (uint64_t{64} * sizeof(uint64_t));
+  const size_t stage_limit = static_cast<size_t>(std::max<uint64_t>(
+      1024u, std::min<uint64_t>(DivCeiling(candidate_upper_bound, workers),
+                                requested_stage_items / workers)));
+  SimpleTimer gather_timer;
+  SimpleTimer sort_timer;
+  SimpleTimer verify_timer;
+  SimpleTimer replay_timer;
+
+  for (const auto &wave : waves) {
+    const unsigned wave_begin = wave.first;
+    const unsigned wave_end = wave.second;
+    const unsigned wave_buckets = wave_end - wave_begin;
+    CandidateBuckets candidates(wave_buckets);
+    for (unsigned bucket = wave_begin; bucket < wave_end; ++bucket) {
+      if (bucket_counts[bucket] > std::numeric_limits<size_t>::max()) {
+        throw std::length_error("candidate bucket exceeds address space");
+      }
+      candidates[bucket - wave_begin].reserve(
+          static_cast<size_t>(bucket_counts[bucket]));
+    }
+    std::vector<std::mutex> bucket_mutexes(wave_buckets);
+    scan_ok.store(true, std::memory_order_relaxed);
+    gather_timer.start();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(options.num_threads)
+    for (int file_id = 0; file_id < static_cast<int>(metadata.num_files);
+         ++file_id) {
+      const unsigned file = static_cast<unsigned>(file_id);
+      std::vector<uint8_t> posting_buffer;
+      CandidateBuckets staged(wave_buckets);
+      size_t staged_items = 0u;
+      const auto flush_bucket = [&](unsigned bucket) {
+        auto &source = staged[bucket];
+        if (source.empty()) return;
+        {
+          std::lock_guard<std::mutex> lock(bucket_mutexes[bucket]);
+          candidates[bucket].insert(candidates[bucket].end(), source.begin(),
+                                    source.end());
+        }
+        source.clear();
+      };
+      const auto flush_all = [&]() {
+        for (unsigned bucket = 0; bucket < wave_buckets; ++bucket) {
+          flush_bucket(bucket);
+        }
+        staged_items = 0u;
+      };
+      for (const MatchedPostingGroup &group : groups_by_file[file]) {
+        if (!scan_ok.load(std::memory_order_relaxed)) break;
+        const uint64_t posting_file_size = index_files->posting_size(file);
+        const uint64_t group_bytes = group.count * metadata.locator_bytes;
+        if (group.posting_byte_offset > posting_file_size ||
+            group_bytes > posting_file_size - group.posting_byte_offset) {
+          scan_ok.store(false, std::memory_order_relaxed);
+          break;
+        }
+        posting_buffer.resize(static_cast<size_t>(group_bytes));
+        if (!posting_buffer.empty() &&
+            !PreadFully(index_files->posting_fd(file), posting_buffer.data(),
+                        posting_buffer.size(), group.posting_byte_offset)) {
+          scan_ok.store(false, std::memory_order_relaxed);
+          break;
+        }
+        const uint8_t *postings = posting_buffer.data();
+        for (uint64_t posting = 0; posting < group.count; ++posting) {
+          const uint64_t encoded = LoadLowBytes(
+              postings + posting * metadata.locator_bytes,
+              metadata.locator_bytes);
+          const uint64_t locator = encoded & locator_value_mask;
+          const uint8_t locator_context = static_cast<uint8_t>(
+              (encoded >> locator_value_bits) & locator_context_mask);
+          const uint64_t anchor_pos = locator & position_mask;
+          const uint64_t word_offset = locator >> metadata.position_bits;
+          uint64_t offsets = group.offset_mask;
+          while (offsets != 0u) {
+            const unsigned offset =
+                static_cast<unsigned>(__builtin_ctzll(offsets));
+            offsets &= offsets - 1u;
+            if (!active_queries.MayMatchContext(
+                    group.anchor_key, offset, locator_context) ||
+                anchor_pos < offset || word_offset >= metadata.parsed_words) {
+              continue;
+            }
+            const unsigned bucket = std::min(
+                static_cast<unsigned>(word_offset / read_order_bucket_words),
+                num_read_order_buckets - 1u);
+            if (bucket < wave_begin || bucket >= wave_end) continue;
+            staged[bucket - wave_begin].push_back(
+                (word_offset << metadata.position_bits) |
+                (anchor_pos - offset));
+            if (++staged_items >= stage_limit) flush_all();
+          }
+        }
+      }
+      flush_all();
+    }
+    gather_timer.stop();
+    if (!scan_ok.load(std::memory_order_relaxed)) {
+      throw std::runtime_error(
+          "failed while gathering streamed edge candidates");
+    }
+
+    sort_timer.start();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(options.num_threads)
+    for (int64_t bucket = 0;
+         bucket < static_cast<int64_t>(candidates.size()); ++bucket) {
+      auto &values = candidates[static_cast<size_t>(bucket)];
+      kmlib::kmsort(values.begin(), values.end());
+      values.erase(std::unique(values.begin(), values.end()), values.end());
+    }
+    sort_timer.stop();
+    for (const auto &bucket : candidates) {
+      stats.unique_candidates += bucket.size();
+    }
+
+    uint64_t wave_filter_hits = 0u;
+    verify_timer.start();
+#pragma omp parallel for schedule(dynamic, 1) reduction(+ : wave_filter_hits) \
+    num_threads(options.num_threads)
+    for (int64_t bucket = 0;
+         bucket < static_cast<int64_t>(candidates.size()); ++bucket) {
+      auto &values = candidates[static_cast<size_t>(bucket)];
+      size_t output = 0u;
+      for (uint64_t candidate : values) {
+        const uint64_t start = candidate & position_mask;
+        const uint64_t word_offset = candidate >> metadata.position_bits;
+        if (start + metadata.window_len > read_words[word_offset]) continue;
+        AnchorWindow window;
+        window.InitFromPtr(read_words + word_offset + 1u,
+                           static_cast<unsigned>(start), metadata.window_len);
+        if (active_windows.Contains(window)) {
+          values[output++] = candidate;
+          ++wave_filter_hits;
+        }
+      }
+      values.resize(output);
+      if (values.size() < values.capacity()) {
+        DiscardMemoryPages(values.data() + values.size(),
+                           (values.capacity() - values.size()) *
+                               sizeof(uint64_t));
+      }
+    }
+    verify_timer.stop();
+    stats.window_filter_hits += wave_filter_hits;
+
+    uint64_t wave_candidate_reads = 0u;
+    uint64_t wave_replay_bytes = 0u;
+    uint64_t wave_aligned_reads = 0u;
+    const unsigned replay_threads =
+        ReadWorkingSetThreads(options, metadata, candidates);
+    replay_timer.start();
+#pragma omp parallel for schedule(dynamic, 1)                           \
+    reduction(+ : wave_candidate_reads, wave_replay_bytes,              \
+              wave_aligned_reads) num_threads(replay_threads)
+    for (int64_t bucket = 0;
+         bucket < static_cast<int64_t>(candidates.size()); ++bucket) {
+      const auto &values = candidates[static_cast<size_t>(bucket)];
+      std::vector<uint32_t> positions;
+      std::vector<uint32_t> state;
+      for (size_t begin = 0; begin < values.size();) {
+        const uint64_t word_offset =
+            values[begin] >> metadata.position_bits;
+        size_t end = begin + 1u;
+        while (end < values.size() &&
+               (values[end] >> metadata.position_bits) == word_offset) {
+          ++end;
+        }
+        const unsigned read_len = read_words[word_offset];
+        positions.clear();
+        positions.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) {
+          positions.push_back(
+              static_cast<uint32_t>(values[i] & position_mask));
+        }
+        if (!positions.empty()) {
+          if (replay->ReplayCandidateRead(read_words + word_offset + 1u,
+                                          read_len, positions, &state)) {
+            ++wave_aligned_reads;
+          }
+          ++wave_candidate_reads;
+          wave_replay_bytes +=
+              (uint64_t{1} + DivCeiling(static_cast<uint64_t>(read_len),
+                                        SeqPackage::kBasesPerWord)) *
+              sizeof(uint32_t);
+        }
+        begin = end;
+      }
+      DiscardCandidateReadPages(values, metadata, read_words);
+    }
+    replay->CommitBatch();
+    replay_timer.stop();
+    stats.candidate_reads += wave_candidate_reads;
+    stats.replay_bytes += wave_replay_bytes;
+    stats.aligned_reads += wave_aligned_reads;
+  }
+
+  SimpleTimer flush_timer;
+  flush_timer.start();
+  replay->Flush();
+  flush_timer.stop();
+  stats.gather_seconds = gather_timer.elapsed();
+  stats.sort_seconds = sort_timer.elapsed();
+  stats.verify_seconds = verify_timer.elapsed();
+  stats.replay_seconds = replay_timer.elapsed();
+  stats.flush_seconds = flush_timer.elapsed();
+  stats.unique_edges = replay->unique_edges();
+  return stats;
+}
+
 void ProfileIndexQuery(const ReadIndexOptions &options) {
+  const double query_begin = omp_get_wtime();
   ReadIndexMetadata metadata = LoadReadIndexMetadata(options.index_prefix);
   if (metadata.window_len > AnchorWindow::max_size()) {
     throw std::logic_error("query-profile window exceeds exact window type");
@@ -3305,6 +3696,18 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
               static_cast<double>(std::numeric_limits<uint64_t>::max())
           ? std::numeric_limits<uint64_t>::max()
           : static_cast<uint64_t>(options.memory_bytes);
+  const unsigned __int128 required_budget_wide =
+      static_cast<unsigned __int128>(candidate_upper_bound) *
+      sizeof(uint64_t) * 4u;
+  const uint64_t required_budget =
+      required_budget_wide / 3u > std::numeric_limits<uint64_t>::max()
+          ? std::numeric_limits<uint64_t>::max()
+          : static_cast<uint64_t>((required_budget_wide + 2u) / 3u);
+  const uint64_t full_scan_bytes =
+      metadata.parsed_words >
+              std::numeric_limits<uint64_t>::max() / sizeof(uint32_t)
+          ? std::numeric_limits<uint64_t>::max()
+          : metadata.parsed_words * sizeof(uint32_t);
   xinfo("Read-index candidate plan: {} upper-bound locators / {.3} GiB raw, "
         "memory budget {.3} GiB\n",
         candidate_upper_bound,
@@ -3316,21 +3719,24 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
       local_candidate_mode &&
       candidate_upper_bound >
           requested_memory / sizeof(uint64_t) * 3u / 4u;
-  if (!local_candidate_mode && candidate_upper_bound >
-      requested_memory / sizeof(uint64_t) * 3u / 4u) {
-    throw std::runtime_error(
-        "candidate set exceeds in-memory replay budget");
-  }
+  const bool streamed_edge_query =
+      !local_candidate_mode &&
+      candidate_upper_bound >
+          requested_memory / sizeof(uint64_t) * 3u / 4u;
 
-  const uint64_t candidate_wave_bytes = std::max<uint64_t>(
-      uint64_t{64} << 20u,
-      requested_memory > (uint64_t{256} << 20u)
-          ? requested_memory * 2u / 5u
-          : requested_memory / 2u);
+  const uint64_t candidate_wave_bytes =
+      streamed_edge_query
+          ? std::max<uint64_t>(sizeof(uint64_t),
+                               requested_memory / 4u * 3u)
+          : std::max<uint64_t>(
+                uint64_t{64} << 20u,
+                requested_memory > (uint64_t{256} << 20u)
+                    ? requested_memory * 2u / 5u
+                    : requested_memory / 2u);
   const uint64_t candidate_wave_items =
       std::max<uint64_t>(1u, candidate_wave_bytes / sizeof(uint64_t));
   unsigned num_read_order_buckets;
-  if (streamed_local_query) {
+  if (streamed_local_query || streamed_edge_query) {
     const uint64_t rough_waves =
         DivCeiling(candidate_upper_bound, candidate_wave_items);
     const uint64_t desired = std::max<uint64_t>(
@@ -3352,6 +3758,47 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
   const uint64_t read_order_bucket_words = std::max<uint64_t>(
       1u, DivCeiling(metadata.parsed_words,
                      static_cast<uint64_t>(num_read_order_buckets)));
+  if (streamed_edge_query) {
+    std::vector<std::vector<ActiveAnchorEntry>>().swap(query_buckets);
+    const StreamedEdgeReplayStats streamed = QueryEdgesInReadOrderWaves(
+        options, metadata, &index_files, groups_by_file, reads.data(),
+        active_queries, active_windows, candidate_upper_bound,
+        requested_memory, num_read_order_buckets,
+        prepared_flank_index.get());
+    std::vector<std::vector<MatchedPostingGroup>>().swap(groups_by_file);
+    xinfo("Compact index query: {} / {} active anchor keys matched, {} "
+          "posting locators, {} upper-bound / {} unique candidate starts, "
+          "{} window-filter hits ({} bases); active {.4}, directory {.4}, "
+          "candidate count {.4}, gather {.4}, read-order sort {.4}, window "
+          "filter {.4}, replay {.4}, edge output {.4} s; directory touched "
+          "{} sparse blocks / {.3} GiB sparse + {.3} GiB dense, {} waves\n",
+          matched_keys, active_queries.key_count(), matched_postings,
+          candidate_upper_bound, streamed.unique_candidates,
+          streamed.window_filter_hits, metadata.window_len,
+          active_timer.elapsed(), lookup_timer.elapsed(),
+          streamed.count_seconds, streamed.gather_seconds,
+          streamed.sort_seconds, streamed.verify_seconds,
+          streamed.replay_seconds, streamed.flush_seconds,
+          sparse_directory_blocks,
+          static_cast<double>(sparse_directory_bytes) /
+              (uint64_t{1} << 30u),
+          static_cast<double>(dense_directory_bytes) /
+              (uint64_t{1} << 30u),
+          streamed.waves);
+    xinfo(
+        "Read-index profile: mode=query k={} next_k={} status=chunked "
+        "reason=bounded_replay query_time={.4} indexed_occurrences={} "
+        "matched_occurrences={} candidate_upper_bound={} "
+        "required_budget_bytes={} budget_bytes={} replayed_occurrences={} "
+        "replay_reads={} replay_bytes={} fallback_reads=0 "
+        "full_scan_bytes_avoided={}\n",
+        options.kmer_k, options.kmer_k + options.step,
+        omp_get_wtime() - query_begin, metadata.num_occurrences,
+        matched_postings, candidate_upper_bound, required_budget,
+        requested_memory, streamed.window_filter_hits,
+        streamed.candidate_reads, streamed.replay_bytes, full_scan_bytes);
+    return;
+  }
   if (streamed_local_query) {
     const uint64_t local_anchor_count = local_queries.anchors.size();
     // Directory matching is complete. Exact window verification needs the
@@ -3556,6 +4003,8 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
   verify_timer.stop();
   const unsigned replay_working_threads =
       ReadWorkingSetThreads(options, metadata, candidate_buckets);
+  uint64_t candidate_reads = 0;
+  uint64_t replay_bytes = 0;
   uint64_t aligned_reads = 0;
   if (local_candidate_mode) {
     PublishLocalCandidates(options, metadata, &candidate_buckets);
@@ -3563,7 +4012,7 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
     ReplayCandidateEdges(options, metadata, candidate_buckets, read_words,
                          window_filter_hits, replay_working_threads,
                          prepared_flank_index.get(),
-                         &aligned_reads);
+                         &candidate_reads, &replay_bytes, &aligned_reads);
   }
   xinfo("Compact index query: {} / {} active anchor keys matched, {} posting "
         "locators, {} upper-bound / {} unique candidate starts, {} "
@@ -3583,6 +4032,20 @@ void ProfileIndexQuery(const ReadIndexOptions &options) {
         static_cast<double>(sparse_directory_bytes) / (uint64_t{1} << 30u),
         static_cast<double>(dense_directory_bytes) / (uint64_t{1} << 30u),
         verify_working_threads, replay_working_threads);
+  if (!local_candidate_mode) {
+    xinfo(
+        "Read-index profile: mode=query k={} next_k={} status=indexed "
+        "reason=none query_time={.4} indexed_occurrences={} "
+        "matched_occurrences={} candidate_upper_bound={} "
+        "required_budget_bytes={} budget_bytes={} replayed_occurrences={} "
+        "replay_reads={} replay_bytes={} fallback_reads=0 "
+        "full_scan_bytes_avoided={}\n",
+        options.kmer_k, options.kmer_k + options.step,
+        omp_get_wtime() - query_begin, metadata.num_occurrences,
+        matched_postings, candidate_upper_bound, required_budget,
+        requested_memory, window_filter_hits, candidate_reads, replay_bytes,
+        full_scan_bytes);
+  }
 }
 
 uint64_t FileSize(int fd) {
@@ -3783,6 +4246,7 @@ unsigned ChooseReadIndexBucketBits(size_t chunk_count, int num_threads,
 }
 
 void RunIndexBuild(const ReadIndexOptions &options) {
+  const double build_begin = omp_get_wtime();
   constexpr size_t kBuildChunkBytes = size_t{1} << 20u;
   MappedWords mapping(options.read_file);
   uint64_t num_reads = 0;
@@ -3882,6 +4346,12 @@ void RunIndexBuild(const ReadIndexOptions &options) {
   std::unique_ptr<ActiveWindowSet> fused_active_windows;
   std::unique_ptr<PreparedFlankIndexBase> fused_prepared_flank_index;
   std::unique_ptr<FusedEdgeReplayBase> fused_edge_replay;
+  uint64_t fused_candidate_reads_profile = 0;
+  uint64_t fused_candidate_windows_profile = 0;
+  uint64_t fused_candidate_bytes_profile = 0;
+  uint64_t fused_aligned_reads_profile = 0;
+  uint64_t fused_unique_edges_profile = 0;
+  bool fused_replay_profile = false;
   SimpleTimer fused_prepare_timer;
   if (!options.edge_output_prefix.empty()) {
     fused_prepare_timer.start();
@@ -4307,6 +4777,7 @@ void RunIndexBuild(const ReadIndexOptions &options) {
   size_t replay_commit_batches = 0;
   double replay_commit_seconds = 0.0;
   if (fused_edge_replay) {
+    fused_replay_profile = true;
     const uint64_t candidate_bytes =
         fused_edge_replay->candidate_record_bytes();
     // A batch and its radix-partitioned copy coexist briefly.  Keep the
@@ -4478,6 +4949,10 @@ void RunIndexBuild(const ReadIndexOptions &options) {
                 replay_positions.end());
             ++local.replay_candidate_reads;
             local.replay_candidate_windows += replay_positions.size();
+            local.replay_candidate_bytes +=
+                (uint64_t{1} + DivCeiling(static_cast<uint64_t>(length),
+                                          SeqPackage::kBasesPerWord)) *
+                sizeof(uint32_t);
             uint64_t generated_edges = 0;
             if (fused_edge_replay->ReplayRead(
                     sequence, length, replay_positions, &local.replay_state,
@@ -4595,15 +5070,22 @@ void RunIndexBuild(const ReadIndexOptions &options) {
   if (fused_edge_replay) {
     uint64_t candidate_reads = 0;
     uint64_t candidate_windows = 0;
+    uint64_t candidate_bytes = 0;
     uint64_t aligned_reads = 0;
     uint64_t generated_edges = 0;
     for (const ReadIndexBuildScratch &local : scratch) {
       candidate_reads += local.replay_candidate_reads;
       candidate_windows += local.replay_candidate_windows;
+      candidate_bytes += local.replay_candidate_bytes;
       aligned_reads += local.replay_aligned_reads;
       generated_edges += local.replay_generated_edges;
     }
     const size_t unique_edges = fused_edge_replay->unique_edges();
+    fused_candidate_reads_profile = candidate_reads;
+    fused_candidate_windows_profile = candidate_windows;
+    fused_candidate_bytes_profile = candidate_bytes;
+    fused_aligned_reads_profile = aligned_reads;
+    fused_unique_edges_profile = unique_edges;
     const uint64_t batch_unique_edges =
         fused_edge_replay->batch_unique_candidates();
     SimpleTimer edge_flush_timer;
@@ -5440,6 +5922,25 @@ void RunIndexBuild(const ReadIndexOptions &options) {
   xinfo("Read-index orchestration: extent/HLL/output setup {.4} s; metadata, "
         "close, and temporary cleanup {.4} s\n",
         finalize_timer.elapsed(), publish_timer.elapsed());
+  const uint64_t index_payload_bytes =
+      total_directory_bytes + total_posting_bytes + built_fences.keys.size();
+  const uint64_t full_scan_bytes =
+      parsed_words >
+              std::numeric_limits<uint64_t>::max() / sizeof(uint32_t)
+          ? std::numeric_limits<uint64_t>::max()
+          : parsed_words * sizeof(uint32_t);
+  xinfo(
+      "Read-index profile: mode=build k={} next_k={} status=ok reason=none "
+      "index_build_time={.4} indexed_occurrences={} index_payload_bytes={} "
+      "budget_bytes={} replayed_occurrences={} replay_reads={} "
+      "replay_bytes={} aligned_reads={} unique_edges={} fallback_reads=0 "
+      "full_scan_bytes_avoided={}\n",
+      options.kmer_k, options.kmer_k + options.step,
+      omp_get_wtime() - build_begin, total_occurrences, index_payload_bytes,
+      requested_memory, fused_candidate_windows_profile,
+      fused_candidate_reads_profile, fused_candidate_bytes_profile,
+      fused_aligned_reads_profile, fused_unique_edges_profile,
+      fused_replay_profile ? full_scan_bytes : 0u);
 }
 
 void RunProfile(const ReadIndexOptions &options) {

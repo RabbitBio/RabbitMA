@@ -67,6 +67,7 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
                         for i, s in enumerate(sequences)))
                     Path(str(contig) + '.info').write_text(f'{len(sequences)} {sum(map(len,sequences))}\n')
                     outputs = []
+                    serial_prefix = None
                     for mode in ('serial', 'parallel', 'direct'):
                         prefix = root / f'{k}-{mode}'
                         common = ['-r', str(lib) + '.bin', '-a', 19, '-w', 40,
@@ -81,8 +82,21 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
                         self.assertTrue(built)
                         self.assertEqual(built, replayed)
                         outputs.append(replayed)
+                        if mode == 'serial':
+                            serial_prefix = prefix
                     for output in outputs[1:]:
                         self.assertEqual(outputs[0], output)
+
+                    # Force total replay candidates above the resident budget.
+                    # Read-order waves must preserve the exact edge multiset
+                    # instead of abandoning the reusable index for a full scan.
+                    chunked_common = list(common)
+                    chunked_common[chunked_common.index('-m') + 1] = 32768
+                    chunked_prefix = root / f'{k}-chunked'
+                    log = run(['read-index', '--index_prefix', serial_prefix,
+                               '-e', chunked_prefix] + chunked_common)
+                    self.assertIn('status=chunked reason=bounded_replay', log)
+                    self.assertEqual(outputs[0], edges(chunked_prefix))
 
 
 if __name__ == '__main__':
