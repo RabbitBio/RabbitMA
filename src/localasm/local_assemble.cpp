@@ -2640,15 +2640,10 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
   std::vector<uint64_t> task_actual_kmers(tasks.size());
   std::vector<uint64_t> task_unique_kmers(tasks.size());
   std::vector<uint16_t> task_k_rounds(tasks.size());
-  const char *const fingerprint_environment =
+  const char *const fingerprint_path =
       std::getenv("MEGAHIT_LOCAL_INPUT_FINGERPRINT");
-  const std::string fingerprint_path =
-      !opt.input_fingerprint_file.empty()
-          ? opt.input_fingerprint_file
-          : (fingerprint_environment == nullptr ? ""
-                                                : fingerprint_environment);
   std::vector<LocalInputFingerprint> task_fingerprints;
-  if (!fingerprint_path.empty()) {
+  if (fingerprint_path != nullptr && *fingerprint_path != '\0') {
     task_fingerprints.resize(tasks.size());
   }
   const double task_phase_begin = omp_get_wtime();
@@ -2800,7 +2795,7 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
     }
     output.close();
     xinfo("Wrote {} exact-input diagnostic fingerprints to {s}\n",
-          task_fingerprints.size(), fingerprint_path.c_str());
+          task_fingerprints.size(), fingerprint_path);
   }
 
   xinfo("Endpoint read gather: {.6}s CPU, max {.6}s, {} reads, {} bases; "

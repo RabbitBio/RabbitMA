@@ -1812,27 +1812,6 @@ def local_assemble(cur_k, kmer_to):
               '-t', str(opt.num_cpu_threads),
               '-o', contig_prefix(cur_k) + '.local.fa',
               '--kmax', str(kmer_to)]
-    fingerprint_spec = os.environ.get('MEGAHIT_LOCAL_INPUT_FINGERPRINT')
-    if fingerprint_spec:
-        values = {'from_k': cur_k, 'to_k': kmer_to}
-        if '{from_k}' in fingerprint_spec or '{to_k}' in fingerprint_spec:
-            fingerprint_path = fingerprint_spec.replace(
-                '{from_k}', str(values['from_k'])).replace(
-                    '{to_k}', str(values['to_k']))
-        elif (fingerprint_spec.endswith(os.sep) or
-              os.path.isdir(fingerprint_spec)):
-            os.makedirs(fingerprint_spec, exist_ok=True)
-            fingerprint_path = os.path.join(
-                fingerprint_spec,
-                'local_k%d_to_k%d.tsv' % (cur_k, kmer_to))
-        else:
-            root, extension = os.path.splitext(fingerprint_spec)
-            fingerprint_path = '%s.k%d_to_k%d%s' % (
-                root, cur_k, kmer_to, extension or '.tsv')
-        fingerprint_parent = os.path.dirname(fingerprint_path)
-        if fingerprint_parent:
-            os.makedirs(fingerprint_parent, exist_ok=True)
-        la_cmd += ['--input_fingerprint', fingerprint_path]
     run_sub_command(la_cmd, 'Local assembly for k = %d' % cur_k)
 
 
