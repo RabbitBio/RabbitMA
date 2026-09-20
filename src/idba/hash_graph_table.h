@@ -190,6 +190,27 @@ class HashGraphVertexTable {
     return op;
   }
 
+  // Unitig walks lock every vertex they absorb. Preserve the exact ascending
+  // bucket traversal order, but filter those vertices in this inline table
+  // loop instead of entering AssembleFunc only to fail its first Lock().
+  template <typename UnaryProc>
+  UnaryProc &for_each_unlocked(UnaryProc &op) {
+    for (size_type word = 0; word < occupied_words_.size(); ++word) {
+      uint64_t bits = occupied_words_[word];
+      while (bits != 0u) {
+        const unsigned bit = static_cast<unsigned>(__builtin_ctzll(bits));
+        const size_type bucket = (word << 6u) + bit;
+        uint32_t index = bucket_heads_[bucket];
+        while (index != kNull) {
+          if (!values_[index].status().IsLocked()) op(values_[index]);
+          index = BucketNext(index);
+        }
+        bits &= bits - 1u;
+      }
+    }
+    return op;
+  }
+
   // Reductions such as coverage histograms have no traversal-order
   // semantics.  Stream the compact vertex array instead of following legacy
   // bucket chains; Assemble() continues to use for_each() above for exact tie

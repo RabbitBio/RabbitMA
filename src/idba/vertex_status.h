@@ -35,6 +35,7 @@ class VertexStatus {
   void SetDeadFlag() { SetFlag(kVertexStatusFlagDead); }
   void ResetDeadFlag() { ResetFlag(kVertexStatusFlagDead); }
   bool IsDead() const { return GetFlag(kVertexStatusFlagDead); }
+  bool IsLocked() const { return GetFlag(kVertexStatusFlagLock); }
 
   int GetLockID() {
     if (status_ & kVertexStatusFlagLock) return status_ & kVertexStatusMaskLock;

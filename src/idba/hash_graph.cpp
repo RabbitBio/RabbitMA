@@ -1093,7 +1093,7 @@ int64_t HashGraph::Assemble(std::vector<ContigGraphVertex> &unitigs) {
   unitigs.reserve(vertex_table_.size());
   assembled_endpoint_codes_.clear();
   AssembleFunc func(this, &unitigs, &assembled_endpoint_codes_);
-  vertex_table_.for_each(func);
+  vertex_table_.for_each_unlocked(func);
   // The local assembler consumes these contigs and then discards the graph.
   // Clearing every status here is therefore an unobservable full-table pass.
   return unitigs.size();
