@@ -476,6 +476,68 @@ class LocalPackedReads {
 // exact packed-word comparison, so it cannot alter graph or tie semantics.
 class MultiKReadIndex {
  public:
+  struct DirectBranchTransition {
+    uint32_t target_code{UINT32_MAX};
+    uint8_t base{0};
+  };
+
+  struct DirectVertex {
+    uint32_t canonical_group{UINT32_MAX};
+    uint32_t count{0};
+    uint32_t next_ref[2]{UINT32_MAX, UINT32_MAX};
+    uint8_t out_edges[2]{0, 0};
+  };
+
+  struct DirectUnitig {
+    uint32_t path_begin{0};
+    uint32_t path_end{0};
+    uint32_t endpoints[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    uint64_t kmer_count{0};
+    uint8_t out_edges[2]{0, 0};
+  };
+
+  struct DirectTopology {
+    static constexpr uint32_t kBranchMarker = uint32_t{1} << 31u;
+    static constexpr uint32_t kNoTransition = UINT32_MAX;
+
+    std::vector<DirectVertex> vertices;
+    std::vector<DirectBranchTransition> branches;
+    std::vector<DirectUnitig> unitigs;
+    std::vector<uint32_t> path_codes;
+    std::vector<uint32_t> unitig_neighbors;
+    uint64_t num_edges{0};
+    uint64_t num_unitig_edges{0};
+
+    void Clear() {
+      vertices.clear();
+      branches.clear();
+      unitigs.clear();
+      path_codes.clear();
+      unitig_neighbors.clear();
+      num_edges = 0;
+      num_unitig_edges = 0;
+    }
+
+    uint8_t OutEdges(uint32_t code) const {
+      return vertices[code >> 1u].out_edges[code & 1u];
+    }
+
+    uint32_t Transition(uint32_t code, uint8_t base) const {
+      const DirectVertex &vertex = vertices[code >> 1u];
+      const uint32_t ref = vertex.next_ref[code & 1u];
+      if (ref == kNoTransition) return kNoTransition;
+      if ((ref & kBranchMarker) == 0u) return ref;
+      uint32_t index = ref & ~kBranchMarker;
+      const uint32_t count = static_cast<uint32_t>(
+          __builtin_popcount(unsigned(vertex.out_edges[code & 1u])));
+      for (uint32_t i = 0; i < count; ++i) {
+        const DirectBranchTransition &transition = branches[index + i];
+        if (transition.base == base) return transition.target_code;
+      }
+      return kNoTransition;
+    }
+  };
+
   struct Stats {
     double build{0};
     double finish_initial{0};
@@ -816,6 +878,185 @@ class MultiKReadIndex {
 
   const Stats &stats() const { return stats_; }
 
+  // Build the read-only graph topology directly from refined occurrence
+  // classes.  This deliberately stops before endpoint/previous-contig
+  // evidence: Prototype 0 measures whether dense class compaction is cheap
+  // enough to justify replacing per-order HashGraph materialization.
+  void BuildDirectTopology(uint32_t kmer_size, DirectTopology *topology) {
+    AdvanceTo(kmer_size);
+    topology->Clear();
+    if ((kmer_size & 1u) == 0u) {
+      throw std::logic_error(
+          "direct local class topology currently requires odd k");
+    }
+
+    if (direct_vertex_by_group_.size() < group_count_) {
+      direct_vertex_by_group_.resize(group_count_, UINT32_MAX);
+    }
+
+    topology->vertices.reserve(live_groups_.size() / 2u + 1u);
+    for (uint32_t group : live_groups_) {
+      const uint32_t partner = group_meta_[group].partner;
+      if (partner >= group_count_ || partner == group) {
+        throw std::logic_error("invalid direct class reverse partner");
+      }
+      const uint32_t canonical = GroupLess(group, partner, kmer_size)
+                                     ? group
+                                     : partner;
+      if (canonical != group) continue;
+      if (topology->vertices.size() >= (uint64_t{1} << 30u)) {
+        throw std::length_error(
+            "direct local topology exceeds oriented-code range");
+      }
+      const uint32_t vertex_id =
+          static_cast<uint32_t>(topology->vertices.size());
+      topology->vertices.emplace_back();
+      DirectVertex &vertex = topology->vertices.back();
+      vertex.canonical_group = canonical;
+      vertex.count = group_meta_[canonical].count;
+      direct_vertex_by_group_[canonical] = vertex_id;
+      direct_vertex_by_group_[partner] = vertex_id;
+    }
+
+    uint64_t total_degree = 0;
+    for (uint32_t vertex_id = 0; vertex_id < topology->vertices.size();
+         ++vertex_id) {
+      DirectVertex &vertex = topology->vertices[vertex_id];
+      const uint32_t groups[2] = {
+          vertex.canonical_group,
+          group_meta_[vertex.canonical_group].partner};
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const GroupMeta &meta = group_meta_[groups[strand]];
+        vertex.out_edges[strand] = meta.out_edges;
+        const uint32_t degree =
+            static_cast<uint32_t>(__builtin_popcount(unsigned(meta.out_edges)));
+        total_degree += degree;
+        if (degree == 0u) continue;
+        if (degree == 1u) {
+          const uint8_t base =
+              static_cast<uint8_t>(__builtin_ctz(unsigned(meta.out_edges)));
+          vertex.next_ref[strand] =
+              DirectTargetCode(meta, base, topology);
+          continue;
+        }
+        if (topology->branches.size() >= DirectTopology::kBranchMarker) {
+          throw std::length_error(
+              "direct local branch-transition tape exceeds 31 bits");
+        }
+        vertex.next_ref[strand] =
+            DirectTopology::kBranchMarker |
+            static_cast<uint32_t>(topology->branches.size());
+        uint8_t edges = meta.out_edges;
+        while (edges != 0u) {
+          const uint8_t base = static_cast<uint8_t>(__builtin_ctz(edges));
+          edges &= static_cast<uint8_t>(edges - 1u);
+          DirectBranchTransition transition;
+          transition.base = base;
+          transition.target_code = DirectTargetCode(meta, base, topology);
+          topology->branches.push_back(transition);
+        }
+      }
+    }
+    topology->num_edges = total_degree / 2u;
+    CompactDirectTopology(topology);
+
+    for (uint32_t group : live_groups_) {
+      direct_vertex_by_group_[group] = UINT32_MAX;
+    }
+  }
+
+  bool ValidateDirectTopology(HashGraph *reference, uint32_t kmer_size,
+                              const DirectTopology &topology,
+                              std::string *difference) const {
+    if (reference->num_vertices() != topology.vertices.size()) {
+      if (difference != nullptr) {
+        *difference = "vertex count " +
+                      std::to_string(topology.vertices.size()) + " vs " +
+                      std::to_string(reference->num_vertices());
+      }
+      return false;
+    }
+
+    for (uint32_t vertex_id = 0; vertex_id < topology.vertices.size();
+         ++vertex_id) {
+      const DirectVertex &vertex = topology.vertices[vertex_id];
+      const uint32_t groups[2] = {
+          vertex.canonical_group,
+          group_meta_[vertex.canonical_group].partner};
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const GroupMeta &meta = group_meta_[groups[strand]];
+        const IdbaKmer key = GroupKmer(groups[strand], kmer_size);
+        HashGraphVertexAdaptor adaptor = reference->FindVertexAdaptor(key);
+        if (adaptor.is_null() || adaptor.kmer() != key ||
+            adaptor.count() != static_cast<int32_t>(meta.count) ||
+            uint8_t(adaptor.in_edges()) != meta.in_edges ||
+            uint8_t(adaptor.out_edges()) != meta.out_edges) {
+          if (difference != nullptr) {
+            *difference = "vertex state at direct id " +
+                          std::to_string(vertex_id) + " strand " +
+                          std::to_string(strand);
+          }
+          return false;
+        }
+
+        uint8_t edges = meta.out_edges;
+        while (edges != 0u) {
+          const uint8_t base = static_cast<uint8_t>(__builtin_ctz(edges));
+          edges &= static_cast<uint8_t>(edges - 1u);
+          IdbaKmer expected = key;
+          expected.ShiftAppend(base);
+          const uint32_t target = topology.Transition(
+              (vertex_id << 1u) | strand, base);
+          if (target == DirectTopology::kNoTransition ||
+              DirectCodeKmer(topology, target, kmer_size) != expected) {
+            if (difference != nullptr) {
+              *difference = "edge target at direct id " +
+                            std::to_string(vertex_id) + " strand " +
+                            std::to_string(strand) + " base " +
+                            std::to_string(base);
+            }
+            return false;
+          }
+        }
+      }
+    }
+
+    std::vector<ContigGraphVertex> reference_unitigs;
+    reference->Assemble(reference_unitigs);
+    reference->ClearStatus();
+    if (reference_unitigs.size() != topology.unitigs.size()) {
+      if (difference != nullptr) {
+        *difference = "unitig count " +
+                      std::to_string(topology.unitigs.size()) + " vs " +
+                      std::to_string(reference_unitigs.size());
+      }
+      return false;
+    }
+
+    std::vector<std::pair<std::string, uint64_t>> direct_sequences;
+    std::vector<std::pair<std::string, uint64_t>> reference_sequences;
+    direct_sequences.reserve(topology.unitigs.size());
+    reference_sequences.reserve(reference_unitigs.size());
+    for (const DirectUnitig &unitig : topology.unitigs) {
+      Sequence sequence = MaterializeDirectUnitig(topology, unitig,
+                                                  kmer_size);
+      direct_sequences.emplace_back(CanonicalSequenceString(sequence),
+                                    unitig.kmer_count);
+    }
+    for (const ContigGraphVertex &unitig : reference_unitigs) {
+      Sequence sequence = unitig.contig();
+      reference_sequences.emplace_back(CanonicalSequenceString(sequence),
+                                       unitig.kmer_count());
+    }
+    std::sort(direct_sequences.begin(), direct_sequences.end());
+    std::sort(reference_sequences.begin(), reference_sequences.end());
+    if (direct_sequences != reference_sequences) {
+      if (difference != nullptr) *difference = "unitig sequence multiset";
+      return false;
+    }
+    return true;
+  }
+
  private:
   struct GroupMeta {
     uint32_t count{0};
@@ -824,6 +1065,7 @@ class MultiKReadIndex {
     uint32_t flat{UINT32_MAX};
     uint32_t partner{UINT32_MAX};
     uint32_t sole_next_flat{UINT32_MAX};
+    uint32_t next_flat[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
     uint8_t in_edges{0};
     uint8_t out_edges{0};
 
@@ -834,6 +1076,7 @@ class MultiKReadIndex {
       flat = UINT32_MAX;
       partner = UINT32_MAX;
       sole_next_flat = UINT32_MAX;
+      std::fill(next_flat, next_flat + 4u, UINT32_MAX);
       in_edges = 0;
       out_edges = 0;
     }
@@ -1268,6 +1511,7 @@ class MultiKReadIndex {
       const uint8_t base =
           LocalPackedReads::PackedBase(words, start + kmer_size);
       const uint8_t edge = static_cast<uint8_t>(1u << base);
+      if (meta.next_flat[base] == UINT32_MAX) meta.next_flat[base] = flat;
       if (meta.out_edges == 0u) {
         meta.sole_next_flat = flat;
       } else if ((meta.out_edges & edge) == 0u) {
@@ -1310,6 +1554,192 @@ class MultiKReadIndex {
                       kmer_size);
   }
 
+  IdbaKmer GroupKmer(uint32_t group, uint32_t kmer_size) const {
+    const GroupMeta &meta = group_meta_[group];
+    const LocalPackedReads::ReadView read =
+        (*reads_)[meta.sequence_id >> 1u];
+    const uint64_t *words = (meta.sequence_id & 1u) == 0u
+                                ? read.forward
+                                : read.reverse;
+    IdbaKmer key;
+    key.AssignPackedBases(words,
+                          meta.flat - oriented_offsets_[meta.sequence_id],
+                          kmer_size);
+    return key;
+  }
+
+  IdbaKmer DirectCodeKmer(const DirectTopology &topology, uint32_t code,
+                          uint32_t kmer_size) const {
+    const DirectVertex &vertex = topology.vertices[code >> 1u];
+    const uint32_t group = (code & 1u) == 0u
+                               ? vertex.canonical_group
+                               : group_meta_[vertex.canonical_group].partner;
+    return GroupKmer(group, kmer_size);
+  }
+
+  Sequence MaterializeDirectUnitig(const DirectTopology &topology,
+                                   const DirectUnitig &unitig,
+                                   uint32_t kmer_size) const {
+    if (unitig.path_begin >= unitig.path_end) return Sequence();
+    Sequence sequence(
+        DirectCodeKmer(topology, topology.path_codes[unitig.path_begin],
+                       kmer_size));
+    for (uint32_t i = unitig.path_begin + 1u; i < unitig.path_end; ++i) {
+      const IdbaKmer key =
+          DirectCodeKmer(topology, topology.path_codes[i], kmer_size);
+      sequence += key[kmer_size - 1u];
+    }
+    return sequence;
+  }
+
+  static std::string CanonicalSequenceString(Sequence sequence) {
+    const std::string forward = sequence.str();
+    sequence.ReverseComplement();
+    const std::string reverse = sequence.str();
+    return std::min(forward, reverse);
+  }
+
+  uint32_t DirectTargetCode(const GroupMeta &meta, uint8_t base,
+                            const DirectTopology *topology) const {
+    const uint32_t flat = meta.next_flat[base];
+    if (flat == UINT32_MAX || flat + 1u >= groups_.size()) {
+      throw std::logic_error("missing direct class transition occurrence");
+    }
+    const uint32_t target_group = groups_[flat + 1u];
+    if (target_group >= direct_vertex_by_group_.size()) {
+      throw std::logic_error("invalid direct class transition group");
+    }
+    const uint32_t vertex_id = direct_vertex_by_group_[target_group];
+    if (vertex_id >= topology->vertices.size()) {
+      throw std::logic_error("unresolved direct class transition target");
+    }
+    const uint32_t canonical =
+        topology->vertices[vertex_id].canonical_group;
+    if (target_group != canonical &&
+        target_group != group_meta_[canonical].partner) {
+      throw std::logic_error("direct target is outside canonical pair");
+    }
+    return (vertex_id << 1u) | uint32_t(target_group != canonical);
+  }
+
+  static bool DirectNext(const DirectTopology &topology, uint32_t current,
+                         uint32_t *next) {
+    const uint8_t edges = topology.OutEdges(current);
+    if (__builtin_popcount(unsigned(edges)) != 1) return false;
+    const uint8_t base = static_cast<uint8_t>(__builtin_ctz(unsigned(edges)));
+    const uint32_t target = topology.Transition(current, base);
+    if (target == DirectTopology::kNoTransition) {
+      throw std::logic_error("missing unique direct class successor");
+    }
+    if (__builtin_popcount(unsigned(topology.OutEdges(target ^ 1u))) != 1) {
+      return false;
+    }
+    *next = target;
+    return true;
+  }
+
+  static void CompactDirectTopology(DirectTopology *topology) {
+    std::vector<uint8_t> locked(topology->vertices.size(), 0u);
+    std::vector<uint32_t> arms[2];
+    topology->unitigs.reserve(topology->vertices.size());
+    topology->path_codes.reserve(topology->vertices.size());
+
+    for (uint32_t seed = 0; seed < topology->vertices.size(); ++seed) {
+      if (locked[seed] != 0u) continue;
+      locked[seed] = 1u;
+      arms[0].clear();
+      arms[1].clear();
+      uint32_t terminals[2] = {seed << 1u, (seed << 1u) | 1u};
+      uint32_t loop_begin = seed << 1u;
+      bool failed = false;
+
+      for (uint32_t strand = 0; strand < 2u && !failed; ++strand) {
+        uint32_t current = (seed << 1u) | strand;
+        while (true) {
+          uint32_t next = UINT32_MAX;
+          if (!DirectNext(*topology, current, &next)) break;
+          if (current == (next ^ 1u)) break;
+          if (next == loop_begin || locked[next >> 1u] != 0u) {
+            failed = true;
+            break;
+          }
+          locked[next >> 1u] = 1u;
+          arms[strand].push_back(next);
+          current = next;
+        }
+        terminals[strand] = current;
+        loop_begin = current ^ 1u;
+      }
+      if (failed) continue;
+
+      DirectUnitig unitig;
+      unitig.path_begin =
+          static_cast<uint32_t>(topology->path_codes.size());
+      for (auto it = arms[1].rbegin(); it != arms[1].rend(); ++it) {
+        topology->path_codes.push_back(*it ^ 1u);
+      }
+      topology->path_codes.push_back(seed << 1u);
+      topology->path_codes.insert(topology->path_codes.end(),
+                                  arms[0].begin(), arms[0].end());
+      unitig.path_end = static_cast<uint32_t>(topology->path_codes.size());
+      unitig.endpoints[0] = terminals[1] ^ 1u;
+      unitig.endpoints[1] = terminals[0] ^ 1u;
+      unitig.endpoints[2] = terminals[0];
+      unitig.endpoints[3] = terminals[1];
+      unitig.out_edges[0] = topology->OutEdges(terminals[0]);
+      unitig.out_edges[1] = topology->OutEdges(terminals[1]);
+      for (uint32_t i = unitig.path_begin; i < unitig.path_end; ++i) {
+        unitig.kmer_count +=
+            topology->vertices[topology->path_codes[i] >> 1u].count;
+      }
+      topology->unitigs.push_back(unitig);
+    }
+
+    std::vector<uint32_t> begin_owner(topology->vertices.size() * 2u,
+                                      UINT32_MAX);
+    for (uint32_t unitig_id = 0; unitig_id < topology->unitigs.size();
+         ++unitig_id) {
+      const DirectUnitig &unitig = topology->unitigs[unitig_id];
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const uint32_t endpoint = unitig.endpoints[strand];
+        const uint32_t owner = (unitig_id << 1u) | strand;
+        if (endpoint >= begin_owner.size() ||
+            (begin_owner[endpoint] != UINT32_MAX &&
+             begin_owner[endpoint] != owner)) {
+          throw std::logic_error("non-unique direct unitig endpoint");
+        }
+        begin_owner[endpoint] = owner;
+      }
+    }
+
+    topology->unitig_neighbors.assign(topology->unitigs.size() * 8u,
+                                      UINT32_MAX);
+    uint64_t total_degree = 0;
+    for (uint32_t unitig_id = 0; unitig_id < topology->unitigs.size();
+         ++unitig_id) {
+      const DirectUnitig &unitig = topology->unitigs[unitig_id];
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const uint32_t terminal = unitig.endpoints[2u + strand];
+        uint8_t edges = topology->OutEdges(terminal);
+        total_degree += __builtin_popcount(unsigned(edges));
+        while (edges != 0u) {
+          const uint8_t base = static_cast<uint8_t>(__builtin_ctz(edges));
+          edges &= static_cast<uint8_t>(edges - 1u);
+          const uint32_t target = topology->Transition(terminal, base);
+          if (target == DirectTopology::kNoTransition ||
+              target >= begin_owner.size() ||
+              begin_owner[target] == UINT32_MAX) {
+            throw std::logic_error("unresolved direct unitig adjacency");
+          }
+          topology->unitig_neighbors[size_t(unitig_id) * 8u +
+                                     size_t(strand) * 4u + base] =
+              begin_owner[target];
+        }
+      }
+    }
+    topology->num_unitig_edges = total_degree / 2u;
+  }
+
   LocalPackedReads *reads_{nullptr};
   uint32_t current_k_{0};
   uint32_t group_count_{0};
@@ -1336,6 +1766,7 @@ class MultiKReadIndex {
   std::vector<uint64_t> canonical_order_;
   std::vector<uint32_t> owner_group_;
   std::vector<uint32_t> vertex_by_group_;
+  std::vector<uint32_t> direct_vertex_by_group_;
   uint64_t total_raw_occurrences_{0};
   Stats stats_;
 };
@@ -1657,6 +2088,7 @@ struct alignas(64) LocalAssemblyProfile {
   double multik_advance{0};
   double multik_aggregate{0};
   double multik_replay{0};
+  double direct_topology{0};
   uint64_t k_rounds{0};
   uint64_t raw_kmers{0};
   uint64_t raw_vertices{0};
@@ -1674,6 +2106,11 @@ struct alignas(64) LocalAssemblyProfile {
   uint64_t incremental_primary_inserts{0};
   uint64_t incremental_primary_hits{0};
   uint64_t incremental_fork_lookups{0};
+  uint64_t direct_vertices{0};
+  uint64_t direct_branches{0};
+  uint64_t direct_unitigs{0};
+  uint64_t direct_path_codes{0};
+  uint64_t direct_edges{0};
 };
 
 void LaunchIDBA(LocalPackedReads &reads,
@@ -1685,6 +2122,7 @@ void LaunchIDBA(LocalPackedReads &reads,
                 std::vector<ContigGraphVertex> &hash_unitigs,
                 std::vector<uint32_t> &hash_unitig_neighbors,
                 MultiKReadIndex &multi_k_index,
+                MultiKReadIndex::DirectTopology &direct_topology,
                 IncrementalKReadGraph &incremental_read_graph,
                 LocalAssemblyProfile *profile,
                 std::vector<uint64_t> *k_round_survival,
@@ -1712,8 +2150,13 @@ void LaunchIDBA(LocalPackedReads &reads,
   // size, thread count or machine topology.
   static const bool use_incremental_read_graph =
       std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_INCREMENTAL") != nullptr;
+  static const bool probe_direct_topology =
+      std::getenv("MEGAHIT_PROBE_LOCAL_DIRECT_TOPOLOGY") != nullptr;
+  static const bool validate_direct_topology =
+      std::getenv("MEGAHIT_VALIDATE_LOCAL_DIRECT_TOPOLOGY") != nullptr;
   static const bool use_multi_k_index =
-      std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_MULTIK") != nullptr;
+      std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_MULTIK") != nullptr ||
+      probe_direct_topology;
   static const bool validate_incremental_read_graph =
       std::getenv("MEGAHIT_VALIDATE_LOCAL_INCREMENTAL") != nullptr;
   static const bool validate_multi_k_index =
@@ -1834,6 +2277,27 @@ void LaunchIDBA(LocalPackedReads &reads,
         hash_graph.DebugBranchTransitionHits() - branch_hits_before;
     (*k_branch_misses)[k_index] +=
         hash_graph.DebugBranchTransitionMisses() - branch_misses_before;
+
+    if (probe_direct_topology) {
+      phase_begin = omp_get_wtime();
+      multi_k_index.BuildDirectTopology(kmer_size, &direct_topology);
+      profile->direct_topology += omp_get_wtime() - phase_begin;
+      profile->direct_vertices += direct_topology.vertices.size();
+      profile->direct_branches += direct_topology.branches.size();
+      profile->direct_unitigs += direct_topology.unitigs.size();
+      profile->direct_path_codes += direct_topology.path_codes.size();
+      profile->direct_edges += direct_topology.num_edges;
+      if (validate_direct_topology) {
+        std::string difference;
+        if (!multi_k_index.ValidateDirectTopology(
+                &hash_graph, kmer_size, direct_topology, &difference)) {
+          std::fprintf(stderr,
+                       "direct local topology differs at k=%u: %s\n",
+                       kmer_size, difference.c_str());
+          std::abort();
+        }
+      }
+    }
 
     phase_begin = omp_get_wtime();
     double mean = hash_graph.coverage_percentile(
@@ -2552,6 +3016,7 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
   // allocator/zero-initialization cycles without sharing graph state.
   HashGraph hash_graph;
   MultiKReadIndex multi_k_index;
+  MultiKReadIndex::DirectTopology direct_topology;
   IncrementalKReadGraph incremental_read_graph;
   ContigGraph contig_graph;
   std::vector<ContigGraphVertex> hash_unitigs;
@@ -2648,7 +3113,7 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
   }
   const double task_phase_begin = omp_get_wtime();
 
-#pragma omp parallel for private(hash_graph, multi_k_index,                    \
+#pragma omp parallel for private(hash_graph, multi_k_index, direct_topology,   \
                                  incremental_read_graph,                       \
                                  contig_graph, hash_unitigs,                    \
                                  hash_unitig_neighbors,                        \
@@ -2746,7 +3211,7 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
     LaunchIDBA(reads, contig_end, out_contigs,
                out_contig_infos, opt.kmin, opt.kmax, opt.step, hash_graph,
                contig_graph, hash_unitigs, hash_unitig_neighbors,
-               multi_k_index, incremental_read_graph,
+               multi_k_index, direct_topology, incremental_read_graph,
                &local_profile, &thread_k_round_survival[omp_get_thread_num()],
                &thread_k_read_graph_seconds[omp_get_thread_num()],
                &thread_k_branch_hits[omp_get_thread_num()],
@@ -2837,6 +3302,7 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
     profile.multik_advance += thread_profile.multik_advance;
     profile.multik_aggregate += thread_profile.multik_aggregate;
     profile.multik_replay += thread_profile.multik_replay;
+    profile.direct_topology += thread_profile.direct_topology;
     profile.k_rounds += thread_profile.k_rounds;
     profile.raw_kmers += thread_profile.raw_kmers;
     profile.raw_vertices += thread_profile.raw_vertices;
@@ -2866,6 +3332,11 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
         thread_profile.incremental_primary_hits;
     profile.incremental_fork_lookups +=
         thread_profile.incremental_fork_lookups;
+    profile.direct_vertices += thread_profile.direct_vertices;
+    profile.direct_branches += thread_profile.direct_branches;
+    profile.direct_unitigs += thread_profile.direct_unitigs;
+    profile.direct_path_codes += thread_profile.direct_path_codes;
+    profile.direct_edges += thread_profile.direct_edges;
   }
   xinfo("Inner-k CPU seconds ({} rounds, {} raw k-mers, {} raw vertices): "
         "reads {.6}, coverage {.6}, "
@@ -2895,6 +3366,13 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
           profile.incremental_primary_inserts,
           profile.incremental_primary_hits,
           profile.incremental_fork_lookups);
+  }
+  if (profile.direct_vertices != 0u) {
+    xinfo("Direct read-class topology: {.6} CPU s, {} vertices, {} sparse "
+          "branch transitions, {} unitigs, {} path codes, {} graph edges\n",
+          profile.direct_topology, profile.direct_vertices,
+          profile.direct_branches, profile.direct_unitigs,
+          profile.direct_path_codes, profile.direct_edges);
   }
 
   std::vector<uint64_t> k_round_survival(num_k_values, 0);
