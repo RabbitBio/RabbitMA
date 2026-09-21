@@ -137,6 +137,9 @@ class HashGraph {
   }
 
   int64_t Assemble(std::vector<ContigGraphVertex> &unitigs);
+  int64_t AssembleWithCodePaths(std::vector<ContigGraphVertex> &unitigs,
+                                std::vector<uint32_t> &path_offsets,
+                                std::vector<uint32_t> &path_codes);
 
   // Derive the unitig graph's explicit adjacency while the compact k-mer
   // table is still alive. This avoids rebuilding an endpoint hash map from
@@ -321,10 +324,14 @@ class HashGraph {
    public:
     AssembleFunc(HashGraph *hash_graph,
                  std::vector<ContigGraphVertex> *unitigs,
-                 std::vector<uint32_t> *endpoint_codes)
+                 std::vector<uint32_t> *endpoint_codes,
+                 std::vector<uint32_t> *path_offsets = nullptr,
+                 std::vector<uint32_t> *path_codes = nullptr)
         : hash_graph_(hash_graph),
           unitigs_(unitigs),
-          endpoint_codes_(endpoint_codes) {}
+          endpoint_codes_(endpoint_codes),
+          path_offsets_(path_offsets),
+          path_codes_(path_codes) {}
     ~AssembleFunc() {}
 
     void operator()(HashGraphVertex &vertex);
@@ -333,6 +340,9 @@ class HashGraph {
     HashGraph *hash_graph_;
     std::vector<ContigGraphVertex> *unitigs_;
     std::vector<uint32_t> *endpoint_codes_;
+    std::vector<uint32_t> *path_offsets_;
+    std::vector<uint32_t> *path_codes_;
+    std::vector<uint32_t> code_arms_[2];
   };
 
   class CoveragePercentileFunc {

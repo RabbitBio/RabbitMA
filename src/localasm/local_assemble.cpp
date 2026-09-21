@@ -1787,12 +1787,109 @@ class IncrementalKReadGraph {
     uint64_t primary_inserts{0};
     uint64_t primary_hits{0};
     uint64_t fork_lookups{0};
+    double setup{0};
+    double initial_walk{0};
+    double initial_adjacency{0};
+    double signature_aggregate{0};
+    double coverage{0};
+    double endpoint_overlay{0};
+    double contig_overlay{0};
+    double compaction{0};
+    double adjacency{0};
+    double legacy_read_build{0};
+    double legacy_coverage{0};
+    double legacy_endpoint{0};
+    double legacy_contig{0};
+    double legacy_compaction{0};
+    double legacy_adjacency{0};
+    uint64_t direct_vertices{0};
+    uint64_t read_vertices{0};
+    uint64_t direct_branches{0};
+    uint64_t direct_unitigs{0};
+    uint64_t direct_path_codes{0};
+    uint64_t endpoint_occurrences{0};
+    uint64_t endpoint_existing_vertices{0};
+    uint64_t endpoint_new_vertices{0};
+    uint64_t endpoint_new_oriented_edges{0};
+    uint64_t contig_occurrences{0};
+    uint64_t contig_existing_vertices{0};
+    uint64_t contig_new_vertices{0};
+    uint64_t contig_new_oriented_edges{0};
+  };
+
+  struct CodeBranchBlock {
+    uint32_t target[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  };
+
+  struct CodeVertex {
+    uint32_t count{0};
+    uint32_t next_ref[2]{UINT32_MAX, UINT32_MAX};
+    uint32_t representative_read{UINT32_MAX};
+    uint32_t representative_start{UINT32_MAX};
+    uint8_t out_edges[2]{0, 0};
+    uint8_t representative_reverse{0};
+    uint8_t representative_source{0};
+  };
+
+  struct CodeUnitig {
+    uint32_t path_begin{0};
+    uint32_t path_end{0};
+    uint32_t endpoints[4]{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    uint64_t kmer_count{0};
+    uint8_t out_edges[2]{0, 0};
+  };
+
+  struct CodeTopology {
+    static constexpr uint32_t kBranchMarker = uint32_t{1} << 31u;
+    static constexpr uint32_t kNoTransition = UINT32_MAX;
+
+    std::vector<CodeVertex> vertices;
+    std::vector<CodeBranchBlock> branches;
+    std::vector<CodeUnitig> unitigs;
+    std::vector<uint32_t> path_codes;
+    std::vector<uint32_t> unitig_neighbors;
+    std::vector<uint8_t> locked;
+    std::vector<uint32_t> arms[2];
+    std::vector<uint32_t> begin_owner;
+    uint64_t num_edges{0};
+    uint64_t num_unitig_edges{0};
+
+    void Clear() {
+      vertices.clear();
+      branches.clear();
+      unitigs.clear();
+      path_codes.clear();
+      unitig_neighbors.clear();
+      num_edges = 0;
+      num_unitig_edges = 0;
+    }
+
+    uint8_t OutEdges(uint32_t code) const {
+      return vertices[code >> 1u].out_edges[code & 1u];
+    }
+
+    uint32_t Transition(uint32_t code, uint8_t base) const {
+      const CodeVertex &vertex = vertices[code >> 1u];
+      const uint32_t ref = vertex.next_ref[code & 1u];
+      if (ref == kNoTransition) return kNoTransition;
+      if ((ref & kBranchMarker) == 0u) return ref;
+      const uint32_t block = ref & ~kBranchMarker;
+      if (block >= branches.size()) return kNoTransition;
+      return branches[block].target[base & 3u];
+    }
   };
 
   void Initialize(LocalPackedReads *reads, uint32_t initial_k) {
     stats_ = Stats();
+    const double setup_begin = omp_get_wtime();
     reads_ = reads;
     current_k_ = initial_k;
+    pending_k_ = 0u;
+    pending_read_code_space_ = 0u;
+    endpoint_words_ = nullptr;
+    endpoint_length_ = 0u;
+    previous_contigs_ = nullptr;
+    endpoint_codes_.clear();
     offsets_.resize(reads_->size() + 1u);
     uint64_t total = 0;
     for (size_t read_id = 0; read_id < reads_->size(); ++read_id) {
@@ -1806,10 +1903,24 @@ class IncrementalKReadGraph {
     }
     offsets_.back() = static_cast<uint32_t>(total);
     codes_.resize(static_cast<size_t>(total));
+    stats_.setup += omp_get_wtime() - setup_begin;
+    initial_reference_.reset_for_endpoint();
+    legacy_reference_.reset_for_endpoint();
   }
 
   uint32_t *InitialCodes(size_t read_id) {
     return codes_.data() + offsets_[read_id];
+  }
+
+  void SetEndpoint(const uint64_t *words, uint32_t length) {
+    endpoint_words_ = words;
+    endpoint_length_ = length;
+    endpoint_codes_.resize(length >= current_k_ ? length - current_k_ + 1u
+                                                : 0u);
+  }
+
+  uint32_t *InitialEndpointCodes() {
+    return endpoint_codes_.empty() ? nullptr : endpoint_codes_.data();
   }
 
   void FinishInitial(uint64_t vertex_count) {
@@ -1818,6 +1929,492 @@ class IncrementalKReadGraph {
           "local incremental-k vertex code exceeds 31 bits");
     }
     previous_code_space_ = static_cast<uint32_t>(vertex_count * 2u);
+    previous_read_code_space_ = previous_code_space_;
+  }
+
+  void FinishInitialEvidence(uint64_t read_vertex_count,
+                             uint64_t vertex_count) {
+    if (vertex_count >= (uint64_t{1} << 31u)) {
+      throw std::length_error("initial evidence code space exceeds 31 bits");
+    }
+    previous_code_space_ = static_cast<uint32_t>(vertex_count * 2u);
+    std::vector<uint32_t> unique_vertices;
+    unique_vertices.reserve(endpoint_codes_.size());
+    for (uint32_t code : endpoint_codes_) {
+      unique_vertices.push_back(code >> 1u);
+    }
+    std::sort(unique_vertices.begin(), unique_vertices.end());
+    unique_vertices.erase(
+        std::unique(unique_vertices.begin(), unique_vertices.end()),
+        unique_vertices.end());
+    for (uint32_t vertex : unique_vertices) {
+      if (vertex < read_vertex_count)
+        ++stats_.endpoint_existing_vertices;
+      else
+        ++stats_.endpoint_new_vertices;
+    }
+    stats_.endpoint_occurrences += endpoint_codes_.size();
+  }
+
+  void MeasureInitialTopology(HashGraph *) {
+    std::vector<ContigGraphVertex> unitigs;
+    std::vector<uint32_t> neighbors;
+    initial_reference_.clear();
+    initial_reference_.set_kmer_size(current_k_);
+    for (size_t read_id = 0; read_id < reads_->size(); ++read_id) {
+      const LocalPackedReads::ReadView read = (*reads_)[read_id];
+      if (read.length >= current_k_) {
+        initial_reference_.InsertPackedKmers(read.forward, read.length);
+      }
+    }
+    double begin = omp_get_wtime();
+    initial_reference_.Assemble(unitigs);
+    stats_.initial_walk += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    uint64_t edges = 0;
+    if (!initial_reference_.BuildUnitigAdjacency(unitigs, neighbors, &edges)) {
+      throw std::logic_error("initial oriented-code reference adjacency failed");
+    }
+    stats_.initial_adjacency += omp_get_wtime() - begin;
+  }
+
+  void MeasureLegacyEndpoint(uint32_t kmer_size, double percentile,
+                             const std::vector<Sequence> &previous_contigs) {
+    double begin = omp_get_wtime();
+    legacy_reference_.clear();
+    legacy_reference_.set_kmer_size(kmer_size);
+    for (size_t read_id = 0; read_id < reads_->size(); ++read_id) {
+      const LocalPackedReads::ReadView read = (*reads_)[read_id];
+      if (read.length >= kmer_size) {
+        legacy_reference_.InsertPackedKmers(read.forward, read.length);
+      }
+    }
+    stats_.legacy_read_build += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    legacy_reference_.coverage_percentile(percentile);
+    stats_.legacy_coverage += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    if (endpoint_words_ != nullptr && endpoint_length_ >= kmer_size) {
+      legacy_reference_.InsertPackedKmers(endpoint_words_, endpoint_length_);
+    }
+    stats_.legacy_endpoint += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    for (const Sequence &contig : previous_contigs) {
+      legacy_reference_.InsertUncountKmers(contig);
+    }
+    stats_.legacy_contig += omp_get_wtime() - begin;
+    std::vector<ContigGraphVertex> unitigs;
+    std::vector<uint32_t> neighbors;
+    begin = omp_get_wtime();
+    legacy_reference_.Assemble(unitigs);
+    stats_.legacy_compaction += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    uint64_t edges = 0;
+    if (!legacy_reference_.BuildUnitigAdjacency(unitigs, neighbors, &edges)) {
+      throw std::logic_error("legacy endpoint reference adjacency failed");
+    }
+    stats_.legacy_adjacency += omp_get_wtime() - begin;
+  }
+
+  uint64_t BuildReadLayer(uint32_t target_k) {
+    if (!CanAdvance(target_k)) {
+      throw std::logic_error("unsupported direct oriented-code transition");
+    }
+    const double total_begin = omp_get_wtime();
+    const uint32_t delta = target_k - current_k_;
+    uint64_t total64 = 0;
+    for (size_t read_id = 0; read_id < reads_->size(); ++read_id) {
+      const uint32_t length = (*reads_)[read_id].length;
+      if (length >= target_k) total64 += length - target_k + 1u;
+    }
+    if (total64 > UINT32_MAX) {
+      throw std::length_error("direct oriented-code occurrence tape exceeds 32 bits");
+    }
+    const uint32_t total = static_cast<uint32_t>(total64);
+
+    for (uint32_t prefix : touched_prefixes_) primary_suffix_[prefix] = UINT32_MAX;
+    touched_prefixes_.clear();
+    const size_t prefix_slots = size_t(previous_read_code_space_);
+    if (primary_suffix_.size() < prefix_slots) {
+      primary_suffix_.resize(prefix_slots, UINT32_MAX);
+      primary_state_.resize(prefix_slots);
+    }
+    signature_table_.Reset(std::max<size_t>(16u, total / 8u));
+    direct_topology_.Clear();
+    direct_topology_.vertices.reserve(std::min<size_t>(total, previous_code_space_));
+
+    uint32_t ordinal = 0;
+    for (size_t read_id = 0; read_id < reads_->size(); ++read_id) {
+      const LocalPackedReads::ReadView read = (*reads_)[read_id];
+      if (read.length < target_k) continue;
+      const uint32_t offset = offsets_[read_id];
+      const uint32_t starts = read.length - target_k + 1u;
+      uint32_t previous_code = UINT32_MAX;
+      for (uint32_t start = 0; start < starts; ++start, ++ordinal) {
+        const uint32_t prefix_code = codes_[offset + start];
+        const uint32_t suffix_code = codes_[offset + start + delta];
+        if (prefix_code >= previous_code_space_ ||
+            suffix_code >= previous_code_space_) {
+          throw std::logic_error("invalid previous oriented code");
+        }
+        const uint32_t code = ResolveSignature(
+            prefix_code, suffix_code, 0u, static_cast<uint32_t>(read_id),
+            start);
+        const uint32_t vertex_id = code >> 1u;
+        CodeVertex &vertex = direct_topology_.vertices[vertex_id];
+        ++vertex.count;
+        if (previous_code != UINT32_MAX) {
+          const uint8_t forward_base = LocalPackedReads::PackedBase(
+              read.forward, start + target_k - 1u);
+          AddTransition(previous_code, forward_base, code);
+          const uint8_t reverse_base = static_cast<uint8_t>(
+              3u - LocalPackedReads::PackedBase(read.forward, start - 1u));
+          AddTransition(code ^ 1u, reverse_base, previous_code ^ 1u);
+        }
+        previous_code = code;
+        codes_[offset + start] = code;
+        ++stats_.occurrences;
+      }
+    }
+    if (ordinal != total) throw std::logic_error("direct occurrence count mismatch");
+    stats_.read_vertices += direct_topology_.vertices.size();
+    pending_read_code_space_ =
+        static_cast<uint32_t>(direct_topology_.vertices.size() * 2u);
+    stats_.signature_aggregate += omp_get_wtime() - total_begin;
+
+    pending_k_ = target_k;
+    return total;
+  }
+
+  int CoveragePercentile(double percentile) {
+    const double begin = omp_get_wtime();
+    coverage_bins_.clear();
+    uint32_t max_coverage = 0;
+    for (const CodeVertex &vertex : direct_topology_.vertices) {
+      if (coverage_bins_.size() <= vertex.count) {
+        coverage_bins_.resize(size_t(vertex.count) + 1u, 0u);
+      }
+      ++coverage_bins_[vertex.count];
+      max_coverage = std::max(max_coverage, vertex.count);
+    }
+    if (direct_topology_.vertices.empty()) return 0;
+    const size_t rank = static_cast<size_t>(
+        direct_topology_.vertices.size() * percentile);
+    size_t cumulative = 0;
+    int result = 0;
+    for (uint32_t coverage = 0; coverage <= max_coverage; ++coverage) {
+      cumulative += coverage_bins_[coverage];
+      if (cumulative > rank) {
+        result = static_cast<int>(coverage);
+        break;
+      }
+    }
+    stats_.coverage += omp_get_wtime() - begin;
+    return result;
+  }
+
+  void AddEndpointOverlay(uint32_t target_k) {
+    const double begin = omp_get_wtime();
+    if (target_k != pending_k_ || endpoint_words_ == nullptr ||
+        endpoint_length_ < target_k) {
+      stats_.endpoint_overlay += omp_get_wtime() - begin;
+      return;
+    }
+    const uint32_t delta = target_k - current_k_;
+    const uint32_t starts = endpoint_length_ - target_k + 1u;
+    ++endpoint_seen_epoch_;
+    if (endpoint_seen_epoch_ == 0u) {
+      std::fill(endpoint_seen_.begin(), endpoint_seen_.end(), 0u);
+      endpoint_seen_epoch_ = 1u;
+    }
+    uint32_t previous_code = UINT32_MAX;
+    for (uint32_t start = 0; start < starts; ++start) {
+      const uint32_t prefix_code = endpoint_codes_[start];
+      const uint32_t suffix_code = endpoint_codes_[start + delta];
+      if (prefix_code >= previous_code_space_ ||
+          suffix_code >= previous_code_space_) {
+        throw std::logic_error("invalid endpoint oriented code");
+      }
+      bool inserted = false;
+      const uint32_t code = ResolveSignature(prefix_code, suffix_code, 1u, 0u,
+                                             start, &inserted);
+      ++direct_topology_.vertices[code >> 1u].count;
+      if (endpoint_seen_.size() < direct_topology_.vertices.size()) {
+        endpoint_seen_.resize(direct_topology_.vertices.size(), 0u);
+      }
+      if (endpoint_seen_[code >> 1u] != endpoint_seen_epoch_) {
+        endpoint_seen_[code >> 1u] = endpoint_seen_epoch_;
+        if (inserted)
+          ++stats_.endpoint_new_vertices;
+        else
+          ++stats_.endpoint_existing_vertices;
+      }
+      ++stats_.endpoint_occurrences;
+      if (previous_code != UINT32_MAX) {
+        const uint8_t forward_base = LocalPackedReads::PackedBase(
+            endpoint_words_, start + target_k - 1u);
+        stats_.endpoint_new_oriented_edges +=
+            AddTransition(previous_code, forward_base, code);
+        const uint8_t reverse_base = static_cast<uint8_t>(
+            3u - LocalPackedReads::PackedBase(endpoint_words_, start - 1u));
+        stats_.endpoint_new_oriented_edges +=
+            AddTransition(code ^ 1u, reverse_base, previous_code ^ 1u);
+      }
+      previous_code = code;
+      endpoint_codes_[start] = code;
+    }
+    stats_.endpoint_overlay += omp_get_wtime() - begin;
+  }
+
+  void AddPreviousContigOverlay(
+      uint32_t target_k, const std::vector<Sequence> &contigs,
+      const std::vector<std::vector<uint32_t>> &paths) {
+    const double begin = omp_get_wtime();
+    if (target_k != pending_k_) {
+      throw std::logic_error("previous-contig overlay applied at wrong k");
+    }
+    if (contigs.size() != paths.size()) {
+      throw std::logic_error("previous-contig sequence/path count mismatch");
+    }
+    previous_contigs_ = &contigs;
+    const uint32_t delta = target_k - current_k_;
+    ++contig_seen_epoch_;
+    if (contig_seen_epoch_ == 0u) {
+      std::fill(contig_seen_.begin(), contig_seen_.end(), 0u);
+      contig_seen_epoch_ = 1u;
+    }
+    for (uint32_t contig_id = 0; contig_id < contigs.size(); ++contig_id) {
+      const Sequence &contig = contigs[contig_id];
+      const std::vector<uint32_t> &old_path = paths[contig_id];
+      const uint32_t expected_old =
+          contig.size() >= current_k_ ? contig.size() - current_k_ + 1u : 0u;
+      if (old_path.size() != expected_old) {
+        throw std::logic_error("previous-contig code path length mismatch");
+      }
+      if (contig.size() < target_k) continue;
+      const uint32_t starts = contig.size() - target_k + 1u;
+      uint32_t previous_code = UINT32_MAX;
+      for (uint32_t start = 0; start < starts; ++start) {
+        const uint32_t prefix_code = old_path[start];
+        const uint32_t suffix_code = old_path[start + delta];
+        if (prefix_code >= previous_code_space_ ||
+            suffix_code >= previous_code_space_) {
+          throw std::logic_error("invalid previous-contig oriented code");
+        }
+        bool inserted = false;
+        const uint32_t code = ResolveSignature(
+            prefix_code, suffix_code, 2u, contig_id, start, &inserted);
+        if (contig_seen_.size() < direct_topology_.vertices.size()) {
+          contig_seen_.resize(direct_topology_.vertices.size(), 0u);
+        }
+        if (contig_seen_[code >> 1u] != contig_seen_epoch_) {
+          contig_seen_[code >> 1u] = contig_seen_epoch_;
+          if (inserted)
+            ++stats_.contig_new_vertices;
+          else
+            ++stats_.contig_existing_vertices;
+        }
+        ++stats_.contig_occurrences;
+        if (previous_code != UINT32_MAX) {
+          const uint8_t forward_base = contig[start + target_k - 1u];
+          stats_.contig_new_oriented_edges +=
+              AddTransition(previous_code, forward_base, code);
+          const uint8_t reverse_base =
+              static_cast<uint8_t>(3u - contig[start - 1u]);
+          stats_.contig_new_oriented_edges +=
+              AddTransition(code ^ 1u, reverse_base, previous_code ^ 1u);
+        }
+        previous_code = code;
+      }
+    }
+    stats_.contig_overlay += omp_get_wtime() - begin;
+  }
+
+  void FinalizeTopology(uint32_t target_k) {
+    if (target_k != pending_k_) {
+      throw std::logic_error("direct code topology finalized at wrong k");
+    }
+    const double degree_begin = omp_get_wtime();
+    uint64_t total_degree = 0;
+    for (const CodeVertex &vertex : direct_topology_.vertices) {
+      total_degree += __builtin_popcount(unsigned(vertex.out_edges[0]));
+      total_degree += __builtin_popcount(unsigned(vertex.out_edges[1]));
+    }
+    direct_topology_.num_edges = total_degree / 2u;
+    stats_.compaction += omp_get_wtime() - degree_begin;
+    CompactDirectTopology();
+    stats_.direct_vertices += direct_topology_.vertices.size();
+    stats_.direct_branches += direct_topology_.branches.size();
+    stats_.direct_unitigs += direct_topology_.unitigs.size();
+    stats_.direct_path_codes += direct_topology_.path_codes.size();
+    previous_code_space_ =
+        static_cast<uint32_t>(direct_topology_.vertices.size() * 2u);
+    previous_read_code_space_ = pending_read_code_space_;
+    current_k_ = target_k;
+    pending_k_ = 0u;
+  }
+
+  bool ValidateDirectTopology(HashGraph *reference, uint32_t kmer_size,
+                              std::string *difference) const {
+    if (reference->num_vertices() != direct_topology_.vertices.size()) {
+      *difference = "vertex count";
+      return false;
+    }
+    for (uint32_t vertex_id = 0; vertex_id < direct_topology_.vertices.size();
+         ++vertex_id) {
+      const CodeVertex &vertex = direct_topology_.vertices[vertex_id];
+      const IdbaKmer canonical = VertexKmer(vertex_id, kmer_size);
+      HashGraphVertexAdaptor adaptor = reference->FindVertexAdaptor(canonical);
+      if (adaptor.is_null() || adaptor.count() != int32_t(vertex.count) ||
+          uint8_t(adaptor.out_edges()) != vertex.out_edges[0]) {
+        *difference = "canonical vertex state " + std::to_string(vertex_id);
+        return false;
+      }
+      adaptor.ReverseComplement();
+      if (uint8_t(adaptor.out_edges()) != vertex.out_edges[1]) {
+        *difference = "reverse vertex state " + std::to_string(vertex_id);
+        return false;
+      }
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        uint8_t edges = vertex.out_edges[strand];
+        IdbaKmer source = canonical;
+        if (strand != 0u) source.ReverseComplement();
+        while (edges != 0u) {
+          const uint8_t base = static_cast<uint8_t>(__builtin_ctz(unsigned(edges)));
+          edges &= uint8_t(edges - 1u);
+          IdbaKmer expected = source;
+          expected.ShiftAppend(base);
+          const uint32_t target =
+              direct_topology_.Transition((vertex_id << 1u) | strand, base);
+          if (target == CodeTopology::kNoTransition ||
+              CodeKmer(target, kmer_size) != expected) {
+            *difference = "edge target " + std::to_string(vertex_id);
+            return false;
+          }
+        }
+      }
+    }
+
+    std::vector<ContigGraphVertex> reference_unitigs;
+    reference->Assemble(reference_unitigs);
+    reference->ClearStatus();
+    if (reference_unitigs.size() != direct_topology_.unitigs.size()) {
+      *difference = "unitig count";
+      return false;
+    }
+    std::vector<std::pair<std::string, uint64_t>> expected;
+    std::vector<std::pair<std::string, uint64_t>> actual;
+    expected.reserve(reference_unitigs.size());
+    actual.reserve(direct_topology_.unitigs.size());
+    for (const auto &unitig : reference_unitigs) {
+      expected.emplace_back(CanonicalSequenceString(unitig.contig()),
+                            unitig.contig_info().kmer_count());
+    }
+    for (const CodeUnitig &unitig : direct_topology_.unitigs) {
+      actual.emplace_back(CanonicalSequenceString(MaterializeUnitig(unitig, kmer_size)),
+                          unitig.kmer_count);
+    }
+    std::sort(expected.begin(), expected.end());
+    std::sort(actual.begin(), actual.end());
+    if (expected != actual) {
+      *difference = "unitig sequence/count multiset";
+      return false;
+    }
+    return true;
+  }
+
+  void ExportDirectUnitigs(
+      uint32_t kmer_size, std::vector<ContigGraphVertex> *unitigs,
+      std::vector<uint32_t> *neighbors, uint64_t *num_edges,
+      std::vector<uint32_t> *path_offsets,
+      std::vector<uint32_t> *path_codes) const {
+    unitigs->clear();
+    unitigs->reserve(direct_topology_.unitigs.size());
+    path_offsets->clear();
+    path_offsets->reserve(direct_topology_.unitigs.size() + 1u);
+    path_offsets->push_back(0u);
+    path_codes->clear();
+    path_codes->reserve(direct_topology_.path_codes.size());
+    for (const CodeUnitig &source : direct_topology_.unitigs) {
+      ContigInfo info;
+      info.set_kmer_size(kmer_size);
+      info.set_kmer_count(source.kmer_count);
+      info.in_edges() = source.out_edges[1];
+      info.out_edges() = source.out_edges[0];
+      unitigs->emplace_back(MaterializeUnitig(source, kmer_size), info);
+      path_codes->insert(path_codes->end(),
+                         direct_topology_.path_codes.begin() + source.path_begin,
+                         direct_topology_.path_codes.begin() + source.path_end);
+      path_offsets->push_back(static_cast<uint32_t>(path_codes->size()));
+    }
+    *neighbors = direct_topology_.unitig_neighbors;
+    *num_edges = direct_topology_.num_unitig_edges;
+  }
+
+  uint64_t direct_num_unitig_edges() const {
+    return direct_topology_.num_unitig_edges;
+  }
+
+  uint64_t pending_read_vertices() const {
+    return pending_read_code_space_ / 2u;
+  }
+
+  bool ValidateSequencePaths(
+      const std::vector<Sequence> &sequences,
+      const std::vector<std::vector<uint32_t>> &paths,
+      uint32_t kmer_size, std::string *difference) const {
+    if (sequences.size() != paths.size()) {
+      *difference = "sequence/path count";
+      return false;
+    }
+    for (size_t i = 0; i < sequences.size(); ++i) {
+      const std::vector<uint32_t> &path = paths[i];
+      const size_t expected = sequences[i].size() >= kmer_size
+                                  ? sequences[i].size() - kmer_size + 1u
+                                  : 0u;
+      if (path.size() != expected) {
+        *difference = "path length at contig " + std::to_string(i);
+        return false;
+      }
+      if (path.empty()) continue;
+      Sequence materialized(CodeKmer(path.front(), kmer_size));
+      for (size_t j = 1; j < path.size(); ++j) {
+        materialized += CodeKmer(path[j], kmer_size)[kmer_size - 1u];
+      }
+      Sequence expected_sequence = sequences[i];
+      if (materialized.str() != expected_sequence.str()) {
+        const std::string observed = materialized.str();
+        const std::string expected_text = expected_sequence.str();
+        Sequence expected_reverse = expected_sequence;
+        expected_reverse.ReverseComplement();
+        const bool is_reverse = observed == expected_reverse.str();
+        size_t mismatch = 0u;
+        while (mismatch < observed.size() && mismatch < expected_text.size() &&
+               observed[mismatch] == expected_text[mismatch]) {
+          ++mismatch;
+        }
+        size_t matching_contig = sequences.size();
+        for (size_t candidate = 0; candidate < sequences.size(); ++candidate) {
+          Sequence candidate_sequence = sequences[candidate];
+          if (candidate_sequence.str() == observed) {
+            matching_contig = candidate;
+            break;
+          }
+        }
+        *difference = "path sequence at contig " + std::to_string(i) +
+                      " base " + std::to_string(mismatch) + " lengths " +
+                      std::to_string(observed.size()) + "/" +
+                      std::to_string(expected_text.size()) +
+                      (is_reverse ? " reverse-complement" : "") +
+                      " matching_contig=" +
+                      (matching_contig == sequences.size()
+                           ? std::string("none")
+                           : std::to_string(matching_contig)) +
+                      " observed=" + observed + " expected=" + expected_text;
+        return false;
+      }
+    }
+    return true;
   }
 
   bool CanAdvance(uint32_t target_k) const {
@@ -1981,6 +2578,266 @@ class IncrementalKReadGraph {
   const Stats &stats() const { return stats_; }
 
  private:
+  uint32_t ResolveSignature(uint32_t prefix_code, uint32_t suffix_code,
+                            uint8_t source, uint32_t source_id,
+                            uint32_t source_start,
+                            bool *was_inserted = nullptr) {
+    const uint64_t signature =
+        (uint64_t(prefix_code) << 32u) | suffix_code;
+    const uint64_t reverse_signature =
+        (uint64_t(suffix_code ^ 1u) << 32u) | (prefix_code ^ 1u);
+    if (signature == reverse_signature) {
+      throw std::logic_error("odd-k signature is self reverse-complementary");
+    }
+    const uint64_t canonical = std::min(signature, reverse_signature);
+    const uint32_t canonical_prefix =
+        static_cast<uint32_t>(canonical >> 32u);
+    const uint32_t canonical_suffix = static_cast<uint32_t>(canonical);
+    bool inserted = false;
+    uint32_t vertex_id = UINT32_MAX;
+    if (canonical_prefix < primary_suffix_.size() &&
+        primary_suffix_[canonical_prefix] == UINT32_MAX) {
+      primary_suffix_[canonical_prefix] = canonical_suffix;
+      vertex_id = static_cast<uint32_t>(direct_topology_.vertices.size());
+      primary_state_[canonical_prefix] = vertex_id;
+      touched_prefixes_.push_back(canonical_prefix);
+      inserted = true;
+      ++stats_.primary_inserts;
+    } else if (canonical_prefix < primary_suffix_.size() &&
+               primary_suffix_[canonical_prefix] == canonical_suffix) {
+      vertex_id = primary_state_[canonical_prefix];
+      ++stats_.primary_hits;
+    } else {
+      const uint32_t proposed =
+          static_cast<uint32_t>(direct_topology_.vertices.size());
+      vertex_id = signature_table_.LookupOrInsert(canonical, proposed,
+                                                   &inserted);
+      ++stats_.fork_lookups;
+    }
+    const bool reverse = signature != canonical;
+    if (inserted) {
+      if (direct_topology_.vertices.size() >= (uint64_t{1} << 30u)) {
+        throw std::length_error("direct oriented-code vertex range exceeded");
+      }
+      direct_topology_.vertices.emplace_back();
+      CodeVertex &created = direct_topology_.vertices.back();
+      created.representative_source = source;
+      created.representative_read = source_id;
+      created.representative_start = source_start;
+      created.representative_reverse = uint8_t(reverse);
+    }
+    if (vertex_id >= direct_topology_.vertices.size()) {
+      throw std::logic_error("invalid direct oriented-code vertex");
+    }
+    if (was_inserted != nullptr) *was_inserted = inserted;
+    return (vertex_id << 1u) | uint32_t(reverse);
+  }
+
+  bool AddTransition(uint32_t source, uint8_t base, uint32_t target) {
+    CodeVertex &vertex = direct_topology_.vertices[source >> 1u];
+    const uint32_t strand = source & 1u;
+    const uint8_t bit = uint8_t(1u << base);
+    const uint8_t old_edges = vertex.out_edges[strand];
+    if ((old_edges & bit) != 0u) {
+      if (direct_topology_.Transition(source, base) != target) {
+        throw std::logic_error("non-deterministic direct code transition");
+      }
+      return false;
+    }
+    if (old_edges == 0u) {
+      vertex.next_ref[strand] = target;
+    } else if ((old_edges & (old_edges - 1u)) == 0u) {
+      if (direct_topology_.branches.size() >= CodeTopology::kBranchMarker) {
+        throw std::length_error("direct code branch range exceeded");
+      }
+      const uint32_t block =
+          static_cast<uint32_t>(direct_topology_.branches.size());
+      direct_topology_.branches.emplace_back();
+      const uint8_t old_base =
+          static_cast<uint8_t>(__builtin_ctz(unsigned(old_edges)));
+      direct_topology_.branches.back().target[old_base] =
+          vertex.next_ref[strand];
+      direct_topology_.branches.back().target[base] = target;
+      vertex.next_ref[strand] = CodeTopology::kBranchMarker | block;
+    } else {
+      const uint32_t block =
+          vertex.next_ref[strand] & ~CodeTopology::kBranchMarker;
+      if (block >= direct_topology_.branches.size()) {
+        throw std::logic_error("invalid direct code branch block");
+      }
+      direct_topology_.branches[block].target[base] = target;
+    }
+    vertex.out_edges[strand] |= bit;
+    return true;
+  }
+
+  IdbaKmer VertexKmer(uint32_t vertex_id, uint32_t kmer_size) const {
+    const CodeVertex &vertex = direct_topology_.vertices[vertex_id];
+    const uint64_t *words = endpoint_words_;
+    if (vertex.representative_source == 0u) {
+      words = (*reads_)[vertex.representative_read].forward;
+    } else if (vertex.representative_source == 2u) {
+      if (previous_contigs_ == nullptr ||
+          vertex.representative_read >= previous_contigs_->size()) {
+        throw std::logic_error("missing previous-contig representative");
+      }
+      IdbaKmer key = (*previous_contigs_)[vertex.representative_read].GetIdbaKmer(
+          vertex.representative_start, kmer_size);
+      if (vertex.representative_reverse != 0u) key.ReverseComplement();
+      return key;
+    }
+    if (words == nullptr) {
+      throw std::logic_error("missing direct-code representative source");
+    }
+    IdbaKmer key;
+    key.AssignPackedBases(words, vertex.representative_start, kmer_size);
+    if (vertex.representative_reverse != 0u) key.ReverseComplement();
+    return key;
+  }
+
+  IdbaKmer CodeKmer(uint32_t code, uint32_t kmer_size) const {
+    IdbaKmer key = VertexKmer(code >> 1u, kmer_size);
+    if ((code & 1u) != 0u) key.ReverseComplement();
+    return key;
+  }
+
+  Sequence MaterializeUnitig(const CodeUnitig &unitig,
+                             uint32_t kmer_size) const {
+    if (unitig.path_begin >= unitig.path_end) return Sequence();
+    Sequence sequence(CodeKmer(direct_topology_.path_codes[unitig.path_begin],
+                               kmer_size));
+    for (uint32_t i = unitig.path_begin + 1u; i < unitig.path_end; ++i) {
+      const IdbaKmer key = CodeKmer(direct_topology_.path_codes[i], kmer_size);
+      sequence += key[kmer_size - 1u];
+    }
+    return sequence;
+  }
+
+  static std::string CanonicalSequenceString(Sequence sequence) {
+    const std::string forward = sequence.str();
+    sequence.ReverseComplement();
+    return std::min(forward, sequence.str());
+  }
+
+  static bool DirectNext(const CodeTopology &topology, uint32_t current,
+                         uint32_t *next) {
+    const uint8_t edges = topology.OutEdges(current);
+    if (__builtin_popcount(unsigned(edges)) != 1) return false;
+    const uint8_t base = static_cast<uint8_t>(__builtin_ctz(unsigned(edges)));
+    const uint32_t target = topology.Transition(current, base);
+    if (target == CodeTopology::kNoTransition) {
+      throw std::logic_error("missing direct code successor");
+    }
+    if (__builtin_popcount(unsigned(topology.OutEdges(target ^ 1u))) != 1) {
+      return false;
+    }
+    *next = target;
+    return true;
+  }
+
+  void CompactDirectTopology() {
+    CodeTopology &topology = direct_topology_;
+    topology.locked.assign(topology.vertices.size(), 0u);
+    topology.unitigs.reserve(topology.vertices.size());
+    topology.path_codes.reserve(topology.vertices.size());
+    double phase_begin = omp_get_wtime();
+
+    for (uint32_t seed = 0; seed < topology.vertices.size(); ++seed) {
+      if (topology.locked[seed] != 0u) continue;
+      topology.locked[seed] = 1u;
+      topology.arms[0].clear();
+      topology.arms[1].clear();
+      uint32_t terminals[2] = {seed << 1u, (seed << 1u) | 1u};
+      uint32_t loop_begin = seed << 1u;
+      uint64_t path_count = topology.vertices[seed].count;
+      bool failed = false;
+      for (uint32_t strand = 0; strand < 2u && !failed; ++strand) {
+        uint32_t current = (seed << 1u) | strand;
+        while (true) {
+          uint32_t next = UINT32_MAX;
+          if (!DirectNext(topology, current, &next)) break;
+          if (current == (next ^ 1u)) break;
+          if (next == loop_begin || topology.locked[next >> 1u] != 0u) {
+            failed = true;
+            break;
+          }
+          topology.locked[next >> 1u] = 1u;
+          topology.arms[strand].push_back(next);
+          path_count += topology.vertices[next >> 1u].count;
+          current = next;
+        }
+        terminals[strand] = current;
+        loop_begin = current ^ 1u;
+      }
+      if (failed) continue;
+
+      CodeUnitig unitig;
+      unitig.path_begin = static_cast<uint32_t>(topology.path_codes.size());
+      for (auto it = topology.arms[1].rbegin(); it != topology.arms[1].rend();
+           ++it) {
+        topology.path_codes.push_back(*it ^ 1u);
+      }
+      topology.path_codes.push_back(seed << 1u);
+      topology.path_codes.insert(topology.path_codes.end(),
+                                 topology.arms[0].begin(),
+                                 topology.arms[0].end());
+      unitig.path_end = static_cast<uint32_t>(topology.path_codes.size());
+      unitig.endpoints[0] = terminals[1] ^ 1u;
+      unitig.endpoints[1] = terminals[0] ^ 1u;
+      unitig.endpoints[2] = terminals[0];
+      unitig.endpoints[3] = terminals[1];
+      unitig.out_edges[0] = topology.OutEdges(terminals[0]);
+      unitig.out_edges[1] = topology.OutEdges(terminals[1]);
+      unitig.kmer_count = path_count;
+      topology.unitigs.push_back(unitig);
+    }
+    const double compact_end = omp_get_wtime();
+    stats_.compaction += compact_end - phase_begin;
+
+    topology.begin_owner.assign(topology.vertices.size() * 2u, UINT32_MAX);
+    for (uint32_t unitig_id = 0; unitig_id < topology.unitigs.size();
+         ++unitig_id) {
+      const CodeUnitig &unitig = topology.unitigs[unitig_id];
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const uint32_t endpoint = unitig.endpoints[strand];
+        const uint32_t owner = (unitig_id << 1u) | strand;
+        if (endpoint >= topology.begin_owner.size() ||
+            (topology.begin_owner[endpoint] != UINT32_MAX &&
+             topology.begin_owner[endpoint] != owner)) {
+          throw std::logic_error("non-unique direct code unitig endpoint");
+        }
+        topology.begin_owner[endpoint] = owner;
+      }
+    }
+
+    topology.unitig_neighbors.assign(topology.unitigs.size() * 8u, UINT32_MAX);
+    uint64_t total_degree = 0;
+    for (uint32_t unitig_id = 0; unitig_id < topology.unitigs.size();
+         ++unitig_id) {
+      const CodeUnitig &unitig = topology.unitigs[unitig_id];
+      for (uint32_t strand = 0; strand < 2u; ++strand) {
+        const uint32_t terminal = unitig.endpoints[2u + strand];
+        uint8_t edges = topology.OutEdges(terminal);
+        total_degree += __builtin_popcount(unsigned(edges));
+        while (edges != 0u) {
+          const uint8_t base = static_cast<uint8_t>(__builtin_ctz(unsigned(edges)));
+          edges &= uint8_t(edges - 1u);
+          const uint32_t target = topology.Transition(terminal, base);
+          if (target == CodeTopology::kNoTransition ||
+              target >= topology.begin_owner.size() ||
+              topology.begin_owner[target] == UINT32_MAX) {
+            throw std::logic_error("unresolved direct code unitig adjacency");
+          }
+          topology.unitig_neighbors[size_t(unitig_id) * 8u +
+                                    size_t(strand) * 4u + base] =
+              topology.begin_owner[target];
+        }
+      }
+    }
+    topology.num_unitig_edges = total_degree / 2u;
+    stats_.adjacency += omp_get_wtime() - compact_end;
+  }
+
   struct SignatureState {
     uint32_t code{UINT32_MAX};
   };
@@ -2068,6 +2925,21 @@ class IncrementalKReadGraph {
   std::vector<uint32_t> touched_prefixes_;
   SignatureTable signature_table_;
   uint32_t previous_code_space_{0};
+  uint32_t previous_read_code_space_{0};
+  uint32_t pending_read_code_space_{0};
+  uint32_t pending_k_{0};
+  const uint64_t *endpoint_words_{nullptr};
+  uint32_t endpoint_length_{0};
+  const std::vector<Sequence> *previous_contigs_{nullptr};
+  std::vector<uint32_t> endpoint_codes_;
+  std::vector<size_t> coverage_bins_;
+  std::vector<uint32_t> endpoint_seen_;
+  uint32_t endpoint_seen_epoch_{0};
+  std::vector<uint32_t> contig_seen_;
+  uint32_t contig_seen_epoch_{0};
+  CodeTopology direct_topology_;
+  HashGraph initial_reference_;
+  HashGraph legacy_reference_;
   Stats stats_;
 };
 
@@ -2089,6 +2961,23 @@ struct alignas(64) LocalAssemblyProfile {
   double multik_aggregate{0};
   double multik_replay{0};
   double direct_topology{0};
+  double code_initial_build{0};
+  double code_setup{0};
+  double code_initial_walk{0};
+  double code_initial_adjacency{0};
+  double code_signature_aggregate{0};
+  double code_coverage{0};
+  double code_endpoint_overlay{0};
+  double code_contig_overlay{0};
+  double code_compaction{0};
+  double code_adjacency{0};
+  double code_path_cleaning{0};
+  double legacy_endpoint_read_build{0};
+  double legacy_endpoint_coverage{0};
+  double legacy_endpoint_insert{0};
+  double legacy_contig_insert{0};
+  double legacy_endpoint_compaction{0};
+  double legacy_endpoint_adjacency{0};
   uint64_t k_rounds{0};
   uint64_t raw_kmers{0};
   uint64_t raw_vertices{0};
@@ -2111,7 +3000,205 @@ struct alignas(64) LocalAssemblyProfile {
   uint64_t direct_unitigs{0};
   uint64_t direct_path_codes{0};
   uint64_t direct_edges{0};
+  uint64_t code_vertices{0};
+  uint64_t code_read_vertices{0};
+  uint64_t code_branches{0};
+  uint64_t code_unitigs{0};
+  uint64_t code_path_codes{0};
+  uint64_t code_endpoint_occurrences{0};
+  uint64_t code_endpoint_existing_vertices{0};
+  uint64_t code_endpoint_new_vertices{0};
+  uint64_t code_endpoint_new_oriented_edges{0};
+  uint64_t code_contig_occurrences{0};
+  uint64_t code_contig_existing_vertices{0};
+  uint64_t code_contig_new_vertices{0};
+  uint64_t code_contig_new_oriented_edges{0};
+  uint64_t code_clean_output_differences{0};
 };
+
+// Run the complete local multi-k assembly on one persistent oriented-code
+// representation.  The first order captures HashGraph vertex codes; every
+// later order refines those exact identities and builds the final unitig graph
+// directly after applying counted endpoint and uncounted contig evidence.
+// Returning false leaves the caller free to use the legacy path for an input
+// whose endpoint or k schedule is not supported by exact code lifting.
+bool LaunchIDBAMultiOrder(
+    LocalPackedReads &reads, const Sequence &contig_end,
+    std::vector<Sequence> &out_contigs,
+    std::vector<ContigInfo> &out_contig_infos, uint32_t mink, uint32_t maxk,
+    uint32_t step, HashGraph &hash_graph, ContigGraph &contig_graph,
+    std::vector<ContigGraphVertex> &unitigs,
+    std::vector<uint32_t> &unitig_neighbors,
+    IncrementalKReadGraph &code_graph,
+    std::vector<uint32_t> &path_offsets,
+    std::vector<uint32_t> &path_codes,
+    std::vector<std::vector<uint32_t>> &out_paths,
+    LocalAssemblyProfile *profile,
+    std::vector<uint64_t> *k_round_survival,
+    std::vector<double> *k_read_graph_seconds) {
+  std::vector<uint64_t> packed_endpoint;
+  if (!PackSequence2Bit(contig_end, &packed_endpoint)) return false;
+
+  const uint32_t last_k = std::min(maxk, reads.max_length());
+  uint32_t previous_k = mink;
+  for (uint32_t k = mink + step; k <= last_k; k += step) {
+    if ((k & 1u) == 0u || k - previous_k > previous_k) return false;
+    previous_k = k;
+  }
+
+  out_contigs.clear();
+  out_contig_infos.clear();
+  out_paths.clear();
+  hash_graph.reset_for_endpoint();
+  code_graph.Initialize(&reads, mink);
+  code_graph.SetEndpoint(packed_endpoint.data(), contig_end.size());
+  const int local_range = static_cast<int>(contig_end.size());
+
+  for (uint32_t k = mink; k <= last_k; k += step) {
+    ++profile->k_rounds;
+    const size_t k_index = (k - mink) / step;
+    ++(*k_round_survival)[k_index];
+    double threshold = 0.0;
+
+    if (k == mink) {
+      double begin = omp_get_wtime();
+      hash_graph.clear();
+      hash_graph.set_kmer_size(k);
+      for (size_t read_id = 0; read_id < reads.size(); ++read_id) {
+        const LocalPackedReads::ReadView read = reads[read_id];
+        if (read.length < k) continue;
+        profile->raw_kmers += hash_graph.InsertPackedKmersIndexed(
+            read.forward, read.length, code_graph.InitialCodes(read_id),
+            nullptr);
+      }
+      const uint64_t read_vertices = hash_graph.num_vertices();
+      profile->raw_vertices += read_vertices;
+      code_graph.FinishInitial(read_vertices);
+      const double build_seconds = omp_get_wtime() - begin;
+      profile->read_graph_build += build_seconds;
+      (*k_read_graph_seconds)[k_index] += build_seconds;
+
+      begin = omp_get_wtime();
+      threshold = hash_graph.coverage_percentile(
+          1 - 1.0 * local_range / hash_graph.num_vertices());
+      profile->coverage += omp_get_wtime() - begin;
+
+      begin = omp_get_wtime();
+      hash_graph.InsertPackedKmersIndexed(
+          packed_endpoint.data(), contig_end.size(),
+          code_graph.InitialEndpointCodes(), nullptr);
+      code_graph.FinishInitialEvidence(read_vertices,
+                                       hash_graph.num_vertices());
+      profile->anchor_insert += omp_get_wtime() - begin;
+
+      begin = omp_get_wtime();
+      hash_graph.AssembleWithCodePaths(unitigs, path_offsets, path_codes);
+      const double walk_seconds = omp_get_wtime() - begin;
+      profile->hash_walk += walk_seconds;
+      begin = omp_get_wtime();
+      uint64_t num_edges = 0;
+      const bool explicit_adjacency = hash_graph.BuildUnitigAdjacency(
+          unitigs, unitig_neighbors, &num_edges);
+      const double adjacency_seconds = omp_get_wtime() - begin;
+      profile->hash_adjacency += adjacency_seconds;
+      profile->hash_assemble += walk_seconds + adjacency_seconds;
+
+      begin = omp_get_wtime();
+      contig_graph.clear();
+      contig_graph.ClearExperimentalCodePaths();
+      contig_graph.set_kmer_size(k);
+      if (explicit_adjacency) {
+        contig_graph.InitializeWithAdjacency(unitigs, unitig_neighbors,
+                                             num_edges);
+      } else {
+        contig_graph.Initialize(unitigs);
+      }
+      contig_graph.SetExperimentalCodePaths(path_offsets, path_codes);
+      profile->contig_initialize += omp_get_wtime() - begin;
+    } else {
+      double begin = omp_get_wtime();
+      profile->raw_kmers += code_graph.BuildReadLayer(k);
+      const double build_seconds = omp_get_wtime() - begin;
+      profile->read_graph_build += build_seconds;
+      (*k_read_graph_seconds)[k_index] += build_seconds;
+
+      threshold = code_graph.CoveragePercentile(
+          1 - 1.0 * local_range /
+                  std::max<uint64_t>(1u, code_graph.pending_read_vertices()));
+
+      begin = omp_get_wtime();
+      code_graph.AddEndpointOverlay(k);
+      code_graph.AddPreviousContigOverlay(k, out_contigs, out_paths);
+      code_graph.FinalizeTopology(k);
+      uint64_t num_edges = 0;
+      code_graph.ExportDirectUnitigs(k, &unitigs, &unitig_neighbors,
+                                    &num_edges, &path_offsets, &path_codes);
+      profile->anchor_insert += omp_get_wtime() - begin;
+
+      begin = omp_get_wtime();
+      contig_graph.clear();
+      contig_graph.ClearExperimentalCodePaths();
+      contig_graph.set_kmer_size(k);
+      contig_graph.InitializeWithAdjacency(unitigs, unitig_neighbors,
+                                           num_edges);
+      contig_graph.SetExperimentalCodePaths(path_offsets, path_codes);
+      profile->contig_initialize += omp_get_wtime() - begin;
+    }
+
+    double begin = omp_get_wtime();
+    const int64_t removed_deadends = contig_graph.RemoveDeadEnd(k * 2);
+    profile->dead_end += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    const int64_t removed_bubbles = contig_graph.RemoveBubble();
+    profile->bubble += omp_get_wtime() - begin;
+    begin = omp_get_wtime();
+    bool coverage_changed = false;
+    contig_graph.IterateCoverage(k * 2, 1, threshold, 1.1,
+                                 &coverage_changed);
+    profile->coverage_clean += omp_get_wtime() - begin;
+    ++profile->cleaning_rounds;
+    profile->deadend_changed_rounds += removed_deadends != 0;
+    profile->bubble_changed_rounds += removed_bubbles != 0;
+    profile->coverage_changed_rounds += coverage_changed;
+
+    begin = omp_get_wtime();
+    contig_graph.Assemble(out_contigs, out_contig_infos);
+    contig_graph.TakeExperimentalAssembledCodePaths(out_paths);
+    profile->contig_assemble += omp_get_wtime() - begin;
+    if (out_contigs.size() != out_paths.size()) {
+      throw std::logic_error("multi-order local contig/code path mismatch");
+    }
+    if (out_contigs.size() == 1u) break;
+  }
+
+  const IncrementalKReadGraph::Stats &stats = code_graph.stats();
+  profile->incremental_occurrences += stats.occurrences;
+  profile->incremental_primary_inserts += stats.primary_inserts;
+  profile->incremental_primary_hits += stats.primary_hits;
+  profile->incremental_fork_lookups += stats.fork_lookups;
+  profile->code_setup += stats.setup;
+  profile->code_signature_aggregate += stats.signature_aggregate;
+  profile->code_coverage += stats.coverage;
+  profile->code_endpoint_overlay += stats.endpoint_overlay;
+  profile->code_contig_overlay += stats.contig_overlay;
+  profile->code_compaction += stats.compaction;
+  profile->code_adjacency += stats.adjacency;
+  profile->code_vertices += stats.direct_vertices;
+  profile->code_read_vertices += stats.read_vertices;
+  profile->code_branches += stats.direct_branches;
+  profile->code_unitigs += stats.direct_unitigs;
+  profile->code_path_codes += stats.direct_path_codes;
+  profile->code_endpoint_occurrences += stats.endpoint_occurrences;
+  profile->code_endpoint_existing_vertices += stats.endpoint_existing_vertices;
+  profile->code_endpoint_new_vertices += stats.endpoint_new_vertices;
+  profile->code_endpoint_new_oriented_edges +=
+      stats.endpoint_new_oriented_edges;
+  profile->code_contig_occurrences += stats.contig_occurrences;
+  profile->code_contig_existing_vertices += stats.contig_existing_vertices;
+  profile->code_contig_new_vertices += stats.contig_new_vertices;
+  profile->code_contig_new_oriented_edges += stats.contig_new_oriented_edges;
+  return true;
+}
 
 void LaunchIDBA(LocalPackedReads &reads,
                 const Sequence &contig_end,
@@ -2124,16 +3211,44 @@ void LaunchIDBA(LocalPackedReads &reads,
                 MultiKReadIndex &multi_k_index,
                 MultiKReadIndex::DirectTopology &direct_topology,
                 IncrementalKReadGraph &incremental_read_graph,
+                ContigGraph &code_contig_graph,
+                std::vector<ContigGraphVertex> &code_unitigs,
+                std::vector<uint32_t> &code_unitig_neighbors,
+                std::vector<uint32_t> &code_path_offsets,
+                std::vector<uint32_t> &code_path_codes,
+                std::vector<Sequence> &code_out_contigs,
+                std::vector<ContigInfo> &code_out_contig_infos,
+                std::vector<std::vector<uint32_t>> &code_out_paths,
+                std::vector<Sequence> &legacy_out_contigs,
+                std::vector<ContigInfo> &legacy_out_contig_infos,
                 LocalAssemblyProfile *profile,
                 std::vector<uint64_t> *k_round_survival,
                 std::vector<double> *k_read_graph_seconds,
                 std::vector<uint64_t> *k_branch_hits,
                 std::vector<uint64_t> *k_branch_misses,
                 uint64_t estimated_read_work) {
+  static const bool use_full_multiorder =
+      std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_MULTIORDER") != nullptr;
+  if (use_full_multiorder &&
+      LaunchIDBAMultiOrder(
+          reads, contig_end, out_contigs, out_contig_infos, mink, maxk, step,
+          hash_graph, contig_graph, hash_unitigs, hash_unitig_neighbors,
+          incremental_read_graph, code_path_offsets, code_path_codes,
+          code_out_paths, profile, k_round_survival,
+          k_read_graph_seconds)) {
+    return;
+  }
   int local_range = contig_end.size();
   hash_graph.reset_for_endpoint();
   out_contigs.clear();
   out_contig_infos.clear();
+  code_out_contigs.clear();
+  code_out_contig_infos.clear();
+  code_out_paths.clear();
+  legacy_out_contigs.clear();
+  legacy_out_contig_infos.clear();
+  contig_graph.ClearExperimentalCodePaths();
+  code_contig_graph.ClearExperimentalCodePaths();
 
   // The endpoint anchor is identical in every inner-k round.  Pack it once
   // into the same two-bit layout as local reads so every round can use the
@@ -2150,6 +3265,19 @@ void LaunchIDBA(LocalPackedReads &reads,
   // size, thread count or machine topology.
   static const bool use_incremental_read_graph =
       std::getenv("MEGAHIT_EXPERIMENTAL_LOCAL_INCREMENTAL") != nullptr;
+  static const bool measure_legacy_endpoint =
+      std::getenv("MEGAHIT_PROFILE_LEGACY_ENDPOINT_REFERENCE") != nullptr;
+  static const bool probe_contig_overlay =
+      std::getenv("MEGAHIT_PROBE_LOCAL_CONTIG_OVERLAY") != nullptr;
+  static const bool probe_oriented_code =
+      std::getenv("MEGAHIT_PROBE_LOCAL_ORIENTED_CODE") != nullptr ||
+      std::getenv("MEGAHIT_PROBE_LOCAL_ENDPOINT_OVERLAY") != nullptr ||
+      probe_contig_overlay ||
+      measure_legacy_endpoint;
+  static const bool validate_oriented_code =
+      std::getenv("MEGAHIT_VALIDATE_LOCAL_ORIENTED_CODE") != nullptr ||
+      std::getenv("MEGAHIT_VALIDATE_LOCAL_ENDPOINT_OVERLAY") != nullptr ||
+      std::getenv("MEGAHIT_VALIDATE_LOCAL_CONTIG_OVERLAY") != nullptr;
   static const bool probe_direct_topology =
       std::getenv("MEGAHIT_PROBE_LOCAL_DIRECT_TOPOLOGY") != nullptr;
   static const bool validate_direct_topology =
@@ -2163,8 +3291,16 @@ void LaunchIDBA(LocalPackedReads &reads,
       std::getenv("MEGAHIT_VALIDATE_LOCAL_MULTIK") != nullptr;
   if (use_multi_k_index) {
     multi_k_index.Build(reads, mink);
-  } else if (use_incremental_read_graph) {
+  } else if (use_incremental_read_graph || probe_oriented_code) {
     incremental_read_graph.Initialize(&reads, mink);
+    if (probe_oriented_code) {
+      if (!packed_contig_end_valid) {
+        throw std::logic_error(
+            "endpoint-overlay probe requires an unambiguous packed endpoint");
+      }
+      incremental_read_graph.SetEndpoint(packed_contig_end.data(),
+                                         contig_end.size());
+    }
   }
   (void)estimated_read_work;
 
@@ -2254,7 +3390,8 @@ void LaunchIDBA(LocalPackedReads &reads,
               read.forward, read.length,
               multi_k_index.ForwardGroups(read_id),
               multi_k_index.ReverseGroups(read_id));
-        } else if (use_incremental_read_graph && kmer_size == mink) {
+        } else if ((use_incremental_read_graph || probe_oriented_code) &&
+                   kmer_size == mink) {
           profile->raw_kmers += hash_graph.InsertPackedKmersIndexed(
               read.forward, read.length,
               incremental_read_graph.InitialCodes(read_id), nullptr);
@@ -2265,7 +3402,8 @@ void LaunchIDBA(LocalPackedReads &reads,
       }
       if (use_multi_k_index && kmer_size == mink) {
         multi_k_index.FinishInitial(hash_graph.num_vertices());
-      } else if (use_incremental_read_graph && kmer_size == mink) {
+      } else if ((use_incremental_read_graph || probe_oriented_code) &&
+                 kmer_size == mink) {
         incremental_read_graph.FinishInitial(hash_graph.num_vertices());
       }
     }
@@ -2277,6 +3415,14 @@ void LaunchIDBA(LocalPackedReads &reads,
         hash_graph.DebugBranchTransitionHits() - branch_hits_before;
     (*k_branch_misses)[k_index] +=
         hash_graph.DebugBranchTransitionMisses() - branch_misses_before;
+
+    if (probe_oriented_code) {
+      if (kmer_size == mink) {
+        profile->code_initial_build += read_graph_seconds;
+      } else {
+        incremental_read_graph.BuildReadLayer(kmer_size);
+      }
+    }
 
     if (probe_direct_topology) {
       phase_begin = omp_get_wtime();
@@ -2303,14 +3449,65 @@ void LaunchIDBA(LocalPackedReads &reads,
     double mean = hash_graph.coverage_percentile(
         1 - 1.0 * local_range / hash_graph.num_vertices());
     double threshold = mean;
-    profile->coverage += omp_get_wtime() - phase_begin;
+    const double coverage_seconds = omp_get_wtime() - phase_begin;
+    profile->coverage += coverage_seconds;
+    if (probe_oriented_code) {
+      if (kmer_size == mink) {
+        profile->code_coverage += coverage_seconds;
+      } else {
+        const int direct_mean = incremental_read_graph.CoveragePercentile(
+            1 - 1.0 * local_range / hash_graph.num_vertices());
+        if (validate_oriented_code && direct_mean != int(mean)) {
+          std::fprintf(stderr,
+                       "direct oriented-code coverage differs at k=%u: %d vs %.0f\n",
+                       kmer_size, direct_mean, mean);
+          std::abort();
+        }
+      }
+    }
 
     phase_begin = omp_get_wtime();
     if (packed_contig_end_valid) {
-      hash_graph.InsertPackedKmers(packed_contig_end.data(),
-                                   contig_end.size());
+      if (probe_oriented_code && kmer_size == mink) {
+        const uint64_t read_vertex_count = hash_graph.num_vertices();
+        profile->code_read_vertices += read_vertex_count;
+        hash_graph.InsertPackedKmersIndexed(
+            packed_contig_end.data(), contig_end.size(),
+            incremental_read_graph.InitialEndpointCodes(), nullptr);
+        incremental_read_graph.FinishInitialEvidence(
+            read_vertex_count, hash_graph.num_vertices());
+      } else {
+        hash_graph.InsertPackedKmers(packed_contig_end.data(),
+                                     contig_end.size());
+      }
     } else {
       hash_graph.InsertKmers(contig_end);
+    }
+    const double endpoint_seconds = omp_get_wtime() - phase_begin;
+    if (probe_oriented_code) {
+      if (kmer_size == mink) {
+        profile->code_endpoint_overlay += endpoint_seconds;
+      } else {
+        incremental_read_graph.AddEndpointOverlay(kmer_size);
+        if (!probe_contig_overlay) {
+          incremental_read_graph.FinalizeTopology(kmer_size);
+          if (validate_oriented_code) {
+            std::string difference;
+            if (!incremental_read_graph.ValidateDirectTopology(
+                    &hash_graph, kmer_size, &difference)) {
+              std::fprintf(stderr,
+                           "endpoint-overlay topology differs at k=%u: %s\n",
+                           kmer_size, difference.c_str());
+              std::abort();
+            }
+          }
+        }
+      }
+    }
+    if (measure_legacy_endpoint) {
+      incremental_read_graph.MeasureLegacyEndpoint(
+          kmer_size, 1 - 1.0 * local_range / hash_graph.num_vertices(),
+          out_contigs);
     }
 
     for (const auto &out_contig : out_contigs) {
@@ -2321,12 +3518,39 @@ void LaunchIDBA(LocalPackedReads &reads,
         hash_graph.InsertUncountKmers(out_contig);
       }
     }
+    if (probe_contig_overlay && kmer_size != mink) {
+      incremental_read_graph.AddPreviousContigOverlay(
+          kmer_size, out_contigs, code_out_paths);
+      incremental_read_graph.FinalizeTopology(kmer_size);
+      if (validate_oriented_code) {
+        std::string difference;
+        if (!incremental_read_graph.ValidateDirectTopology(
+                &hash_graph, kmer_size, &difference)) {
+          std::fprintf(stderr,
+                       "full evidence topology differs at k=%u: %s\n",
+                       kmer_size, difference.c_str());
+          std::abort();
+        }
+      }
+      uint64_t code_unitig_edges = 0u;
+      incremental_read_graph.ExportDirectUnitigs(
+          kmer_size, &code_unitigs, &code_unitig_neighbors,
+          &code_unitig_edges, &code_path_offsets, &code_path_codes);
+    }
     profile->anchor_insert += omp_get_wtime() - phase_begin;
 
     phase_begin = omp_get_wtime();
-    hash_graph.Assemble(hash_unitigs);
+    if (probe_contig_overlay && kmer_size == mink) {
+      hash_graph.AssembleWithCodePaths(hash_unitigs, code_path_offsets,
+                                       code_path_codes);
+    } else {
+      hash_graph.Assemble(hash_unitigs);
+    }
     const double hash_walk_seconds = omp_get_wtime() - phase_begin;
     profile->hash_walk += hash_walk_seconds;
+    if (probe_oriented_code && kmer_size == mink) {
+      profile->code_compaction += hash_walk_seconds;
+    }
 
     // A single isolated unitig with at least 2*k k-mers is outside the
     // strict length predicate used by both tip and low-coverage cleaning;
@@ -2334,7 +3558,7 @@ void LaunchIDBA(LocalPackedReads &reads,
     // stages and ContigGraph reconstruction are therefore exact no-ops, and
     // the historical pipeline would immediately break after emitting this
     // same sequence.
-    if (hash_unitigs.size() == 1u) {
+    if (!probe_contig_overlay && hash_unitigs.size() == 1u) {
       ++profile->single_hash_unitigs;
       if (hash_unitigs.front().contig_size() >= 3u * kmer_size - 1u) {
         ++profile->long_single_hash_unitigs;
@@ -2358,9 +3582,13 @@ void LaunchIDBA(LocalPackedReads &reads,
     const double hash_adjacency_seconds = omp_get_wtime() - phase_begin;
     profile->hash_adjacency += hash_adjacency_seconds;
     profile->hash_assemble += hash_walk_seconds + hash_adjacency_seconds;
+    if (probe_oriented_code && kmer_size == mink) {
+      profile->code_adjacency += hash_adjacency_seconds;
+    }
 
     phase_begin = omp_get_wtime();
     contig_graph.clear();
+    contig_graph.ClearExperimentalCodePaths();
     contig_graph.set_kmer_size(kmer_size);
     if (has_explicit_hash_adjacency) {
       contig_graph.InitializeWithAdjacency(hash_unitigs,
@@ -2368,6 +3596,10 @@ void LaunchIDBA(LocalPackedReads &reads,
                                            hash_unitig_edges);
     } else {
       contig_graph.Initialize(hash_unitigs);
+    }
+    if (probe_contig_overlay && kmer_size == mink) {
+      contig_graph.SetExperimentalCodePaths(code_path_offsets,
+                                            code_path_codes);
     }
     profile->contig_initialize += omp_get_wtime() - phase_begin;
 
@@ -2391,8 +3623,96 @@ void LaunchIDBA(LocalPackedReads &reads,
     profile->coverage_changed_rounds += coverage_changed;
 
     phase_begin = omp_get_wtime();
-    contig_graph.Assemble(out_contigs, out_contig_infos);
+    contig_graph.Assemble(legacy_out_contigs, legacy_out_contig_infos);
     profile->contig_assemble += omp_get_wtime() - phase_begin;
+
+    if (probe_contig_overlay) {
+      if (kmer_size == mink) {
+        contig_graph.TakeExperimentalAssembledCodePaths(code_out_paths);
+        if (code_out_paths.size() != legacy_out_contigs.size()) {
+          throw std::logic_error("initial cleaned contig/code path mismatch");
+        }
+        out_contigs.swap(legacy_out_contigs);
+        out_contig_infos.swap(legacy_out_contig_infos);
+      } else {
+        const double code_clean_begin = omp_get_wtime();
+        code_contig_graph.clear();
+        code_contig_graph.ClearExperimentalCodePaths();
+        code_contig_graph.set_kmer_size(kmer_size);
+        const uint64_t code_unitig_edges =
+            incremental_read_graph.direct_num_unitig_edges();
+        code_contig_graph.InitializeWithAdjacency(
+            code_unitigs, code_unitig_neighbors, code_unitig_edges);
+        code_contig_graph.SetExperimentalCodePaths(code_path_offsets,
+                                                   code_path_codes);
+        auto validate_code_graph_paths = [&](const char *stage) {
+          if (!validate_oriented_code) return;
+          code_contig_graph.Assemble(code_out_contigs,
+                                     code_out_contig_infos);
+          code_contig_graph.TakeExperimentalAssembledCodePaths(
+              code_out_paths);
+          std::string path_difference;
+          if (!incremental_read_graph.ValidateSequencePaths(
+                  code_out_contigs, code_out_paths, kmer_size,
+                  &path_difference)) {
+            std::fprintf(stderr,
+                         "code paths differ after %s at k=%u: %s\n",
+                         stage, kmer_size, path_difference.c_str());
+            std::abort();
+          }
+          code_contig_graph.ClearStatus();
+        };
+        validate_code_graph_paths("initialization");
+        code_contig_graph.RemoveDeadEnd(kmer_size * 2);
+        validate_code_graph_paths("dead-end cleaning");
+        code_contig_graph.RemoveBubble();
+        validate_code_graph_paths("bubble cleaning");
+        bool code_coverage_changed = false;
+        code_contig_graph.IterateCoverage(kmer_size * 2, 1, threshold, 1.1,
+                                          &code_coverage_changed);
+        validate_code_graph_paths("coverage cleaning");
+        code_contig_graph.Assemble(code_out_contigs, code_out_contig_infos);
+        code_contig_graph.TakeExperimentalAssembledCodePaths(code_out_paths);
+        profile->code_path_cleaning += omp_get_wtime() - code_clean_begin;
+        if (code_out_paths.size() != code_out_contigs.size()) {
+          throw std::logic_error("cleaned direct contig/code path mismatch");
+        }
+        if (validate_oriented_code) {
+          std::string path_difference;
+          if (!incremental_read_graph.ValidateSequencePaths(
+                  code_out_contigs, code_out_paths, kmer_size,
+                  &path_difference)) {
+            std::fprintf(stderr,
+                         "cleaned code paths differ at k=%u: %s\n",
+                         kmer_size, path_difference.c_str());
+            std::abort();
+          }
+          auto canonical_outputs = [](const std::vector<Sequence> &sequences,
+                                      const std::vector<ContigInfo> &infos) {
+            std::vector<std::pair<std::string, uint64_t>> result;
+            result.reserve(sequences.size());
+            for (size_t i = 0; i < sequences.size(); ++i) {
+              Sequence forward = sequences[i];
+              Sequence reverse = forward;
+              reverse.ReverseComplement();
+              result.emplace_back(std::min(forward.str(), reverse.str()),
+                                  infos[i].kmer_count());
+            }
+            std::sort(result.begin(), result.end());
+            return result;
+          };
+          if (canonical_outputs(legacy_out_contigs, legacy_out_contig_infos) !=
+              canonical_outputs(code_out_contigs, code_out_contig_infos)) {
+            ++profile->code_clean_output_differences;
+          }
+        }
+        out_contigs.swap(code_out_contigs);
+        out_contig_infos.swap(code_out_contig_infos);
+      }
+    } else {
+      out_contigs.swap(legacy_out_contigs);
+      out_contig_infos.swap(legacy_out_contig_infos);
+    }
 
     if (out_contigs.size() == 1) {
       break;
@@ -2407,7 +3727,7 @@ void LaunchIDBA(LocalPackedReads &reads,
     profile->multik_aggregate += stats.aggregate;
     profile->multik_replay += stats.replay;
   }
-  if (use_incremental_read_graph) {
+  if (use_incremental_read_graph || probe_oriented_code) {
     const IncrementalKReadGraph::Stats &stats =
         incremental_read_graph.stats();
     profile->incremental_occurrences += stats.occurrences;
@@ -2415,6 +3735,40 @@ void LaunchIDBA(LocalPackedReads &reads,
     profile->incremental_primary_inserts += stats.primary_inserts;
     profile->incremental_primary_hits += stats.primary_hits;
     profile->incremental_fork_lookups += stats.fork_lookups;
+    if (probe_oriented_code) {
+      profile->code_initial_walk += stats.initial_walk;
+      profile->code_setup += stats.setup;
+      profile->code_initial_adjacency += stats.initial_adjacency;
+      profile->code_signature_aggregate += stats.signature_aggregate;
+      profile->code_coverage += stats.coverage;
+      profile->code_endpoint_overlay += stats.endpoint_overlay;
+      profile->code_contig_overlay += stats.contig_overlay;
+      profile->code_compaction += stats.compaction;
+      profile->code_adjacency += stats.adjacency;
+      profile->code_vertices += stats.direct_vertices;
+      profile->code_read_vertices += stats.read_vertices;
+      profile->code_branches += stats.direct_branches;
+      profile->code_unitigs += stats.direct_unitigs;
+      profile->code_path_codes += stats.direct_path_codes;
+      profile->code_endpoint_occurrences += stats.endpoint_occurrences;
+      profile->code_endpoint_existing_vertices +=
+          stats.endpoint_existing_vertices;
+      profile->code_endpoint_new_vertices += stats.endpoint_new_vertices;
+      profile->code_endpoint_new_oriented_edges +=
+          stats.endpoint_new_oriented_edges;
+      profile->code_contig_occurrences += stats.contig_occurrences;
+      profile->code_contig_existing_vertices +=
+          stats.contig_existing_vertices;
+      profile->code_contig_new_vertices += stats.contig_new_vertices;
+      profile->code_contig_new_oriented_edges +=
+          stats.contig_new_oriented_edges;
+      profile->legacy_endpoint_read_build += stats.legacy_read_build;
+      profile->legacy_endpoint_coverage += stats.legacy_coverage;
+      profile->legacy_endpoint_insert += stats.legacy_endpoint;
+      profile->legacy_contig_insert += stats.legacy_contig;
+      profile->legacy_endpoint_compaction += stats.legacy_compaction;
+      profile->legacy_endpoint_adjacency += stats.legacy_adjacency;
+    }
   }
 
   profile->branch_transition_hits += hash_graph.DebugBranchTransitionHits();
@@ -3019,8 +4373,18 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
   MultiKReadIndex::DirectTopology direct_topology;
   IncrementalKReadGraph incremental_read_graph;
   ContigGraph contig_graph;
+  ContigGraph code_contig_graph;
   std::vector<ContigGraphVertex> hash_unitigs;
   std::vector<uint32_t> hash_unitig_neighbors;
+  std::vector<ContigGraphVertex> code_unitigs;
+  std::vector<uint32_t> code_unitig_neighbors;
+  std::vector<uint32_t> code_path_offsets;
+  std::vector<uint32_t> code_path_codes;
+  std::vector<Sequence> code_out_contigs;
+  std::vector<ContigInfo> code_out_contig_infos;
+  std::vector<std::vector<uint32_t>> code_out_paths;
+  std::vector<Sequence> legacy_out_contigs;
+  std::vector<ContigInfo> legacy_out_contig_infos;
   // Private to an OpenMP worker and retained across dynamic endpoint tasks;
   // clear() keeps the backing capacity while replacing millions of individual
   // small string allocations with four contiguous arrays.
@@ -3115,8 +4479,13 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
 
 #pragma omp parallel for private(hash_graph, multi_k_index, direct_topology,   \
                                  incremental_read_graph,                       \
-                                 contig_graph, hash_unitigs,                    \
-                                 hash_unitig_neighbors,                        \
+                                 contig_graph, code_contig_graph,               \
+                                 hash_unitigs, hash_unitig_neighbors,           \
+                                 code_unitigs, code_unitig_neighbors,           \
+                                 code_path_offsets, code_path_codes,            \
+                                 code_out_contigs, code_out_contig_infos,       \
+                                 code_out_paths, legacy_out_contigs,            \
+                                 legacy_out_contig_infos,                       \
                                  contig_end, reads, out_contigs,               \
                                  out_contig_infos)                              \
     reduction(+ : endpoint_gather_cpu_seconds,                             \
@@ -3212,6 +4581,10 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
                out_contig_infos, opt.kmin, opt.kmax, opt.step, hash_graph,
                contig_graph, hash_unitigs, hash_unitig_neighbors,
                multi_k_index, direct_topology, incremental_read_graph,
+               code_contig_graph, code_unitigs, code_unitig_neighbors,
+               code_path_offsets, code_path_codes, code_out_contigs,
+               code_out_contig_infos, code_out_paths, legacy_out_contigs,
+               legacy_out_contig_infos,
                &local_profile, &thread_k_round_survival[omp_get_thread_num()],
                &thread_k_read_graph_seconds[omp_get_thread_num()],
                &thread_k_branch_hits[omp_get_thread_num()],
@@ -3303,6 +4676,30 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
     profile.multik_aggregate += thread_profile.multik_aggregate;
     profile.multik_replay += thread_profile.multik_replay;
     profile.direct_topology += thread_profile.direct_topology;
+    profile.code_initial_build += thread_profile.code_initial_build;
+    profile.code_setup += thread_profile.code_setup;
+    profile.code_initial_walk += thread_profile.code_initial_walk;
+    profile.code_initial_adjacency += thread_profile.code_initial_adjacency;
+    profile.code_signature_aggregate +=
+        thread_profile.code_signature_aggregate;
+    profile.code_coverage += thread_profile.code_coverage;
+    profile.code_endpoint_overlay += thread_profile.code_endpoint_overlay;
+    profile.code_contig_overlay += thread_profile.code_contig_overlay;
+    profile.code_compaction += thread_profile.code_compaction;
+    profile.code_adjacency += thread_profile.code_adjacency;
+    profile.code_path_cleaning += thread_profile.code_path_cleaning;
+    profile.legacy_endpoint_read_build +=
+        thread_profile.legacy_endpoint_read_build;
+    profile.legacy_endpoint_coverage +=
+        thread_profile.legacy_endpoint_coverage;
+    profile.legacy_endpoint_insert +=
+        thread_profile.legacy_endpoint_insert;
+    profile.legacy_contig_insert +=
+        thread_profile.legacy_contig_insert;
+    profile.legacy_endpoint_compaction +=
+        thread_profile.legacy_endpoint_compaction;
+    profile.legacy_endpoint_adjacency +=
+        thread_profile.legacy_endpoint_adjacency;
     profile.k_rounds += thread_profile.k_rounds;
     profile.raw_kmers += thread_profile.raw_kmers;
     profile.raw_vertices += thread_profile.raw_vertices;
@@ -3337,6 +4734,29 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
     profile.direct_unitigs += thread_profile.direct_unitigs;
     profile.direct_path_codes += thread_profile.direct_path_codes;
     profile.direct_edges += thread_profile.direct_edges;
+    profile.code_vertices += thread_profile.code_vertices;
+    profile.code_read_vertices += thread_profile.code_read_vertices;
+    profile.code_branches += thread_profile.code_branches;
+    profile.code_unitigs += thread_profile.code_unitigs;
+    profile.code_path_codes += thread_profile.code_path_codes;
+    profile.code_endpoint_occurrences +=
+        thread_profile.code_endpoint_occurrences;
+    profile.code_endpoint_existing_vertices +=
+        thread_profile.code_endpoint_existing_vertices;
+    profile.code_endpoint_new_vertices +=
+        thread_profile.code_endpoint_new_vertices;
+    profile.code_endpoint_new_oriented_edges +=
+        thread_profile.code_endpoint_new_oriented_edges;
+    profile.code_contig_occurrences +=
+        thread_profile.code_contig_occurrences;
+    profile.code_contig_existing_vertices +=
+        thread_profile.code_contig_existing_vertices;
+    profile.code_contig_new_vertices +=
+        thread_profile.code_contig_new_vertices;
+    profile.code_contig_new_oriented_edges +=
+        thread_profile.code_contig_new_oriented_edges;
+    profile.code_clean_output_differences +=
+        thread_profile.code_clean_output_differences;
   }
   xinfo("Inner-k CPU seconds ({} rounds, {} raw k-mers, {} raw vertices): "
         "reads {.6}, coverage {.6}, "
@@ -3373,6 +4793,59 @@ void AssembleAndOutput(const HashMapper &mapper, const SeqPackage &read_pkg,
           profile.direct_topology, profile.direct_vertices,
           profile.direct_branches, profile.direct_unitigs,
           profile.direct_path_codes, profile.direct_edges);
+  }
+  if (profile.code_vertices != 0u) {
+    const double code_total =
+        profile.code_setup + profile.code_initial_build + profile.code_initial_walk +
+        profile.code_initial_adjacency + profile.code_signature_aggregate +
+        profile.code_coverage + profile.code_endpoint_overlay +
+        profile.code_contig_overlay +
+        profile.code_compaction + profile.code_adjacency;
+    xinfo("Oriented-code dynamic overlay: total {.6} CPU s (setup {.6}, initial build {.6}, "
+          "initial walk {.6}, initial adjacency {.6}, signature/aggregate "
+          "{.6}, coverage {.6}, endpoint {.6}, previous contig {.6}, compact {.6}, adjacency {.6}); {} later-k vertices, {} "
+          "branch blocks, {} unitigs, {} path codes\n",
+          code_total, profile.code_setup, profile.code_initial_build, profile.code_initial_walk,
+          profile.code_initial_adjacency, profile.code_signature_aggregate,
+          profile.code_coverage, profile.code_endpoint_overlay,
+          profile.code_contig_overlay,
+          profile.code_compaction, profile.code_adjacency,
+          profile.code_vertices, profile.code_branches,
+          profile.code_unitigs, profile.code_path_codes);
+    xinfo("Endpoint overlay volume: {} occurrences, {} existing vertices, "
+          "{} new vertices, {} later-k new oriented edges; {} read-derived "
+          "vertices\n",
+          profile.code_endpoint_occurrences,
+          profile.code_endpoint_existing_vertices,
+          profile.code_endpoint_new_vertices,
+          profile.code_endpoint_new_oriented_edges,
+          profile.code_read_vertices);
+    xinfo("Previous-contig overlay volume: {} occurrences, {} existing "
+          "vertices, {} new vertices, {} later-k new oriented edges; "
+          "experimental path-cleaning validation {.6} CPU s\n",
+          profile.code_contig_occurrences,
+          profile.code_contig_existing_vertices,
+          profile.code_contig_new_vertices,
+          profile.code_contig_new_oriented_edges,
+          profile.code_path_cleaning);
+    xinfo("Code-path cleaning output-order differences: {} inner-k rounds\n",
+          profile.code_clean_output_differences);
+  }
+  if (profile.legacy_endpoint_read_build != 0.0) {
+    const double legacy_total =
+        profile.legacy_endpoint_read_build +
+        profile.legacy_endpoint_coverage + profile.legacy_endpoint_insert +
+        profile.legacy_contig_insert +
+        profile.legacy_endpoint_compaction +
+        profile.legacy_endpoint_adjacency;
+    xinfo("Legacy full-evidence reference: total {.6} CPU s (read build "
+          "{.6}, coverage {.6}, endpoint {.6}, previous contig {.6}, "
+          "compact {.6}, adjacency {.6})\n",
+          legacy_total, profile.legacy_endpoint_read_build,
+          profile.legacy_endpoint_coverage, profile.legacy_endpoint_insert,
+          profile.legacy_contig_insert,
+          profile.legacy_endpoint_compaction,
+          profile.legacy_endpoint_adjacency);
   }
 
   std::vector<uint64_t> k_round_survival(num_k_values, 0);

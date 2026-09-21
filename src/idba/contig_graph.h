@@ -44,6 +44,11 @@ class ContigGraph {
   void InitializeWithAdjacency(std::vector<ContigGraphVertex> &vertices,
                                std::vector<uint32_t> &neighbor_codes,
                                uint64_t num_edges);
+  void SetExperimentalCodePaths(const std::vector<uint32_t> &path_offsets,
+                                const std::vector<uint32_t> &path_codes);
+  void ClearExperimentalCodePaths();
+  void TakeExperimentalAssembledCodePaths(
+      std::vector<std::vector<uint32_t>> &paths);
 
   void Refresh();
   void RefreshVertices();

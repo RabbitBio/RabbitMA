@@ -1099,6 +1099,26 @@ int64_t HashGraph::Assemble(std::vector<ContigGraphVertex> &unitigs) {
   return unitigs.size();
 }
 
+int64_t HashGraph::AssembleWithCodePaths(
+    std::vector<ContigGraphVertex> &unitigs,
+    std::vector<uint32_t> &path_offsets,
+    std::vector<uint32_t> &path_codes) {
+  unitigs.clear();
+  unitigs.reserve(vertex_table_.size());
+  assembled_endpoint_codes_.clear();
+  path_offsets.clear();
+  path_offsets.push_back(0u);
+  path_codes.clear();
+  path_codes.reserve(vertex_table_.size());
+  AssembleFunc func(this, &unitigs, &assembled_endpoint_codes_,
+                    &path_offsets, &path_codes);
+  vertex_table_.for_each_unlocked(func);
+  if (path_offsets.size() != unitigs.size() + 1u) {
+    throw std::logic_error("HashGraph code-path/unitig count mismatch");
+  }
+  return unitigs.size();
+}
+
 bool HashGraph::BuildUnitigAdjacency(
     std::vector<ContigGraphVertex> &unitigs,
     std::vector<uint32_t> &neighbor_codes, uint64_t *num_edges) {
@@ -1219,6 +1239,8 @@ void HashGraph::AssembleFunc::operator()(HashGraphVertex &vertex) {
         hash_graph_->assemble_arm_bases_[1];
     forward_arm.clear();
     reverse_arm.clear();
+    code_arms_[0].clear();
+    code_arms_[1].clear();
     uint32_t unitig_kmer_count = static_cast<uint32_t>(vertex.count());
     HashGraphVertexAdaptor terminals[2] = {
         HashGraphVertexAdaptor(&vertex, false),
@@ -1237,6 +1259,11 @@ void HashGraph::AssembleFunc::operator()(HashGraphVertex &vertex) {
         if (!next.status().LockPreempt(0)) return;
 
         hash_graph_->assemble_arm_bases_[strand].push_back(next.last_base());
+        if (path_codes_ != nullptr) {
+          code_arms_[strand].push_back(
+              (hash_graph_->vertex_table_.index_of(next.vertex()) << 1u) |
+              uint32_t(next.is_reverse()));
+        }
         unitig_kmer_count += static_cast<uint32_t>(next.count());
         current = next;
       }
@@ -1276,6 +1303,17 @@ void HashGraph::AssembleFunc::operator()(HashGraphVertex &vertex) {
     }
     for (uint8_t base : forward_arm) contig[output++] = base;
     unitigs_->back().take_contig(contig);
+
+    if (path_codes_ != nullptr && path_offsets_ != nullptr) {
+      for (auto it = code_arms_[1].rbegin(); it != code_arms_[1].rend(); ++it) {
+        path_codes_->push_back(*it ^ 1u);
+      }
+      path_codes_->push_back(
+          hash_graph_->vertex_table_.index_of(vertex) << 1u);
+      path_codes_->insert(path_codes_->end(), code_arms_[0].begin(),
+                          code_arms_[0].end());
+      path_offsets_->push_back(static_cast<uint32_t>(path_codes_->size()));
+    }
 
     const auto encode = [this](const HashGraphVertexAdaptor &endpoint) {
       return (hash_graph_->vertex_table_.index_of(endpoint.vertex()) << 1u) |

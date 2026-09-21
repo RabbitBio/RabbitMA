@@ -23,6 +23,70 @@
 
 using namespace std;
 
+namespace {
+struct ExperimentalCodePathState {
+  std::vector<std::vector<uint32_t>> paths;
+  std::vector<std::vector<uint32_t>> merge_paths;
+  std::vector<std::vector<uint32_t>> assembled_paths;
+};
+
+thread_local std::map<const ContigGraph *, ExperimentalCodePathState>
+    experimental_code_paths;
+
+void AppendOrientedCodePath(const ContigGraphVertexAdaptor &vertex,
+                            const ExperimentalCodePathState &state,
+                            std::vector<uint32_t> *output) {
+  if (vertex.id() >= state.paths.size()) {
+    throw std::logic_error("experimental code path vertex ID is invalid");
+  }
+  const std::vector<uint32_t> &source = state.paths[vertex.id()];
+  if (!vertex.is_reverse()) {
+    output->insert(output->end(), source.begin(), source.end());
+  } else {
+    for (auto it = source.rbegin(); it != source.rend(); ++it) {
+      output->push_back(*it ^ 1u);
+    }
+  }
+}
+
+void AssembleCodePath(const ContigGraphPath &path,
+                      const ExperimentalCodePathState &state,
+                      std::vector<uint32_t> *output) {
+  output->clear();
+  for (uint32_t i = 0; i < path.num_nodes(); ++i) {
+    AppendOrientedCodePath(path[i], state, output);
+  }
+}
+}  // namespace
+
+void ContigGraph::SetExperimentalCodePaths(
+    const std::vector<uint32_t> &path_offsets,
+    const std::vector<uint32_t> &path_codes) {
+  if (path_offsets.size() != vertices_.size() + 1u ||
+      path_offsets.empty() || path_offsets.back() != path_codes.size()) {
+    throw std::logic_error("experimental code path shape mismatch");
+  }
+  ExperimentalCodePathState &state = experimental_code_paths[this];
+  state.paths.clear();
+  state.paths.resize(vertices_.size());
+  for (uint32_t i = 0; i < vertices_.size(); ++i) {
+    state.paths[i].assign(path_codes.begin() + path_offsets[i],
+                          path_codes.begin() + path_offsets[i + 1u]);
+  }
+  state.assembled_paths.clear();
+}
+
+void ContigGraph::ClearExperimentalCodePaths() {
+  experimental_code_paths.erase(this);
+}
+
+void ContigGraph::TakeExperimentalAssembledCodePaths(
+    std::vector<std::vector<uint32_t>> &paths) {
+  ExperimentalCodePathState &state = experimental_code_paths[this];
+  paths.swap(state.assembled_paths);
+  state.assembled_paths.clear();
+}
+
 void ContigGraph::Initialize(deque<Sequence> &contigs,
                              deque<ContigInfo> &contig_infos) {
   pending_dead_vertices_ = false;
@@ -439,6 +503,16 @@ void ContigGraph::MergeSimplePaths() {
       merge_payload_sources_workspace_;
   payload_sources.clear();
   payload_sources.reserve(vertices_.size());
+  auto code_state_it = experimental_code_paths.find(this);
+  ExperimentalCodePathState *code_state =
+      code_state_it != experimental_code_paths.end() &&
+              code_state_it->second.paths.size() == vertices_.size()
+          ? &code_state_it->second
+          : nullptr;
+  if (code_state != nullptr) {
+    code_state->merge_paths.clear();
+    code_state->merge_paths.reserve(vertices_.size());
+  }
   // Preserve Assemble()'s historical palindrome-first output order.  A DNA
   // reverse-complement palindrome has even length, so the normal odd-k local
   // path skips this entire full-vertex sequence scan.
@@ -451,6 +525,9 @@ void ContigGraph::MergeSimplePaths() {
 
         merged_vertices.emplace_back(vertices_[i].contig(),
                                      vertices_[i].contig_info());
+        if (code_state != nullptr) {
+          code_state->merge_paths.push_back(code_state->paths[i]);
+        }
         payload_sources.push_back(UINT32_MAX);
         merged_vertices.back().set_id(
             static_cast<uint32_t>(merged_vertices.size() - 1u));
@@ -488,6 +565,10 @@ void ContigGraph::MergeSimplePaths() {
     }
 
     if (!failed) {
+      if (code_state != nullptr) {
+        code_state->merge_paths.emplace_back();
+        AssembleCodePath(path, *code_state, &code_state->merge_paths.back());
+      }
       if (path.num_nodes() == 1u && !path[0].is_reverse()) {
         // The overwhelming common case after a sparse cleaning mutation is
         // an unchanged, already-compressed unitig.  Defer moving its payload
@@ -598,6 +679,12 @@ void ContigGraph::MergeSimplePaths() {
   }
 
   vertices_.swap(merged_vertices);
+  if (code_state != nullptr) {
+    if (code_state->merge_paths.size() != vertices_.size()) {
+      throw std::logic_error("merged experimental code path count mismatch");
+    }
+    code_state->paths.swap(code_state->merge_paths);
+  }
   if (remap_topology) {
     neighbor_codes_.swap(merged_neighbors);
     num_edges_ = merged_degree / 2u;
@@ -798,6 +885,13 @@ int64_t ContigGraph::Assemble(vector<Sequence> &contigs,
   contig_infos.clear();
   contigs.reserve(vertices_.size());
   contig_infos.reserve(vertices_.size());
+  auto code_state_it = experimental_code_paths.find(this);
+  ExperimentalCodePathState *code_state =
+      code_state_it != experimental_code_paths.end() &&
+              code_state_it->second.paths.size() == vertices_.size()
+          ? &code_state_it->second
+          : nullptr;
+  if (code_state != nullptr) code_state->assembled_paths.clear();
 
   if ((kmer_size_ & 1u) == 0u) {
     for (int64_t i = 0; i < (int64_t)vertices_.size(); ++i) {
@@ -813,6 +907,9 @@ int64_t ContigGraph::Assemble(vector<Sequence> &contigs,
 
         contigs.push_back(contig);
         contig_infos.push_back(contig_info);
+        if (code_state != nullptr) {
+          code_state->assembled_paths.push_back(code_state->paths[i]);
+        }
       }
     }
   }
@@ -852,6 +949,11 @@ int64_t ContigGraph::Assemble(vector<Sequence> &contigs,
     contig_infos.emplace_back();
     contigs.back().swap(contig);
     contig_infos.back().swap(contig_info);
+    if (code_state != nullptr) {
+      code_state->assembled_paths.emplace_back();
+      AssembleCodePath(path, *code_state,
+                       &code_state->assembled_paths.back());
+    }
   FAIL:;
   }
 
