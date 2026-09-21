@@ -2913,6 +2913,39 @@ int64_t SeqToSdbg::Lv1DirectMemoryLimit() const {
         rss_target / 2u);
     if (retained >= rss_target ||
         untracked_headroom >= rss_target - retained) {
+      // Streamed fixed edges cannot fall back to the compact-locator path:
+      // their chunk records deliberately have no stable random-access
+      // locator after the sequential buffer is released.  A large mercy set
+      // can make the retained overlay exceed the configured total-RSS target
+      // after streaming was selected in Initialize().  Preserve exactness by
+      // keeping one target-sized bounded direct arena, rather than returning
+      // zero and entering the unsupported locator path.  AdjustMemory still
+      // caps this arena by the declared host budget and reuses it across Lv1
+      // scans, so this does not materialize the complete streamed graph.
+      if (stream_input_edges_ && opt_.host_mem > 0) {
+        const uint64_t host_limit = static_cast<uint64_t>(opt_.host_mem);
+        const uint64_t host_headroom =
+            std::max<uint64_t>(uint64_t{256} << 20u, host_limit / 100u) +
+            static_cast<uint64_t>(std::max(1, opt_.n_threads)) *
+                kNumBuckets * sizeof(int64_t) * 3u;
+        if (retained < host_limit &&
+            host_headroom < host_limit - retained) {
+          const uint64_t workspace = std::min<uint64_t>(
+              rss_target, host_limit - retained - host_headroom);
+          if (workspace != 0) {
+            xinfo(
+                "Retained streamed-edge overlays exceed the {.3} GiB RSS "
+                "target; preserving a {.3} GiB bounded direct workspace "
+                "inside the host-memory budget\n",
+                static_cast<double>(rss_target) / (uint64_t{1} << 30u),
+                static_cast<double>(workspace) / (uint64_t{1} << 30u));
+            return workspace > static_cast<uint64_t>(
+                                   std::numeric_limits<int64_t>::max())
+                       ? std::numeric_limits<int64_t>::max()
+                       : static_cast<int64_t>(workspace);
+          }
+        }
+      }
       return 0;
     }
     const uint64_t workspace = rss_target - retained - untracked_headroom;

@@ -30,6 +30,37 @@ def records(path):
 
 
 class LowMemoryPipelineTests(unittest.TestCase):
+    def test_streamed_mercy_overlay_keeps_bounded_direct_workspace(self):
+        with tempfile.TemporaryDirectory(prefix='megahit-stream-overlay-') as name:
+            temporary = Path(name)
+            binary = temporary / 'bin'
+            binary.mkdir()
+            shutil.copy2(ROOT / 'src/megahit', binary / 'megahit')
+            for executable in ('megahit_core', 'megahit_core_popcnt',
+                               'megahit_core_no_hw_accel', 'megahit_toolkit'):
+                (binary / executable).symlink_to(CORE)
+            output = temporary / 'assembly'
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(('MEGAHIT_', 'OMP_', 'GOMP_', 'KMP_'))}
+            # Force the retained mercy overlay above the synthetic RSS target.
+            # The streamed fixed edges must still use a bounded direct arena;
+            # compact locators cannot identify records in sequential chunks.
+            environment['MEGAHIT_SEQ2SDBG_RSS_TARGET_GIB'] = '0.001'
+            command = [sys.executable, str(binary / 'megahit'), '--12',
+                       str(ROOT / 'test_data/r1.il.fa.gz'), '--k-list', '21',
+                       '-t', '2', '-m', str(2 * 2**30), '--numa-node', 'off',
+                       '-o', str(output)]
+            run = subprocess.run(command, env=environment, capture_output=True,
+                                 text=True, timeout=60)
+            detail = run.stderr
+            log = ''
+            if (output / 'log').exists():
+                log = (output / 'log').read_text()
+                detail += log
+            self.assertEqual(run.returncode, 0, detail)
+            self.assertIn('bounded direct workspace', log)
+            self.assertTrue(records(output / 'final.contigs.fa'))
+
     def test_streamed_and_resident_budgets_preserve_exact_final_records(self):
         with tempfile.TemporaryDirectory(prefix='megahit-low-memory-') as name:
             temporary = Path(name)
