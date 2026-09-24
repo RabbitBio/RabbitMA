@@ -2701,14 +2701,43 @@ class IncrementalKReadGraph {
     return key;
   }
 
+  uint8_t CodeLastBase(uint32_t code, uint32_t kmer_size) const {
+    const CodeVertex &vertex = direct_topology_.vertices[code >> 1u];
+    // A unitig extension needs only the final base of this oriented k-mer.
+    // Read it from the representative sequence instead of rebuilding all k
+    // bases through CodeKmer() for every step of a long path.
+    const bool reverse =
+        (vertex.representative_reverse ^ (code & 1u)) != 0u;
+    const uint32_t position = vertex.representative_start +
+                              (reverse ? 0u : kmer_size - 1u);
+    uint8_t base;
+    if (vertex.representative_source == 0u) {
+      base = LocalPackedReads::PackedBase(
+          (*reads_)[vertex.representative_read].forward, position);
+    } else if (vertex.representative_source == 1u) {
+      if (endpoint_words_ == nullptr) {
+        throw std::logic_error("missing endpoint representative");
+      }
+      base = LocalPackedReads::PackedBase(endpoint_words_, position);
+    } else if (vertex.representative_source == 2u) {
+      if (previous_contigs_ == nullptr ||
+          vertex.representative_read >= previous_contigs_->size()) {
+        throw std::logic_error("missing previous-contig representative");
+      }
+      base = (*previous_contigs_)[vertex.representative_read][position];
+    } else {
+      throw std::logic_error("invalid direct-code representative source");
+    }
+    return reverse ? static_cast<uint8_t>(3u - base) : base;
+  }
+
   Sequence MaterializeUnitig(const CodeUnitig &unitig,
                              uint32_t kmer_size) const {
     if (unitig.path_begin >= unitig.path_end) return Sequence();
     Sequence sequence(CodeKmer(direct_topology_.path_codes[unitig.path_begin],
                                kmer_size));
     for (uint32_t i = unitig.path_begin + 1u; i < unitig.path_end; ++i) {
-      const IdbaKmer key = CodeKmer(direct_topology_.path_codes[i], kmer_size);
-      sequence += key[kmer_size - 1u];
+      sequence += CodeLastBase(direct_topology_.path_codes[i], kmer_size);
     }
     return sequence;
   }

@@ -567,7 +567,15 @@ void ContigGraph::MergeSimplePaths() {
     if (!failed) {
       if (code_state != nullptr) {
         code_state->merge_paths.emplace_back();
-        AssembleCodePath(path, *code_state, &code_state->merge_paths.back());
+        if (path.num_nodes() == 1u && !path[0].is_reverse()) {
+          // This vertex is already claimed by the successful walk. Preserve
+          // its unchanged code tape just as we preserve its sequence payload;
+          // later topology discovery does not read the code-path sidecar.
+          code_state->merge_paths.back().swap(
+              code_state->paths[path[0].id()]);
+        } else {
+          AssembleCodePath(path, *code_state, &code_state->merge_paths.back());
+        }
       }
       if (path.num_nodes() == 1u && !path[0].is_reverse()) {
         // The overwhelming common case after a sparse cleaning mutation is
@@ -951,8 +959,13 @@ int64_t ContigGraph::Assemble(vector<Sequence> &contigs,
     contig_infos.back().swap(contig_info);
     if (code_state != nullptr) {
       code_state->assembled_paths.emplace_back();
-      AssembleCodePath(path, *code_state,
-                       &code_state->assembled_paths.back());
+      if (path.num_nodes() == 1u && !path[0].is_reverse()) {
+        code_state->assembled_paths.back().swap(
+            code_state->paths[path[0].id()]);
+      } else {
+        AssembleCodePath(path, *code_state,
+                         &code_state->assembled_paths.back());
+      }
     }
   FAIL:;
   }
