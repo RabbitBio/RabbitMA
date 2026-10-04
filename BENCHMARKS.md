@@ -1,5 +1,51 @@
 # Benchmarks and validation
 
+## October 2026 read-index update: complete CAMI II runs
+
+All three complete CAMI II workloads were measured on October 3–4, 2026,
+using 128 threads, a fixed 215786124083-byte memory allowance (200.97 GiB),
+`--k-list 39,59,79,99,119,141`, and `--min-contig-len 200`. Each run started
+from the original interleaved gzip reads and built a fresh index. Local
+multi-order was disabled throughout. Input warming and output comparisons
+were outside the GNU time wall measurement; temporary files used the same
+filesystem, without forced cache eviction.
+The machine had two AMD EPYC 7T83 processors (128 physical cores total) and
+about 251 GiB of RAM.
+
+- **A:** main commit `d248826574e1a24b7659cc456b67b5938c54fad9`.
+- **B:** this read-index update, with parallel flank filters and fused anchor
+  extraction enabled by default; legacy compaction selected.
+- **C:** the same B executable, with
+  `MEGAHIT_EXPERIMENTAL_COMPACT_READ_PIPELINE=1`.
+
+Runs were serial, with order A/B/C for marine, B/C/A for plant-associated,
+and C/A/B for strain-madness. There was one run per configuration, so these
+are observed timings, not replicated estimates of a universal speedup.
+Wall times below use minutes:seconds.
+
+| Dataset | A wall | B wall | C wall | C wall reduction vs A | Peak RSS A / B / C (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Marine | 24:41 | 24:24 | 23:25 | 5.13% | 33.92 / 33.94 / 33.92 |
+| Plant-associated | 56:59 | 58:02 | 55:23 | 2.81% | 78.19 / 78.14 / 78.65 |
+| Strain-madness | 97:57 | 94:27 | 92:38 | 5.44% | 92.75 / 93.04 / 92.40 |
+
+All nine runs succeeded without an indexed-iterate fallback. Every pair of
+final contig sequence multisets matched exactly after strand normalization,
+including duplicate multiplicity. Comparisons sorted complete sequence
+strings; FASTA headers were excluded. This was not a new reference-based
+assembly-quality evaluation.
+
+Query preparation fell from A to B on every dataset: marine 33.33 to 15.96 s,
+plant 96.05 to 49.58 s, and strain 329.67 to 158.86 s. Nevertheless, B's plant
+end-to-end time was 1.85% higher; variation in other phases matters.
+
+The compact option remains experimental. Its own stage fell from B's
+322.14 s to C's 130.88 s on strain, while rising from 2.62 to 9.20 s on marine
+and from 7.18 to 27.33 s on plant. Metadata/close/temporary-cleanup time also
+varied substantially, so the complete-run changes must not all be attributed
+to faster compact computation. Thread-seconds for compact read, compute and
+output overlap across workers and are not additive wall time.
+
 ## CAMI III reference measurement
 
 The reference workload used all 20 short-read samples from the CAMI III Toy
@@ -64,13 +110,23 @@ still retain the exact fallback path and are reported as `status=fallback`.
 
 ## Scaling policy
 
+Routine optimization work uses focused correctness tests and bounded phase
+replays on fixed inputs, usually taking seconds to minutes. Reuse existing
+phase inputs and baseline results when the measured path has not changed.
+Do not automatically launch complete datasets after each kernel change or
+small percentage improvement. Batch related improvements before a planned
+release or architecture milestone, or run the full suite when explicitly
+requested. A focused integration check should answer a specific unresolved
+correctness, memory or scaling question before expanding to all workloads.
+
 Use the 1-million-pair CAMI2 strain-madness subset only for fast correctness
 and mechanism checks. Compare final and per-k contigs with metadata and
 circular equivalence before promoting a change to performance experiments.
 Do not use its speedup or phase percentages to rank large-data work.
 
-Performance decisions use nested inputs derived once from the same complete
-CAMI III workload at approximately 1%, 5%, 10%, 25%, 50%, and 100%. Input
+When a scaling study is needed, use nested inputs derived once from the same
+complete workload at approximately 1%, 5%, 10%, 25%, 50%, and 100%; this is
+not a mandatory sweep for each change. Input
 preparation is outside the timed run; record each input's byte count, read-pair
 count, base count, and SHA-256 digest. Keep the k schedule, thread placement,
 memory policy, software build, and storage path fixed across the curve.

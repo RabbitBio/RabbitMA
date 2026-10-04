@@ -257,11 +257,25 @@ adaptive optimizations use the existing command-line interface. Additional
 are not a claim about default performance on every input or machine. The
 per-NUMA SDBG replica prototype that failed to show a useful gain is excluded.
 
+`MEGAHIT_EXPERIMENTAL_COMPACT_READ_PIPELINE=1` enables bounded, adjacent-bucket
+reads during read-index compaction. Contiguous temporary extents are scattered
+directly into bucket buffers while the preceding wave is compacted. It keeps
+the index format and exact postings unchanged and charges prefetched buffers
+against the existing compact memory budget. It remains opt-in: fragmented disk
+reads can benefit substantially, while small cached builds can be slower and
+prefetching increases resident memory.
+
+Active-query extraction shares the forward/reverse rolling anchor scan when
+the query covers the full flank, and constructs window-filter keys directly
+from packed words. Shorter query windows still use the two distinct flank
+ends. Anchor rank, right-most tie selection, context bits and index format
+are unchanged.
+
 For source regression tests, use Python 3.8 or newer after building:
 
 ```bash
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
-cmake --build build --target check_stream_stores check_local_minimizer_gate
+cmake --build build --target check_stream_stores check_local_minimizer_gate check_flank_filters check_coalesced_reads check_query_anchor
 ```
 
 `MEGAHIT_TEST_CORE=/path/to/megahit_core_popcnt` (or the portable variant)

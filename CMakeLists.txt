@@ -178,6 +178,21 @@ add_custom_target(check_stream_stores
         COMMAND $<TARGET_FILE:test_stream_store_fallback>
         DEPENDS test_stream_store test_stream_store_fallback)
 
+add_executable(test_flank_filters EXCLUDE_FROM_ALL tests/flank_filters.cpp)
+add_custom_target(check_flank_filters
+        COMMAND $<TARGET_FILE:test_flank_filters>
+        DEPENDS test_flank_filters)
+
+add_executable(test_coalesced_reads EXCLUDE_FROM_ALL tests/coalesced_reads.cpp)
+add_custom_target(check_coalesced_reads
+        COMMAND $<TARGET_FILE:test_coalesced_reads>
+        DEPENDS test_coalesced_reads)
+
+add_executable(test_query_anchor EXCLUDE_FROM_ALL tests/query_anchor.cpp)
+add_custom_target(check_query_anchor
+        COMMAND $<TARGET_FILE:test_query_anchor>
+        DEPENDS test_query_anchor)
+
 add_executable(test_local_minimizer_gate EXCLUDE_FROM_ALL
         tests/local_minimizer_gate.cpp
         src/localasm/hash_mapper.cpp

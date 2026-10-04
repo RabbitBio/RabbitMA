@@ -100,9 +100,15 @@ class ContigFlankIndex {
       words_.assign(num_words, 0);
       word_mask_ = num_words - 1;
 
-      for (const auto &shard : shards) {
-        for (const auto &entry : shard.primary) {
+      // The exact-key shards have disjoint readers, but Bloom words are
+      // shared across shards. Atomic OR preserves every bit without allocating
+      // a full (potentially GiB-sized) filter per worker. Queries start only
+      // after the parallel loop's implicit barrier.
+#pragma omp parallel for schedule(dynamic, 1)
+      for (size_t shard = 0; shard < shards.size(); ++shard) {
+        for (const auto &entry : shards[shard].primary) {
           const size_t hash = FilterHash(entry.first);
+#pragma omp atomic update
           words_[hash & word_mask_] |= BitMask(hash);
         }
       }
@@ -170,8 +176,9 @@ class ContigFlankIndex {
       words_.assign(num_words, 0);
       word_mask_ = num_words - 1u;
 
-      for (const HashShard &shard : shards) {
-        for (const auto &entry : shard.primary) {
+#pragma omp parallel for schedule(dynamic, 1)
+      for (size_t shard = 0; shard < shards.size(); ++shard) {
+        for (const auto &entry : shards[shard].primary) {
           Add(PrefixOf(entry.first, prefix_len_));
           KmerType reverse = entry.first;
           reverse.ReverseComplement(kmer_length);
@@ -218,6 +225,7 @@ class ContigFlankIndex {
 
     void Add(uint64_t prefix) {
       const uint64_t hash = Hash(prefix);
+#pragma omp atomic update
       words_[hash & word_mask_] |= BitMask(hash);
     }
 

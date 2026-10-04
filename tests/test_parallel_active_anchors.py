@@ -10,6 +10,7 @@ import unittest
 
 CORE = Path(os.environ.get(
     'MEGAHIT_TEST_CORE', Path(__file__).resolve().parents[1] / 'build/megahit_core'))
+REFERENCE_CORE = os.environ.get('MEGAHIT_REFERENCE_CORE')
 
 
 def edges(prefix):
@@ -40,13 +41,15 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
             config.write_text('reads\nse ' + str(fasta) + '\n')
             lib = root / 'reads.lib'
 
-            def run(command, parallel=False, direct=False):
+            def run(command, parallel=False, direct=False, pipeline=False, core=CORE):
                 env = {k: v for k, v in os.environ.items() if not k.startswith('MEGAHIT_')}
                 if parallel:
                     env['MEGAHIT_EXPERIMENTAL_PARALLEL_ACTIVE_ANCHORS'] = '1'
                 if direct:
                     env['MEGAHIT_EXPERIMENTAL_DIRECT_ITERATE_WINDOWS'] = '1'
-                result = subprocess.run([str(CORE)] + list(map(str, command)),
+                if pipeline:
+                    env['MEGAHIT_EXPERIMENTAL_COMPACT_READ_PIPELINE'] = '1'
+                result = subprocess.run([str(core)] + list(map(str, command)),
                                         env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return result.stderr
@@ -55,8 +58,10 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
             bubble = root / 'bubble.fa'
             bubble.write_text('')
             Path(str(bubble) + '.info').write_text('0 0\n')
-            for k, step in ((39, 10), (63, 10), (119, 10), (139, 2)):
-                with self.subTest(k=k):
+            for k, step, anchor, window in ((39, 10, 19, 40), (39, 10, 21, 40),
+                                             (63, 10, 31, 64), (119, 10, 19, 40),
+                                             (139, 2, 19, 40)):
+                with self.subTest(k=k, anchor=anchor, window=window):
                     contig = root / f'k{k}.fa'
                     sequences = [g[600:1000] for g in genomes]
                     sequences += [g[600 + step:1000 + step] for g in genomes]
@@ -68,15 +73,15 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
                     Path(str(contig) + '.info').write_text(f'{len(sequences)} {sum(map(len,sequences))}\n')
                     outputs = []
                     serial_prefix = None
-                    for mode in ('serial', 'parallel', 'direct'):
-                        prefix = root / f'{k}-{mode}'
-                        common = ['-r', str(lib) + '.bin', '-a', 19, '-w', 40,
+                    for mode in ('serial', 'parallel', 'direct', 'pipeline'):
+                        prefix = root / f'{k}-{anchor}-{mode}'
+                        common = ['-r', str(lib) + '.bin', '-a', anchor, '-w', window,
                                   '-c', contig, '-b', bubble, '-k', k, '-s', step,
                                   '-t', 4, '-m', 1000000000]
                         run(['read-index', '-o', prefix, '-e', str(prefix) + '-build'] + common,
-                            mode != 'serial', mode == 'direct')
+                            mode != 'serial', mode == 'direct', mode == 'pipeline')
                         run(['read-index', '--index_prefix', prefix, '-e', str(prefix) + '-replay'] + common,
-                            mode != 'serial', mode == 'direct')
+                            mode != 'serial', mode == 'direct', mode == 'pipeline')
                         built = edges(str(prefix) + '-build')
                         replayed = edges(str(prefix) + '-replay')
                         self.assertTrue(built)
@@ -86,6 +91,17 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
                             serial_prefix = prefix
                     for output in outputs[1:]:
                         self.assertEqual(outputs[0], output)
+
+                    if REFERENCE_CORE:
+                        reference = root / f'{k}-{anchor}-reference'
+                        run(['read-index', '-o', reference,
+                             '-e', str(reference) + '-build'] + common,
+                            core=REFERENCE_CORE)
+                        run(['read-index', '--index_prefix', reference,
+                             '-e', str(reference) + '-replay'] + common,
+                            core=REFERENCE_CORE)
+                        self.assertEqual(outputs[0], edges(str(reference) + '-build'))
+                        self.assertEqual(outputs[0], edges(str(reference) + '-replay'))
 
                     # Force total replay candidates above the resident budget.
                     # Read-order waves must preserve the exact edge multiset
@@ -97,6 +113,19 @@ class ParallelActiveAnchorsTest(unittest.TestCase):
                                '-e', chunked_prefix] + chunked_common)
                     self.assertIn('status=chunked reason=bounded_replay', log)
                     self.assertEqual(outputs[0], edges(chunked_prefix))
+
+                    if k == 39:
+                        # One large bucket must run alone when the requested
+                        # budget is tiny, including a single-worker build.
+                        for threads in (1, 4):
+                            constrained = list(chunked_common)
+                            constrained[constrained.index('-t') + 1] = threads
+                            prefix = root / f'pipeline-low-memory-{threads}'
+                            log = run(['read-index', '-o', prefix,
+                                       '-e', str(prefix) + '-build'] + constrained,
+                                      pipeline=True)
+                            self.assertIn('Compact read pipeline:', log)
+                            self.assertEqual(outputs[0], edges(str(prefix) + '-build'))
 
 
 if __name__ == '__main__':

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -37,6 +38,7 @@
 
 #include "iterate/contig_flank_index.h"
 #include "iterate/kmer_collector.h"
+#include "iterate/query_anchor.h"
 #include "kmlib/kmsort.h"
 #include "localasm/hash_mapper.h"
 #include "parallel_hashmap/phmap.h"
@@ -45,6 +47,7 @@
 #include "sequence/io/read_anchor_positions.h"
 #include "sequence/io/read_chunk_index.h"
 #include "sequence/sequence_package.h"
+#include "utils/coalesced_reads.h"
 #include "utils/mutex.h"
 #include "utils/options_description.h"
 #include "utils/startup_affinity.h"
@@ -905,50 +908,7 @@ void ProfileRead(const uint32_t *sequence, unsigned length,
   }
 }
 
-struct SelectedAnchor {
-  uint64_t key;
-  unsigned offset;
-  uint8_t context;
-};
-
-template <class KmerType>
-SelectedAnchor SelectQueryAnchor(const KmerType &kmer,
-                                 const ReadIndexOptions &options,
-                                 unsigned context_bits,
-                                 unsigned context_distance) {
-  const uint64_t key_mask =
-      (uint64_t{1} << (2u * options.anchor_len)) - 1u;
-  uint64_t key = 0;
-  uint64_t selected_key = 0;
-  unsigned selected_offset = 0;
-  uint64_t selected_hash = std::numeric_limits<uint64_t>::max();
-  for (unsigned i = 0; i < options.window_len; ++i) {
-    key = ((key << 2u) | kmer.GetBase(i)) & key_mask;
-    if (i + 1u < options.anchor_len) {
-      continue;
-    }
-    const uint64_t hash = AnchorHash(key);
-    // Match the read-side minimizer's right-most tie breaking.
-    if (hash <= selected_hash) {
-      selected_hash = hash;
-      selected_key = key;
-      selected_offset = i + 1u - options.anchor_len;
-    }
-  }
-  uint8_t context = 0u;
-  if (context_bits >= 2u && selected_offset >= context_distance) {
-    context |= kmer.GetBase(selected_offset - context_distance);
-  }
-  if (context_bits >= 4u &&
-      selected_offset + options.anchor_len + context_distance <=
-          options.window_len) {
-    context |= static_cast<uint8_t>(
-        kmer.GetBase(selected_offset + options.anchor_len +
-                     context_distance - 1u)
-        << 2u);
-  }
-  return SelectedAnchor{selected_key, selected_offset, context};
-}
+using query_anchor::SelectedAnchor;
 
 struct PreparedFlankIndexBase {
   virtual ~PreparedFlankIndexBase() = default;
@@ -1020,29 +980,18 @@ bool BuildActiveQueriesForType(const ReadIndexOptions &options,
     else windows->Add(window);
   };
   const auto extract = [&](const KmerType &canonical) {
-    const SelectedAnchor forward =
-        SelectQueryAnchor(canonical, options, queries->context_bits(),
-                          queries->context_distance());
-    add_anchor(forward);
-    if (windows != nullptr) {
-      AnchorWindow window;
-      for (unsigned i = 0; i < options.window_len; ++i) {
-        window.ShiftAppend(canonical.GetBase(i), options.window_len);
-      }
-      add_window(window);
-    }
     KmerType reverse = canonical;
     reverse.ReverseComplement(options.kmer_k + 1u);
-    const SelectedAnchor backward =
-        SelectQueryAnchor(reverse, options, queries->context_bits(),
-                          queries->context_distance());
-    add_anchor(backward);
+    const auto anchors = query_anchor::SelectPair(
+        canonical, reverse, options.kmer_k + 1u, options.anchor_len,
+        options.window_len, queries->context_bits(), queries->context_distance());
+    add_anchor(anchors[0]);
     if (windows != nullptr) {
-      AnchorWindow window;
-      for (unsigned i = 0; i < options.window_len; ++i) {
-        window.ShiftAppend(reverse.GetBase(i), options.window_len);
-      }
-      add_window(window);
+      add_window(query_anchor::PackedWindow(canonical, options.window_len));
+    }
+    add_anchor(anchors[1]);
+    if (windows != nullptr) {
+      add_window(query_anchor::PackedWindow(reverse, options.window_len));
     }
   };
   if (parallel_anchors) {
@@ -1518,23 +1467,23 @@ class CompactMemoryLimiter {
   explicit CompactMemoryLimiter(uint64_t budget)
       : budget_(std::max<uint64_t>(1, budget)) {}
 
-  uint64_t Acquire(uint64_t requested) {
+  uint64_t Acquire(uint64_t requested, unsigned tasks = 1) {
     const uint64_t charged = std::min(requested, budget_);
     std::unique_lock<std::mutex> lock(mutex_);
     ready_.wait(lock, [&] { return charged <= budget_ - used_; });
     used_ += charged;
     peak_used_ = std::max(peak_used_, used_);
-    ++active_workers_;
+    active_workers_ += tasks;
     peak_workers_ = std::max(peak_workers_, active_workers_);
     return charged;
   }
 
-  void Release(uint64_t charged) {
+  void Release(uint64_t charged, unsigned tasks = 1) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      assert(charged <= used_ && active_workers_ != 0);
+      assert(charged <= used_ && active_workers_ >= tasks);
       used_ -= charged;
-      --active_workers_;
+      active_workers_ -= tasks;
     }
     ready_.notify_all();
   }
@@ -1554,9 +1503,11 @@ class CompactMemoryLimiter {
 
 class CompactMemoryLease {
  public:
-  CompactMemoryLease(CompactMemoryLimiter *limiter, uint64_t requested)
-      : limiter_(limiter), charged_(limiter->Acquire(requested)) {}
-  ~CompactMemoryLease() { limiter_->Release(charged_); }
+  CompactMemoryLease(CompactMemoryLimiter *limiter, uint64_t requested,
+                     unsigned tasks = 1)
+      : limiter_(limiter), charged_(limiter->Acquire(requested, tasks)),
+        tasks_(tasks) {}
+  ~CompactMemoryLease() { limiter_->Release(charged_, tasks_); }
 
   CompactMemoryLease(const CompactMemoryLease &) = delete;
   CompactMemoryLease &operator=(const CompactMemoryLease &) = delete;
@@ -1564,6 +1515,7 @@ class CompactMemoryLease {
  private:
   CompactMemoryLimiter *limiter_;
   uint64_t charged_;
+  unsigned tasks_;
 };
 
 struct ReadIndexBucketMeta {
@@ -5412,368 +5364,533 @@ void RunIndexBuild(const ReadIndexOptions &options) {
   std::atomic<uint64_t> compact_read_calls(0);
   std::atomic<uint64_t> compact_read_bytes(0);
   CompactMemoryLimiter compact_memory_limiter(task_memory_budget);
+
+  // A flush interleaves all buckets in physical order. Reading one bucket
+  // at a time turns that layout into many small, competing preads. Adjacent
+  // bucket waves can scatter each contiguous run with one preadv instead.
+  // Only one wave computes and at most one wave is prefetched. Reserve the
+  // current wave's workspace BEFORE admitting the next wave's raw buffers;
+  // otherwise readers can exhaust the budget while waiting for workspace.
+  const bool compact_read_pipeline =
+      std::getenv("MEGAHIT_EXPERIMENTAL_COMPACT_READ_PIPELINE") != nullptr;
+  struct CompactWavePlan {
+    unsigned begin;
+    unsigned end;
+    uint64_t memory;
+    uint64_t raw_memory;
+  };
+  struct LoadedCompactWave {
+    // Destroy the buffers before returning their memory reservation.
+    std::unique_ptr<CompactMemoryLease> lease;
+    std::unique_ptr<CompactMemoryLease> workspace;
+    unsigned begin;
+    std::vector<std::vector<uint8_t>> records;
+    std::vector<unsigned> order;
+  };
+  std::vector<CompactWavePlan> compact_waves;
+  if (compact_read_pipeline) {
+    for (unsigned begin = 0; begin < num_index_buckets;) {
+      unsigned end = begin;
+      uint64_t memory = 0;
+      uint64_t raw_memory = 0;
+      while (end < num_index_buckets && end - begin < unsigned(num_threads)) {
+        const uint64_t needed = compact_task_memory[end];
+        const uint64_t raw = saturated_multiply(
+            bucket_offsets[end + 1] - bucket_offsets[end],
+            temporary_record_bytes);
+        // Leave room for raw data from a similarly sized following wave.
+        // Uneven waves get an exact overlap check at dispatch time below.
+        if (end != begin &&
+            saturated_add(saturated_add(memory, needed),
+                          saturated_add(raw_memory, raw)) > task_memory_budget) {
+          break;
+        }
+        memory = saturated_add(memory, needed);
+        raw_memory = saturated_add(raw_memory, raw);
+        ++end;
+      }
+      compact_waves.push_back(CompactWavePlan{begin, end, memory, raw_memory});
+      begin = end;
+    }
+  }
+  const int compact_read_threads = std::max<int>(
+      1, std::min<int>(num_temporary_files, num_threads / 2));
+  const auto load_compact_wave = [&](const CompactWavePlan &plan)
+      -> std::unique_ptr<LoadedCompactWave> {
+    try {
+      std::unique_ptr<LoadedCompactWave> wave(new LoadedCompactWave);
+      wave->lease.reset(new CompactMemoryLease(
+          &compact_memory_limiter, plan.raw_memory, 0));
+      wave->begin = plan.begin;
+      wave->records.resize(plan.end - plan.begin);
+      std::vector<std::vector<PositionedRead>> file_reads(num_temporary_files);
+      for (unsigned bucket = plan.begin; bucket < plan.end; ++bucket) {
+        const uint64_t count =
+            bucket_offsets[bucket + 1] - bucket_offsets[bucket];
+        if (count > std::numeric_limits<size_t>::max() / temporary_record_bytes) {
+          throw std::length_error("compact bucket exceeds addressable memory");
+        }
+        auto &records = wave->records[bucket - plan.begin];
+        records.resize(size_t(count) * temporary_record_bytes);
+        size_t offset = 0;
+        for (const BucketExtent &extent : bucket_writers[bucket].extents) {
+          if (extent.records >
+                  (records.size() - offset) / temporary_record_bytes ||
+              extent.file_id >= file_reads.size()) {
+            throw std::runtime_error("invalid compact bucket extent");
+          }
+          const size_t bytes = size_t(extent.records) * temporary_record_bytes;
+          if (bytes != 0) {
+            file_reads[extent.file_id].push_back(PositionedRead{
+                extent.byte_offset, bytes, records.data() + offset});
+          }
+          offset += bytes;
+        }
+        if (offset != records.size()) {
+          throw std::runtime_error("incomplete compact bucket extents");
+        }
+        wave->order.push_back(bucket);
+      }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(compact_read_threads)
+      for (unsigned file = 0; file < num_temporary_files; ++file) {
+        const uint64_t read_begin = ClockNanoseconds(CLOCK_MONOTONIC);
+        CoalescedReadStats stats;
+        if (!ReadCoalescedExtents(temporary_fds[file], &file_reads[file], &stats)) {
+          compact_ok.store(false, std::memory_order_relaxed);
+        }
+        compact_read_nanos.fetch_add(
+            ClockNanoseconds(CLOCK_MONOTONIC) - read_begin,
+            std::memory_order_relaxed);
+        compact_read_calls.fetch_add(stats.calls, std::memory_order_relaxed);
+        compact_read_bytes.fetch_add(stats.bytes, std::memory_order_relaxed);
+      }
+      // I/O visits adjacent bucket IDs; compute still handles the largest
+      // admitted buckets first. Every byte stays in its original bucket and
+      // extent order, so the existing CSR construction is unchanged.
+      std::sort(wave->order.begin(), wave->order.end(),
+                [&](unsigned a, unsigned b) {
+                  return compact_task_memory[a] > compact_task_memory[b];
+                });
+      return wave;
+    } catch (const std::exception &error) {
+      xwarn("Compact read pipeline: {}\n", error.what());
+      compact_ok.store(false, std::memory_order_relaxed);
+      return nullptr;
+    }
+  };
   SimpleTimer compact_timer;
   const double compact_cpu_begin = ProcessCpuSeconds();
   finalize_timer.stop();
   compact_timer.start();
-#pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
-  for (int task_id = 0; task_id < static_cast<int>(num_index_buckets);
-       ++task_id) {
-    if (!compact_ok.load(std::memory_order_relaxed)) {
-      continue;
-    }
-    const unsigned bucket = compact_order[static_cast<size_t>(task_id)];
-    CompactMemoryLease memory_lease(&compact_memory_limiter,
-                                    compact_task_memory[bucket]);
-    const uint64_t count =
-        bucket_offsets[bucket + 1u] - bucket_offsets[bucket];
-    if (count > std::numeric_limits<size_t>::max() /
-                    temporary_record_bytes) {
-      compact_ok.store(false, std::memory_order_relaxed);
-      continue;
-    }
-    std::vector<uint8_t> packed_records(
-        static_cast<size_t>(count) * temporary_record_bytes);
-    const uint64_t read_begin = ClockNanoseconds(CLOCK_MONOTONIC);
-    uint64_t task_read_calls = 0;
-    uint64_t task_read_bytes = 0;
-    size_t packed_offset = 0;
-    for (const BucketExtent &extent : bucket_writers[bucket].extents) {
-      const size_t extent_bytes =
-          static_cast<size_t>(extent.records) * temporary_record_bytes;
-      ++task_read_calls;
-      task_read_bytes += extent_bytes;
-      if (extent_bytes > packed_records.size() - packed_offset ||
-          extent.file_id >= temporary_fds.size() ||
-          !PreadFully(temporary_fds[extent.file_id],
-                      packed_records.data() + packed_offset, extent_bytes,
-                      extent.byte_offset)) {
+  const auto compact_buckets = [&](const std::vector<unsigned> &order,
+                                   LoadedCompactWave *loaded, int workers) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+    for (int task_id = 0; task_id < static_cast<int>(order.size());
+         ++task_id) {
+      if (!compact_ok.load(std::memory_order_relaxed)) {
+        continue;
+      }
+      const unsigned bucket = order[static_cast<size_t>(task_id)];
+      std::unique_ptr<CompactMemoryLease> memory_lease;
+      if (loaded == nullptr) {
+        memory_lease.reset(new CompactMemoryLease(
+            &compact_memory_limiter, compact_task_memory[bucket]));
+      }
+      const uint64_t count =
+          bucket_offsets[bucket + 1u] - bucket_offsets[bucket];
+      if (count > std::numeric_limits<size_t>::max() /
+                      temporary_record_bytes) {
         compact_ok.store(false, std::memory_order_relaxed);
-        break;
+        continue;
       }
-      packed_offset += extent_bytes;
-    }
-    compact_read_nanos.fetch_add(
-        ClockNanoseconds(CLOCK_MONOTONIC) - read_begin,
-        std::memory_order_relaxed);
-    compact_read_calls.fetch_add(task_read_calls, std::memory_order_relaxed);
-    compact_read_bytes.fetch_add(task_read_bytes, std::memory_order_relaxed);
-    if (!compact_ok.load(std::memory_order_relaxed) ||
-        packed_offset != packed_records.size()) {
-      compact_ok.store(false, std::memory_order_relaxed);
-      continue;
-    }
-    const auto load_temporary_locator = [&](const uint8_t *source) {
-      return LoadLowBytes(source + temporary_key_bytes, locator_bytes);
-    };
-    const auto load_temporary_key = [&](const uint8_t *source) {
-      const uint64_t low = LoadLowBytes(source, temporary_key_bytes);
-      if (temporary_key_extra_bits == 0) return low;
-      return low |
-             (((load_temporary_locator(source) >> locator_bits) &
-               LowBitMask(temporary_key_extra_bits))
-              << temporary_key_bits);
-    };
-    const auto load_final_locator = [&](const uint8_t *source) {
-      const uint64_t temporary = load_temporary_locator(source);
-      const uint64_t context =
-          (temporary >> (locator_bits + temporary_key_extra_bits)) &
-          locator_context_mask;
-      return (temporary & locator_mask) | (context << locator_bits);
-    };
-    // RabbitTClust's CSR construction is the right join order here: count
-    // unique keys first, sort only that compact key set, then fill one flat
-    // postings array.  The old path radix-sorted every occurrence even though
-    // most records share a key (7.03B occurrences versus 618M keys on CAMI).
-    phmap::flat_hash_map<uint64_t, uint64_t> key_counts;
-    std::vector<uint64_t> keys;
-    std::vector<uint32_t> group_counts;
-    std::vector<size_t> partition_offsets;
-    std::vector<size_t> partition_group_offsets;
-    std::vector<uint64_t> direct_table;
-    const uint64_t count_begin = ClockNanoseconds(CLOCK_MONOTONIC);
-    const bool use_direct_partition =
-        directory_key_bits > 16u && directory_key_bits <= 28u &&
-        count >= (uint64_t{1} << 16u);
-    if (use_direct_partition) {
-      // One stable high-bit partition turns two global random hash probes per
-      // occurrence into direct accesses to a 16-bit table that fits in cache.
-      // Within each high partition, sorting only the touched low keys emits
-      // globally ordered directory keys without sorting all occurrences.
-      constexpr unsigned kDirectLowBits = 16u;
-      constexpr uint64_t kDirectLowMask = (uint64_t{1} << kDirectLowBits) - 1u;
-      const unsigned partition_bits = directory_key_bits - kDirectLowBits;
-      const size_t num_partitions = size_t{1} << partition_bits;
-      partition_offsets.assign(num_partitions + 1u, 0);
-      for (size_t record = 0;
-           record < packed_records.size() / temporary_record_bytes; ++record) {
-        const uint8_t *source =
-            packed_records.data() + record * temporary_record_bytes;
-        const size_t partition = static_cast<size_t>(
-            load_temporary_key(source) >> kDirectLowBits);
-        ++partition_offsets[partition + 1u];
+      std::vector<uint8_t> packed_records;
+      if (loaded != nullptr) {
+        packed_records.swap(loaded->records[bucket - loaded->begin]);
+      } else {
+        packed_records.resize(
+            static_cast<size_t>(count) * temporary_record_bytes);
+        const uint64_t read_begin = ClockNanoseconds(CLOCK_MONOTONIC);
+        uint64_t task_read_calls = 0;
+        uint64_t task_read_bytes = 0;
+        size_t packed_offset = 0;
+        for (const BucketExtent &extent : bucket_writers[bucket].extents) {
+          const size_t extent_bytes =
+              static_cast<size_t>(extent.records) * temporary_record_bytes;
+          ++task_read_calls;
+          task_read_bytes += extent_bytes;
+          if (extent_bytes > packed_records.size() - packed_offset ||
+              extent.file_id >= temporary_fds.size() ||
+              !PreadFully(temporary_fds[extent.file_id],
+                          packed_records.data() + packed_offset, extent_bytes,
+                          extent.byte_offset)) {
+            compact_ok.store(false, std::memory_order_relaxed);
+            break;
+          }
+          packed_offset += extent_bytes;
+        }
+        compact_read_nanos.fetch_add(
+            ClockNanoseconds(CLOCK_MONOTONIC) - read_begin,
+            std::memory_order_relaxed);
+        compact_read_calls.fetch_add(task_read_calls, std::memory_order_relaxed);
+        compact_read_bytes.fetch_add(task_read_bytes, std::memory_order_relaxed);
+        if (!compact_ok.load(std::memory_order_relaxed) ||
+            packed_offset != packed_records.size()) {
+          compact_ok.store(false, std::memory_order_relaxed);
+          continue;
+        }
       }
-      for (size_t partition = 0; partition < num_partitions; ++partition) {
-        partition_offsets[partition + 1u] += partition_offsets[partition];
-      }
-      std::vector<size_t> partition_cursors = partition_offsets;
-      std::vector<uint8_t> partitioned_records(packed_records.size());
-      for (size_t record = 0;
-           record < packed_records.size() / temporary_record_bytes; ++record) {
-        const uint8_t *source =
-            packed_records.data() + record * temporary_record_bytes;
-        const size_t partition = static_cast<size_t>(
-            load_temporary_key(source) >> kDirectLowBits);
-        const size_t destination = partition_cursors[partition]++;
-        std::memcpy(partitioned_records.data() +
-                        destination * temporary_record_bytes,
-                    source, temporary_record_bytes);
-      }
-      packed_records.swap(partitioned_records);
-      std::vector<uint8_t>().swap(partitioned_records);
-      std::vector<size_t>().swap(partition_cursors);
-
-      direct_table.assign(size_t{1} << kDirectLowBits, 0);
-      std::vector<uint32_t> touched;
-      touched.reserve(size_t{1} << kDirectLowBits);
-      keys.reserve(static_cast<size_t>(std::min<uint64_t>(
-          unique_capacity[bucket], std::numeric_limits<size_t>::max())));
-      group_counts.reserve(keys.capacity());
-      partition_group_offsets.resize(num_partitions + 1u, 0);
-      for (size_t partition = 0; partition < num_partitions; ++partition) {
-        partition_group_offsets[partition] = keys.size();
-        touched.clear();
-        for (size_t record = partition_offsets[partition];
-             record < partition_offsets[partition + 1u]; ++record) {
+      const auto load_temporary_locator = [&](const uint8_t *source) {
+        return LoadLowBytes(source + temporary_key_bytes, locator_bytes);
+      };
+      const auto load_temporary_key = [&](const uint8_t *source) {
+        const uint64_t low = LoadLowBytes(source, temporary_key_bytes);
+        if (temporary_key_extra_bits == 0) return low;
+        return low |
+               (((load_temporary_locator(source) >> locator_bits) &
+                 LowBitMask(temporary_key_extra_bits))
+                << temporary_key_bits);
+      };
+      const auto load_final_locator = [&](const uint8_t *source) {
+        const uint64_t temporary = load_temporary_locator(source);
+        const uint64_t context =
+            (temporary >> (locator_bits + temporary_key_extra_bits)) &
+            locator_context_mask;
+        return (temporary & locator_mask) | (context << locator_bits);
+      };
+      // RabbitTClust's CSR construction is the right join order here: count
+      // unique keys first, sort only that compact key set, then fill one flat
+      // postings array.  The old path radix-sorted every occurrence even though
+      // most records share a key (7.03B occurrences versus 618M keys on CAMI).
+      phmap::flat_hash_map<uint64_t, uint64_t> key_counts;
+      std::vector<uint64_t> keys;
+      std::vector<uint32_t> group_counts;
+      std::vector<size_t> partition_offsets;
+      std::vector<size_t> partition_group_offsets;
+      std::vector<uint64_t> direct_table;
+      const uint64_t count_begin = ClockNanoseconds(CLOCK_MONOTONIC);
+      const bool use_direct_partition =
+          directory_key_bits > 16u && directory_key_bits <= 28u &&
+          count >= (uint64_t{1} << 16u);
+      if (use_direct_partition) {
+        // One stable high-bit partition turns two global random hash probes per
+        // occurrence into direct accesses to a 16-bit table that fits in cache.
+        // Within each high partition, sorting only the touched low keys emits
+        // globally ordered directory keys without sorting all occurrences.
+        constexpr unsigned kDirectLowBits = 16u;
+        constexpr uint64_t kDirectLowMask = (uint64_t{1} << kDirectLowBits) - 1u;
+        const unsigned partition_bits = directory_key_bits - kDirectLowBits;
+        const size_t num_partitions = size_t{1} << partition_bits;
+        partition_offsets.assign(num_partitions + 1u, 0);
+        for (size_t record = 0;
+             record < packed_records.size() / temporary_record_bytes; ++record) {
           const uint8_t *source =
               packed_records.data() + record * temporary_record_bytes;
-          const uint32_t low = static_cast<uint32_t>(
-              load_temporary_key(source) & kDirectLowMask);
-          if (direct_table[low] == 0) touched.push_back(low);
-          if (direct_table[low] == std::numeric_limits<uint32_t>::max()) {
+          const size_t partition = static_cast<size_t>(
+              load_temporary_key(source) >> kDirectLowBits);
+          ++partition_offsets[partition + 1u];
+        }
+        for (size_t partition = 0; partition < num_partitions; ++partition) {
+          partition_offsets[partition + 1u] += partition_offsets[partition];
+        }
+        std::vector<size_t> partition_cursors = partition_offsets;
+        std::vector<uint8_t> partitioned_records(packed_records.size());
+        for (size_t record = 0;
+             record < packed_records.size() / temporary_record_bytes; ++record) {
+          const uint8_t *source =
+              packed_records.data() + record * temporary_record_bytes;
+          const size_t partition = static_cast<size_t>(
+              load_temporary_key(source) >> kDirectLowBits);
+          const size_t destination = partition_cursors[partition]++;
+          std::memcpy(partitioned_records.data() +
+                          destination * temporary_record_bytes,
+                      source, temporary_record_bytes);
+        }
+        packed_records.swap(partitioned_records);
+        std::vector<uint8_t>().swap(partitioned_records);
+        std::vector<size_t>().swap(partition_cursors);
+
+        direct_table.assign(size_t{1} << kDirectLowBits, 0);
+        std::vector<uint32_t> touched;
+        touched.reserve(size_t{1} << kDirectLowBits);
+        keys.reserve(static_cast<size_t>(std::min<uint64_t>(
+            unique_capacity[bucket], std::numeric_limits<size_t>::max())));
+        group_counts.reserve(keys.capacity());
+        partition_group_offsets.resize(num_partitions + 1u, 0);
+        for (size_t partition = 0; partition < num_partitions; ++partition) {
+          partition_group_offsets[partition] = keys.size();
+          touched.clear();
+          for (size_t record = partition_offsets[partition];
+               record < partition_offsets[partition + 1u]; ++record) {
+            const uint8_t *source =
+                packed_records.data() + record * temporary_record_bytes;
+            const uint32_t low = static_cast<uint32_t>(
+                load_temporary_key(source) & kDirectLowMask);
+            if (direct_table[low] == 0) touched.push_back(low);
+            if (direct_table[low] == std::numeric_limits<uint32_t>::max()) {
+              compact_ok.store(false, std::memory_order_relaxed);
+              break;
+            }
+            ++direct_table[low];
+          }
+          if (!compact_ok.load(std::memory_order_relaxed)) break;
+          std::sort(touched.begin(), touched.end());
+          for (uint32_t low : touched) {
+            keys.push_back((static_cast<uint64_t>(partition) <<
+                            kDirectLowBits) |
+                           low);
+            group_counts.push_back(static_cast<uint32_t>(direct_table[low]));
+            direct_table[low] = 0;
+          }
+        }
+        partition_group_offsets[num_partitions] = keys.size();
+      } else {
+        // The previous first-64K extrapolation saw almost exclusively new keys
+        // and reserved near the occurrence count.  The order-independent HLL
+        // drives reserve for the hash fallback used by genuinely small tasks.
+        if (unique_capacity[bucket] <=
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+          key_counts.reserve(static_cast<size_t>(unique_capacity[bucket]));
+        }
+        for (size_t record = 0;
+             record < packed_records.size() / temporary_record_bytes; ++record) {
+          const uint8_t *source =
+              packed_records.data() + record * temporary_record_bytes;
+          const uint64_t key = load_temporary_key(source);
+          auto inserted = key_counts.emplace(key, 0u);
+          ++inserted.first->second;
+        }
+        keys.reserve(key_counts.size());
+        for (const auto &entry : key_counts) keys.push_back(entry.first);
+        SortReadIndexKeys(&keys, key_bytes);
+        group_counts.reserve(keys.size());
+        for (uint64_t key : keys) {
+          const auto cursor = key_counts.find(key);
+          if (cursor == key_counts.end() || cursor->second == 0 ||
+              cursor->second > std::numeric_limits<uint32_t>::max()) {
             compact_ok.store(false, std::memory_order_relaxed);
             break;
           }
-          ++direct_table[low];
-        }
-        if (!compact_ok.load(std::memory_order_relaxed)) break;
-        std::sort(touched.begin(), touched.end());
-        for (uint32_t low : touched) {
-          keys.push_back((static_cast<uint64_t>(partition) <<
-                          kDirectLowBits) |
-                         low);
-          group_counts.push_back(static_cast<uint32_t>(direct_table[low]));
-          direct_table[low] = 0;
+          group_counts.push_back(static_cast<uint32_t>(cursor->second));
         }
       }
-      partition_group_offsets[num_partitions] = keys.size();
-    } else {
-      // The previous first-64K extrapolation saw almost exclusively new keys
-      // and reserved near the occurrence count.  The order-independent HLL
-      // drives reserve for the hash fallback used by genuinely small tasks.
-      if (unique_capacity[bucket] <=
-          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-        key_counts.reserve(static_cast<size_t>(unique_capacity[bucket]));
-      }
-      for (size_t record = 0;
-           record < packed_records.size() / temporary_record_bytes; ++record) {
-        const uint8_t *source =
-            packed_records.data() + record * temporary_record_bytes;
-        const uint64_t key = load_temporary_key(source);
-        auto inserted = key_counts.emplace(key, 0u);
-        ++inserted.first->second;
-      }
-      keys.reserve(key_counts.size());
-      for (const auto &entry : key_counts) keys.push_back(entry.first);
-      SortReadIndexKeys(&keys, key_bytes);
-      group_counts.reserve(keys.size());
-      for (uint64_t key : keys) {
-        const auto cursor = key_counts.find(key);
-        if (cursor == key_counts.end() || cursor->second == 0 ||
-            cursor->second > std::numeric_limits<uint32_t>::max()) {
-          compact_ok.store(false, std::memory_order_relaxed);
-          break;
-        }
-        group_counts.push_back(static_cast<uint32_t>(cursor->second));
-      }
-    }
-    if (!compact_ok.load(std::memory_order_relaxed) ||
-        group_counts.size() != keys.size()) {
-      compact_ok.store(false, std::memory_order_relaxed);
-      continue;
-    }
-    compact_count_nanos.fetch_add(
-        ClockNanoseconds(CLOCK_MONOTONIC) - count_begin,
-        std::memory_order_relaxed);
-
-    const uint64_t posting_fill_begin = ClockNanoseconds(CLOCK_MONOTONIC);
-    const uint64_t groups = keys.size();
-    std::vector<uint8_t> directory(
-        static_cast<size_t>(groups) * directory_entry_bytes);
-    std::vector<uint8_t> postings(
-        static_cast<size_t>(count) * locator_bytes);
-    size_t posting_index = 0;
-    for (size_t group_index = 0; group_index < keys.size(); ++group_index) {
-      const uint64_t key = keys[group_index];
-      const uint64_t group_count = group_counts[group_index];
-      if (group_count == 0 || group_count > count - posting_index) {
+      if (!compact_ok.load(std::memory_order_relaxed) ||
+          group_counts.size() != keys.size()) {
         compact_ok.store(false, std::memory_order_relaxed);
-        break;
+        continue;
       }
-      uint8_t *entry =
-          directory.data() + group_index * directory_entry_bytes;
-      StoreLowBytes(entry, key, key_bytes);
-      StoreLowBytes(entry + key_bytes, posting_index, bucket_begin_bytes);
-      StoreLowBytes(entry + key_bytes + bucket_begin_bytes, group_count,
-                    4u);
-      if (!use_direct_partition) {
-        auto cursor = key_counts.find(key);
-        if (cursor == key_counts.end()) {
+      compact_count_nanos.fetch_add(
+          ClockNanoseconds(CLOCK_MONOTONIC) - count_begin,
+          std::memory_order_relaxed);
+
+      const uint64_t posting_fill_begin = ClockNanoseconds(CLOCK_MONOTONIC);
+      const uint64_t groups = keys.size();
+      std::vector<uint8_t> directory(
+          static_cast<size_t>(groups) * directory_entry_bytes);
+      std::vector<uint8_t> postings(
+          static_cast<size_t>(count) * locator_bytes);
+      size_t posting_index = 0;
+      for (size_t group_index = 0; group_index < keys.size(); ++group_index) {
+        const uint64_t key = keys[group_index];
+        const uint64_t group_count = group_counts[group_index];
+        if (group_count == 0 || group_count > count - posting_index) {
           compact_ok.store(false, std::memory_order_relaxed);
           break;
         }
-        cursor->second = posting_index;
-      }
-      posting_index += group_count;
-    }
-    if (!compact_ok.load(std::memory_order_relaxed) || posting_index != count) {
-      compact_ok.store(false, std::memory_order_relaxed);
-      continue;
-    }
-
-    // Posting order is immaterial to exact replay: candidates are sorted and
-    // uniqued in read order before verification.  Avoiding a per-key locator
-    // sort saves another full pass over this much larger array.
-    if (use_direct_partition) {
-      constexpr unsigned kDirectLowBits = 16u;
-      constexpr uint64_t kDirectLowMask =
-          (uint64_t{1} << kDirectLowBits) - 1u;
-      const size_t num_partitions = partition_offsets.size() - 1u;
-      for (size_t partition = 0; partition < num_partitions; ++partition) {
-        const size_t group_begin = partition_group_offsets[partition];
-        const size_t group_end = partition_group_offsets[partition + 1u];
-        for (size_t group = group_begin; group < group_end; ++group) {
-          const uint32_t low =
-              static_cast<uint32_t>(keys[group] & kDirectLowMask);
-          const uint8_t *entry =
-              directory.data() + group * directory_entry_bytes;
-          direct_table[low] =
-              LoadLowBytes(entry + key_bytes, bucket_begin_bytes);
+        uint8_t *entry =
+            directory.data() + group_index * directory_entry_bytes;
+        StoreLowBytes(entry, key, key_bytes);
+        StoreLowBytes(entry + key_bytes, posting_index, bucket_begin_bytes);
+        StoreLowBytes(entry + key_bytes + bucket_begin_bytes, group_count,
+                      4u);
+        if (!use_direct_partition) {
+          auto cursor = key_counts.find(key);
+          if (cursor == key_counts.end()) {
+            compact_ok.store(false, std::memory_order_relaxed);
+            break;
+          }
+          cursor->second = posting_index;
         }
-        for (size_t packed = partition_offsets[partition];
-             packed < partition_offsets[partition + 1u]; ++packed) {
+        posting_index += group_count;
+      }
+      if (!compact_ok.load(std::memory_order_relaxed) || posting_index != count) {
+        compact_ok.store(false, std::memory_order_relaxed);
+        continue;
+      }
+
+      // Posting order is immaterial to exact replay: candidates are sorted and
+      // uniqued in read order before verification.  Avoiding a per-key locator
+      // sort saves another full pass over this much larger array.
+      if (use_direct_partition) {
+        constexpr unsigned kDirectLowBits = 16u;
+        constexpr uint64_t kDirectLowMask =
+            (uint64_t{1} << kDirectLowBits) - 1u;
+        const size_t num_partitions = partition_offsets.size() - 1u;
+        for (size_t partition = 0; partition < num_partitions; ++partition) {
+          const size_t group_begin = partition_group_offsets[partition];
+          const size_t group_end = partition_group_offsets[partition + 1u];
+          for (size_t group = group_begin; group < group_end; ++group) {
+            const uint32_t low =
+                static_cast<uint32_t>(keys[group] & kDirectLowMask);
+            const uint8_t *entry =
+                directory.data() + group * directory_entry_bytes;
+            direct_table[low] =
+                LoadLowBytes(entry + key_bytes, bucket_begin_bytes);
+          }
+          for (size_t packed = partition_offsets[partition];
+               packed < partition_offsets[partition + 1u]; ++packed) {
+            const uint8_t *source =
+                packed_records.data() + packed * temporary_record_bytes;
+            const uint32_t low = static_cast<uint32_t>(
+                load_temporary_key(source) & kDirectLowMask);
+            const uint64_t cursor = direct_table[low]++;
+            if (cursor >= count) {
+              compact_ok.store(false, std::memory_order_relaxed);
+              break;
+            }
+            const uint64_t locator = load_final_locator(source);
+            StoreLowBytes(postings.data() + cursor * locator_bytes, locator,
+                          locator_bytes);
+          }
+          if (!compact_ok.load(std::memory_order_relaxed)) break;
+          for (size_t group = group_begin; group < group_end; ++group) {
+            const uint32_t low =
+                static_cast<uint32_t>(keys[group] & kDirectLowMask);
+            const uint8_t *entry =
+                directory.data() + group * directory_entry_bytes;
+            const uint64_t begin =
+                LoadLowBytes(entry + key_bytes, bucket_begin_bytes);
+            const uint64_t group_count = LoadLowBytes(
+                entry + key_bytes + bucket_begin_bytes, 4u);
+            if (direct_table[low] != begin + group_count) {
+              compact_ok.store(false, std::memory_order_relaxed);
+              break;
+            }
+            direct_table[low] = 0;
+          }
+          if (!compact_ok.load(std::memory_order_relaxed)) break;
+        }
+      } else {
+        for (size_t packed = 0;
+             packed < packed_records.size() / temporary_record_bytes;
+             ++packed) {
           const uint8_t *source =
               packed_records.data() + packed * temporary_record_bytes;
-          const uint32_t low = static_cast<uint32_t>(
-              load_temporary_key(source) & kDirectLowMask);
-          const uint64_t cursor = direct_table[low]++;
-          if (cursor >= count) {
-            compact_ok.store(false, std::memory_order_relaxed);
-            break;
-          }
+          const uint64_t key = load_temporary_key(source);
           const uint64_t locator = load_final_locator(source);
-          StoreLowBytes(postings.data() + cursor * locator_bytes, locator,
-                        locator_bytes);
-        }
-        if (!compact_ok.load(std::memory_order_relaxed)) break;
-        for (size_t group = group_begin; group < group_end; ++group) {
-          const uint32_t low =
-              static_cast<uint32_t>(keys[group] & kDirectLowMask);
-          const uint8_t *entry =
-              directory.data() + group * directory_entry_bytes;
-          const uint64_t begin =
-              LoadLowBytes(entry + key_bytes, bucket_begin_bytes);
-          const uint64_t group_count = LoadLowBytes(
-              entry + key_bytes + bucket_begin_bytes, 4u);
-          if (direct_table[low] != begin + group_count) {
+          auto cursor = key_counts.find(key);
+          if (cursor == key_counts.end() || cursor->second >= count) {
             compact_ok.store(false, std::memory_order_relaxed);
             break;
           }
-          direct_table[low] = 0;
+          StoreLowBytes(postings.data() + cursor->second * locator_bytes,
+                        locator, locator_bytes);
+          ++cursor->second;
         }
-        if (!compact_ok.load(std::memory_order_relaxed)) break;
-      }
-    } else {
-      for (size_t packed = 0;
-           packed < packed_records.size() / temporary_record_bytes;
-           ++packed) {
-        const uint8_t *source =
-            packed_records.data() + packed * temporary_record_bytes;
-        const uint64_t key = load_temporary_key(source);
-        const uint64_t locator = load_final_locator(source);
-        auto cursor = key_counts.find(key);
-        if (cursor == key_counts.end() || cursor->second >= count) {
-          compact_ok.store(false, std::memory_order_relaxed);
-          break;
-        }
-        StoreLowBytes(postings.data() + cursor->second * locator_bytes,
-                      locator, locator_bytes);
-        ++cursor->second;
-      }
-      if (compact_ok.load(std::memory_order_relaxed)) {
-        posting_index = 0;
-        for (size_t group_index = 0; group_index < keys.size();
-             ++group_index) {
-          posting_index += group_counts[group_index];
-          const auto cursor = key_counts.find(keys[group_index]);
-          if (cursor == key_counts.end() ||
-              cursor->second != posting_index) {
-            compact_ok.store(false, std::memory_order_relaxed);
-            break;
+        if (compact_ok.load(std::memory_order_relaxed)) {
+          posting_index = 0;
+          for (size_t group_index = 0; group_index < keys.size();
+               ++group_index) {
+            posting_index += group_counts[group_index];
+            const auto cursor = key_counts.find(keys[group_index]);
+            if (cursor == key_counts.end() ||
+                cursor->second != posting_index) {
+              compact_ok.store(false, std::memory_order_relaxed);
+              break;
+            }
           }
         }
       }
-    }
-    if (!compact_ok.load(std::memory_order_relaxed)) continue;
-    phmap::flat_hash_map<uint64_t, uint64_t>().swap(key_counts);
-    std::vector<uint8_t>().swap(packed_records);
-    compact_fill_nanos.fetch_add(
-        ClockNanoseconds(CLOCK_MONOTONIC) - posting_fill_begin,
-        std::memory_order_relaxed);
+      if (!compact_ok.load(std::memory_order_relaxed)) continue;
+      phmap::flat_hash_map<uint64_t, uint64_t>().swap(key_counts);
+      std::vector<uint8_t>().swap(packed_records);
+      compact_fill_nanos.fetch_add(
+          ClockNanoseconds(CLOCK_MONOTONIC) - posting_fill_begin,
+          std::memory_order_relaxed);
 
-    std::vector<uint8_t> &fences = bucket_fence_keys[bucket];
-    fences.resize(static_cast<size_t>(DivCeiling(
-                      groups, static_cast<uint64_t>(directory_fence_stride))) *
-                  key_bytes);
-    for (uint64_t group = 0, fence = 0; group < groups;
-         group += directory_fence_stride, ++fence) {
-      std::memcpy(fences.data() + fence * key_bytes,
-                  directory.data() + group * directory_entry_bytes,
-                  key_bytes);
-    }
-    std::vector<uint64_t>().swap(keys);
+      std::vector<uint8_t> &fences = bucket_fence_keys[bucket];
+      fences.resize(static_cast<size_t>(DivCeiling(
+                        groups, static_cast<uint64_t>(directory_fence_stride))) *
+                    key_bytes);
+      for (uint64_t group = 0, fence = 0; group < groups;
+           group += directory_fence_stride, ++fence) {
+        std::memcpy(fences.data() + fence * key_bytes,
+                    directory.data() + group * directory_entry_bytes,
+                    key_bytes);
+      }
+      std::vector<uint64_t>().swap(keys);
 
-    const unsigned output_file_id =
-        static_cast<unsigned>(omp_get_thread_num()) % num_output_files;
-    const uint64_t output_begin = ClockNanoseconds(CLOCK_MONOTONIC);
-    uint64_t directory_offset = 0;
-    uint64_t posting_offset = 0;
-    bool write_ok = true;
-    {
-      std::lock_guard<std::mutex> lock(
-          output_file_mutexes[output_file_id]);
-      directory_offset = directory_cursors[output_file_id];
-      posting_offset = posting_cursors[output_file_id];
-      directory_cursors[output_file_id] += directory.size();
-      posting_cursors[output_file_id] += postings.size();
-      write_ok =
-          (directory.empty() ||
-           PwriteFully(directory_fds[output_file_id], directory.data(),
-                       directory.size(), directory_offset)) &&
-          (postings.empty() ||
-           PwriteFully(posting_fds[output_file_id], postings.data(),
-                       postings.size(), posting_offset));
+      const unsigned output_file_id =
+          static_cast<unsigned>(omp_get_thread_num()) % num_output_files;
+      const uint64_t output_begin = ClockNanoseconds(CLOCK_MONOTONIC);
+      uint64_t directory_offset = 0;
+      uint64_t posting_offset = 0;
+      bool write_ok = true;
+      {
+        std::lock_guard<std::mutex> lock(
+            output_file_mutexes[output_file_id]);
+        directory_offset = directory_cursors[output_file_id];
+        posting_offset = posting_cursors[output_file_id];
+        directory_cursors[output_file_id] += directory.size();
+        posting_cursors[output_file_id] += postings.size();
+        write_ok =
+            (directory.empty() ||
+             PwriteFully(directory_fds[output_file_id], directory.data(),
+                         directory.size(), directory_offset)) &&
+            (postings.empty() ||
+             PwriteFully(posting_fds[output_file_id], postings.data(),
+                         postings.size(), posting_offset));
+      }
+      if (!write_ok) {
+        compact_ok.store(false, std::memory_order_relaxed);
+        continue;
+      }
+      compact_write_nanos.fetch_add(
+          ClockNanoseconds(CLOCK_MONOTONIC) - output_begin,
+          std::memory_order_relaxed);
+      bucket_meta[bucket] = ReadIndexBucketMeta{
+          directory_offset, groups, posting_offset, count, output_file_id};
+      total_keys.fetch_add(groups, std::memory_order_relaxed);
     }
-    if (!write_ok) {
-      compact_ok.store(false, std::memory_order_relaxed);
-      continue;
+  };
+  if (!compact_read_pipeline) {
+    compact_buckets(compact_order, nullptr, num_threads);
+  } else {
+    std::unique_ptr<LoadedCompactWave> current =
+        load_compact_wave(compact_waves.front());
+    for (size_t wave = 0;
+         wave < compact_waves.size() &&
+         compact_ok.load(std::memory_order_relaxed); ++wave) {
+      const bool has_next = wave + 1 < compact_waves.size();
+      current->workspace.reset(new CompactMemoryLease(
+          &compact_memory_limiter,
+          compact_waves[wave].memory - compact_waves[wave].raw_memory,
+          compact_waves[wave].end - compact_waves[wave].begin));
+      // Oversized/skewed waves run without overlap. A prefetch never waits
+      // for memory held by the current wave, including during error unwinding.
+      const bool overlap = has_next && num_threads > 1 &&
+          compact_waves[wave + 1].raw_memory <= task_memory_budget &&
+          compact_waves[wave].memory <=
+              task_memory_budget - compact_waves[wave + 1].raw_memory;
+      std::future<std::unique_ptr<LoadedCompactWave>> next;
+      if (overlap) {
+        next = std::async(std::launch::async, [&, wave] {
+          ResetThreadAffinityToStartupMask();
+          return load_compact_wave(compact_waves[wave + 1]);
+        });
+      }
+      compact_buckets(
+          current->order, current.get(),
+          overlap ? num_threads - compact_read_threads : num_threads);
+      current.reset();
+      if (overlap) {
+        current = next.get();
+      } else if (has_next && compact_ok.load(std::memory_order_relaxed)) {
+        current = load_compact_wave(compact_waves[wave + 1]);
+      }
     }
-    compact_write_nanos.fetch_add(
-        ClockNanoseconds(CLOCK_MONOTONIC) - output_begin,
-        std::memory_order_relaxed);
-    bucket_meta[bucket] = ReadIndexBucketMeta{
-        directory_offset, groups, posting_offset, count, output_file_id};
-    total_keys.fetch_add(groups, std::memory_order_relaxed);
+    xinfo("Compact read pipeline: {} bounded bucket waves, up to {} "
+          "reader threads; exact contiguous-extent scatter\n",
+          compact_waves.size(), compact_read_threads);
   }
   compact_timer.stop();
   SimpleTimer publish_timer;
