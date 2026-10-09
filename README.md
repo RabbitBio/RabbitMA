@@ -265,6 +265,54 @@ against the existing compact memory budget. It remains opt-in: fragmented disk
 reads can benefit substantially, while small cached builds can be slower and
 prefetching increases resident memory.
 
+`MEGAHIT_EXPERIMENTAL_LARGE_GRAPH_CACHE=1` enables bounded graph-navigation
+caches beyond the 32-bit SDBG edge-address limit. Successors retain one-byte
+offsets with a 64-bit base per symbol per 256-edge block; the Backward
+transform uses compressed monotone blocks, and reverse-lookup samples store
+sequence keys separately from 64-bit edge offsets. This avoids a dense
+64-bit neighbor array. Cache allocation follows the existing memory budgets
+and falls back to live topology when unavailable. Smaller graphs keep their
+normal representation. For validation, additionally set
+`MEGAHIT_FORCE_LARGE_GRAPH_CACHE=1` to exercise wide bases on those graphs.
+It remains experimental:
+extra cache memory and construction time must be included in stage timings.
+`MEGAHIT_DISABLE_INVERSE_SIMPLE_SNAPSHOT=1` omits the optional one-byte-per-edge
+predecessor snapshot while retaining forward, Backward, and reverse-lookup
+acceleration. This reduces memory during tip removal at the cost of additional
+live incoming edge queries; peak RSS can still be set by later stages. When
+allocated, the inverse snapshot is released after initial tip removal; the
+forward snapshot remains reusable.
+
+`MEGAHIT_EXPERIMENTAL_PACKED_LEGACY_ORDER=1` sorts historical unitig starts
+using contiguous integer keys instead of repeatedly loading endpoints through
+an indirect comparator. It packs the full SDBG start address and oriented
+handle into the existing eight bytes per start only when their actual bit
+widths fit. Oversized combinations and duplicate start addresses retain the
+original comparator and input order. The subsequent ownership/event simulation
+is unchanged. `MEGAHIT_VALIDATE_PACKED_LEGACY_ORDER=1` additionally compares the
+complete ordered handle vector against the old sort; this validation consumes
+extra memory and time and should not be used for performance measurements.
+
+`MEGAHIT_EXPERIMENTAL_BATCHED_ENDPOINT_REKEY=1` batches sparse endpoint-map
+updates when graph cleaning shortens unitigs. It retires the old endpoint keys
+before trimming and publishing new endpoints, using bounded per-worker shard
+buffers. Endpoint-map readers resume after all buffers have been flushed.
+The SDBG trimming operations, coverage rounding and merge ownership rules are
+unchanged; dense endpoint maps retain their existing update path. This remains
+opt-in because it adds a retirement pass, and its total time and peak memory
+need to be measured alongside the graph workload. Set
+`MEGAHIT_PROFILE_GRAPH_REFRESH=1` to report the retired endpoint count and
+the erase and trim/insert times.
+
+Large-graph endpoint hash keys use two naturally aligned 32-bit words by
+default. This preserves all 64 key bits and the original hash while reducing
+each key/value slot from 16 to 12 bytes. Lookups accept the original uint64
+edge ID directly; the existing 32-bit-key path and graph caches are unchanged.
+Set `MEGAHIT_DISABLE_PACKED_ENDPOINT_KEYS=1` to use the previous 16-byte
+wide-key slots for comparison or rollback. `MEGAHIT_FORCE_PACKED_ENDPOINT_KEYS=1`
+exercises the wide-key representation on small regression graphs as well;
+the disable flag takes precedence over this test flag.
+
 Active-query extraction shares the forward/reverse rolling anchor scan when
 the query covers the full flank, and constructs window-filter keys directly
 from packed words. Shorter query windows still use the two distinct flank
@@ -275,8 +323,14 @@ For source regression tests, use Python 3.8 or newer after building:
 
 ```bash
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
-cmake --build build --target check_stream_stores check_local_minimizer_gate check_flank_filters check_coalesced_reads check_query_anchor
+cmake --build build --target check_stream_stores check_local_minimizer_gate check_flank_filters check_coalesced_reads check_query_anchor check_block_edge_bases check_legacy_order_sort check-packed-endpoint-key
 ```
+
+For a retained SDBG, build `test_sdbg_cache` and run
+`build/test_sdbg_cache GRAPH_PREFIX THREADS PROBES` to compare cached
+transforms, reverse complements, and invalidated links with uncached results.
+The reported `wide_probes` count covers actual addresses at or above the
+legacy `UINT32_MAX` cache boundary, rather than forced-wide small-graph tests.
 
 `MEGAHIT_TEST_CORE=/path/to/megahit_core_popcnt` (or the portable variant)
 selects another core for the same regression suite. These developer tests

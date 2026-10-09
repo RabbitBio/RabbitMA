@@ -7,6 +7,7 @@
 
 #include "sdbg_def.h"
 #include "sdbg_raw_content.h"
+#include "block_edge_bases.h"
 
 #include <omp.h>
 #include <algorithm>
@@ -28,6 +29,14 @@
 class SDBG {
  public:
   static const uint64_t kNullID = static_cast<uint64_t>(-1);
+  static bool LargeGraphCachesEnabled() {
+    return std::getenv("MEGAHIT_EXPERIMENTAL_LARGE_GRAPH_CACHE") != nullptr;
+  }
+  bool UseLargeGraphCaches() const {
+    return LargeGraphCachesEnabled() &&
+           (size() >= std::numeric_limits<uint32_t>::max() ||
+            std::getenv("MEGAHIT_FORCE_LARGE_GRAPH_CACHE") != nullptr);
+  }
   SDBG() = default;
   ~SDBG() = default;
 
@@ -141,10 +150,19 @@ class SDBG {
     const uint64_t num_edges = size();
     const uint64_t max_cached_id =
         std::numeric_limits<uint32_t>::max();
-    if (num_edges == 0 || num_edges >= max_cached_id ||
-        num_edges > std::numeric_limits<uint64_t>::max() /
-                        (2 * sizeof(uint32_t))) {
-      return false;
+    if (num_edges == 0) return false;
+    // Edge addresses and sampled sequence keys have different widths. Large
+    // graphs cannot use a uint32 dense transform, but can use block-relative
+    // Backward storage and the exact reverse-label directory. The experiment
+    // can force this representation on small fixtures for validation without
+    // changing the usual compact-ID path on later/smaller k rounds.
+    if (num_edges >= max_cached_id || UseLargeGraphCaches()) {
+      if (!LargeGraphCachesEnabled()) return false;
+      if (std::getenv("MEGAHIT_DISABLE_SDBG_TOPOLOGY_CACHE") == nullptr) {
+        BuildCompactBackwardTopologyCache(host_mem);
+      }
+      BuildReverseLookupSamples(host_mem);
+      return compact_backward_ready_ || !reverse_lookup_samples_.empty();
     }
     if (std::getenv("MEGAHIT_DISABLE_SDBG_TOPOLOGY_CACHE") != nullptr) {
       BuildReverseLookupSamples(host_mem);
@@ -304,11 +322,7 @@ class SDBG {
 
   uint64_t SimplePathSnapshotBytes() const {
     if (!simple_path_codes_) return 0;
-    const uint64_t blocks =
-        (simple_path_edge_count_ + kSimplePathBlockEdges - 1u) /
-        kSimplePathBlockEdges;
-    return simple_path_edge_count_ +
-           blocks * (kAlphabetSize + 1u) * sizeof(uint32_t);
+    return simple_path_edge_count_ + simple_path_bases_.bytes();
   }
 
   uint64_t SimplePathSnapshotOverflowCount() const {
@@ -318,6 +332,9 @@ class SDBG {
   bool HasSimplePathSnapshot() const {
     return simple_path_codes_ && simple_path_bases_ &&
            simple_path_edge_count_ == size();
+  }
+  bool SimplePathSnapshotUsesWideBases() const {
+    return simple_path_bases_.wide();
   }
 
   bool HasInverseSimplePathSnapshot() const {
@@ -346,16 +363,11 @@ class SDBG {
     }
     uint8_t c = GetW(edge);
     if (c > kAlphabetSize) c -= kAlphabetSize;
-    const uint32_t base = simple_path_bases_[
-        (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c];
-    if (base != std::numeric_limits<uint32_t>::max() && next >= base &&
-        next - base < 254u) {
-      simple_path_codes_[edge] =
-          static_cast<uint8_t>(next - base + 1u);
-      return false;
-    }
-    simple_path_codes_[edge] = 255u;
-    return true;
+    const uint64_t base = simple_path_bases_.Load(
+        (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c);
+    const uint8_t code = EncodeSimplePathDelta(base, next);
+    simple_path_codes_[edge] = code;
+    return code == 255u;
   }
 
   void FinishFinalSimplePathSnapshot(uint64_t overflow_count) {
@@ -372,20 +384,21 @@ class SDBG {
     }
 
     const uint64_t num_edges = size();
-    if (num_edges == 0 ||
-        num_edges >= std::numeric_limits<uint32_t>::max()) {
-      return false;
-    }
+    if (num_edges == 0) return false;
+    const bool wide_bases = num_edges >= std::numeric_limits<uint32_t>::max() ||
+                            UseLargeGraphCaches();
+    if (wide_bases && !LargeGraphCachesEnabled()) return false;
+    const size_t base_bytes = wide_bases ? sizeof(uint64_t) : sizeof(uint32_t);
     const uint64_t num_blocks =
         (num_edges + kSimplePathBlockEdges - 1u) /
         kSimplePathBlockEdges;
-    if (num_blocks > std::numeric_limits<uint64_t>::max() /
-                         ((kAlphabetSize + 1u) * sizeof(uint32_t))) {
+    if (num_blocks > (std::numeric_limits<size_t>::max() - num_edges) /
+                         ((kAlphabetSize + 1u) * base_bytes)) {
       return false;
     }
     const uint64_t bytes =
         num_edges +
-        num_blocks * (kAlphabetSize + 1u) * sizeof(uint32_t);
+        num_blocks * (kAlphabetSize + 1u) * base_bytes;
     // Match the portable auto-selection contract used by UnitigGraph: an
     // optional acceleration may consume at most a quarter of the caller's
     // declared memory budget.  No socket count or machine-specific constant
@@ -403,10 +416,10 @@ class SDBG {
     inverse_simple_path_overflow_count_ = 0u;
 
     std::unique_ptr<uint8_t[]> codes;
-    std::unique_ptr<uint32_t[]> bases;
+    BlockEdgeBases bases;
     try {
       codes.reset(new uint8_t[num_edges]);
-      bases.reset(new uint32_t[num_blocks * (kAlphabetSize + 1u)]);
+      bases.Allocate(num_blocks * (kAlphabetSize + 1u), wide_bases);
     } catch (const std::bad_alloc &) {
       return false;
     }
@@ -435,24 +448,22 @@ class SDBG {
     uint64_t inverse_overflow_count = 0;
 #pragma omp parallel reduction(+ : overflow_count, inverse_overflow_count)
     {
-      std::array<uint32_t, kSimplePathBlockEdges> local_next;
+      std::array<uint64_t, kSimplePathBlockEdges> local_next;
 #pragma omp for schedule(static)
       for (uint64_t block_id = 0; block_id < num_blocks; ++block_id) {
-        uint32_t *block_bases =
-            bases.get() + block_id * (kAlphabetSize + 1u);
-        std::fill(block_bases, block_bases + kAlphabetSize + 1u,
-                  std::numeric_limits<uint32_t>::max());
+        std::array<uint64_t, kAlphabetSize + 1u> block_bases;
+        block_bases.fill(uint64_t{kNullID});
         const uint64_t edge_begin = block_id * kSimplePathBlockEdges;
         const uint64_t edge_end =
             std::min<uint64_t>(num_edges,
                                edge_begin + kSimplePathBlockEdges);
 
         for (uint64_t edge = edge_begin; edge < edge_end; ++edge) {
-          uint32_t next_id = std::numeric_limits<uint32_t>::max();
+          uint64_t next_id = kNullID;
           if (IsValidEdge(edge)) {
             const uint64_t next = NextSimplePathEdge(edge);
             if (next != kNullID) {
-              next_id = static_cast<uint32_t>(next);
+              next_id = next;
               if (inverse_codes) {
                 const uint64_t first_incoming = Backward(next);
                 if (first_incoming <= edge &&
@@ -473,20 +484,18 @@ class SDBG {
         }
 
         for (uint64_t edge = edge_begin; edge < edge_end; ++edge) {
-          const uint32_t next_id = local_next[edge - edge_begin];
-          if (next_id == std::numeric_limits<uint32_t>::max()) {
+          const uint64_t next_id = local_next[edge - edge_begin];
+          if (next_id == kNullID) {
             codes[edge] = 0;
             continue;
           }
           uint8_t c = GetW(edge);
           if (c > kAlphabetSize) c -= kAlphabetSize;
-          const uint32_t delta = next_id - block_bases[c];
-          if (delta < 254u) {
-            codes[edge] = static_cast<uint8_t>(delta + 1u);
-          } else {
-            codes[edge] = 255u;
-            ++overflow_count;
-          }
+          codes[edge] = EncodeSimplePathDelta(block_bases[c], next_id);
+          overflow_count += codes[edge] == 255u;
+        }
+        for (unsigned c = 0; c <= kAlphabetSize; ++c) {
+          bases.Store(block_id * (kAlphabetSize + 1u) + c, block_bases[c]);
         }
       }
     }
@@ -513,9 +522,9 @@ class SDBG {
     if (code == 0 || code == 255u) return false;
     uint8_t c = GetW(edge);
     if (c > kAlphabetSize) c -= kAlphabetSize;
-    const uint32_t base = simple_path_bases_[
-        (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c];
-    if (base == std::numeric_limits<uint32_t>::max()) return false;
+    const uint64_t base = simple_path_bases_.Load(
+        (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c);
+    if (base == kNullID) return false;
     const uint64_t cached =
         static_cast<uint64_t>(base) + static_cast<uint64_t>(code - 1u);
     if (cached >= simple_path_edge_count_ || !IsValidEdge(cached)) {
@@ -559,9 +568,9 @@ class SDBG {
       if (code != 255u) {
         uint8_t c = GetW(edge);
         if (c > kAlphabetSize) c -= kAlphabetSize;
-        const uint32_t base = simple_path_bases_[
-            (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c];
-        assert(base != std::numeric_limits<uint32_t>::max());
+        const uint64_t base = simple_path_bases_.Load(
+            (edge / kSimplePathBlockEdges) * (kAlphabetSize + 1u) + c);
+        assert(base != kNullID);
         const uint64_t cached =
             static_cast<uint64_t>(base) + static_cast<uint64_t>(code - 1u);
         assert(cached < simple_path_edge_count_ && IsValidEdge(cached));
@@ -1711,7 +1720,7 @@ class SDBG {
   };
 
   struct CompactBackwardBlock {
-    uint32_t base_high{0};
+    uint64_t base_high{0};  // One wide base per 512 edges; offsets stay uint32.
     uint32_t high_word_offset{0};
     uint32_t low_word_offset{0};
     std::array<uint16_t,
@@ -1746,8 +1755,9 @@ class SDBG {
         std::getenv("MEGAHIT_ENABLE_COMPACT_BACKWARD_TOPOLOGY_CACHE") !=
         nullptr;
     if (num_edges == 0 ||
-        num_edges >= static_cast<uint64_t>(
-                         std::numeric_limits<uint32_t>::max()) ||
+        (num_edges >= static_cast<uint64_t>(
+                          std::numeric_limits<uint32_t>::max()) &&
+         !LargeGraphCachesEnabled()) ||
         host_mem == 0 ||
         (std::getenv("MEGAHIT_DISABLE_COMPACT_BACKWARD_TOPOLOGY_CACHE") !=
              nullptr &&
@@ -1808,17 +1818,21 @@ class SDBG {
     compact_backward_groups_[kAlphabetSize + 1u].block_begin =
         static_cast<uint32_t>(total_blocks);
 
+    if (total_blocks > host_mem / 8u / sizeof(CompactBackwardBlock)) {
+      return false;
+    }
     try {
       compact_backward_blocks_.resize(static_cast<size_t>(total_blocks));
     } catch (const std::bad_alloc &) {
-      compact_backward_blocks_.clear();
+      std::vector<CompactBackwardBlock>().swap(compact_backward_blocks_);
       return false;
     }
 
     // Each block is independent.  Two exact endpoint queries determine its
     // private high/low storage sizes without materializing an edge-sized
     // scratch array.
-#pragma omp parallel for schedule(static)
+    uint64_t oversized_blocks = 0;
+#pragma omp parallel for schedule(static) reduction(+ : oversized_blocks)
     for (int64_t signed_block = 0;
          signed_block < static_cast<int64_t>(total_blocks); ++signed_block) {
       const uint32_t block_id = static_cast<uint32_t>(signed_block);
@@ -1837,16 +1851,23 @@ class SDBG {
       const unsigned low_bits = group.low_bits;
       const uint64_t base_high = first >> low_bits;
       const uint64_t last_high = last >> low_bits;
-      assert(base_high <= std::numeric_limits<uint32_t>::max());
       CompactBackwardBlock &block = compact_backward_blocks_[block_id];
-      block.base_high = static_cast<uint32_t>(base_high);
+      block.base_high = base_high;
       block.select_samples.fill(kCompactBackwardSelectSampleOverflow);
       // Temporarily hold word counts; the serial prefix sum below replaces
       // them with final offsets.
-      block.high_word_offset = static_cast<uint32_t>(
-          (count + last_high - base_high + 63u) / 64u);
-      block.low_word_offset = static_cast<uint32_t>(
-          (count * low_bits + 63u) / 64u);
+      const uint64_t high_count = (count + last_high - base_high + 63u) / 64u;
+      const uint64_t low_count = (count * low_bits + 63u) / 64u;
+      if (high_count > std::numeric_limits<uint32_t>::max() ||
+          low_count > std::numeric_limits<uint32_t>::max()) {
+        ++oversized_blocks;
+      }
+      block.high_word_offset = static_cast<uint32_t>(high_count);
+      block.low_word_offset = static_cast<uint32_t>(low_count);
+    }
+    if (oversized_blocks != 0) {
+      std::vector<CompactBackwardBlock>().swap(compact_backward_blocks_);
+      return false;
     }
 
     uint64_t high_words = 0;
@@ -1856,7 +1877,7 @@ class SDBG {
       const uint32_t low_count = block.low_word_offset;
       if (high_words > std::numeric_limits<uint32_t>::max() - high_count ||
           low_words > std::numeric_limits<uint32_t>::max() - low_count) {
-        compact_backward_blocks_.clear();
+        std::vector<CompactBackwardBlock>().swap(compact_backward_blocks_);
         return false;
       }
       block.high_word_offset = static_cast<uint32_t>(high_words);
@@ -1874,7 +1895,7 @@ class SDBG {
     // unitig structures; --host_mem is already a per-job budget in shared-node
     // mode.
     if (cache_bytes > host_mem / 8u) {
-      compact_backward_blocks_.clear();
+      std::vector<CompactBackwardBlock>().swap(compact_backward_blocks_);
       return false;
     }
 
@@ -1882,7 +1903,7 @@ class SDBG {
       compact_backward_high_.reset(new uint64_t[high_words]);
       compact_backward_low_.reset(new uint64_t[low_words]);
     } catch (const std::bad_alloc &) {
-      compact_backward_blocks_.clear();
+      std::vector<CompactBackwardBlock>().swap(compact_backward_blocks_);
       compact_backward_high_.reset();
       compact_backward_low_.reset();
       return false;
@@ -2295,7 +2316,7 @@ class SDBG {
   uint64_t host_memory_budget_{0};
   bool forward_cache_borrowed_{false};
   std::unique_ptr<uint8_t[]> simple_path_codes_;
-  std::unique_ptr<uint32_t[]> simple_path_bases_;
+  BlockEdgeBases simple_path_bases_;
   uint64_t simple_path_edge_count_{0};
   uint64_t simple_path_overflow_count_{0};
   bool simple_path_snapshot_finalized_{false};

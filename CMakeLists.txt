@@ -193,6 +193,26 @@ add_custom_target(check_query_anchor
         COMMAND $<TARGET_FILE:test_query_anchor>
         DEPENDS test_query_anchor)
 
+add_executable(test_block_edge_bases EXCLUDE_FROM_ALL tests/block_edge_bases.cpp)
+add_custom_target(check_block_edge_bases
+        COMMAND $<TARGET_FILE:test_block_edge_bases>
+        DEPENDS test_block_edge_bases)
+
+add_executable(test_legacy_order_sort EXCLUDE_FROM_ALL tests/legacy_order_sort.cpp)
+add_executable(test_packed_endpoint_key EXCLUDE_FROM_ALL tests/packed_endpoint_key.cpp)
+add_custom_target(check-packed-endpoint-key
+        COMMAND $<TARGET_FILE:test_packed_endpoint_key>
+        DEPENDS test_packed_endpoint_key)
+add_custom_target(check_legacy_order_sort
+        COMMAND $<TARGET_FILE:test_legacy_order_sort>
+        DEPENDS test_legacy_order_sort)
+
+# Supply a retained SDBG prefix to this bounded replay executable. It checks
+# the actual wide-address path without rebuilding the read/assembly pipeline.
+add_executable(test_sdbg_cache EXCLUDE_FROM_ALL tests/sdbg_cache.cpp
+        src/assembly/sdbg_pruning.cpp ${SDBG_SOURCE})
+target_link_libraries(test_sdbg_cache ${ZLIB_LIBRARIES} ${LIBDEFLATE_LIBRARY})
+
 add_executable(test_local_minimizer_gate EXCLUDE_FROM_ALL
         tests/local_minimizer_gate.cpp
         src/localasm/hash_mapper.cpp

@@ -1151,6 +1151,12 @@ uint64_t RemoveTips(SDBG &dbg, int max_tip_len) {
     ProfileCandidateDensity(ignored, dbg.size(), max_tip_len);
   }
 
+  // Only backward tip walks consume this optional per-edge array.  The
+  // forward snapshot is reused by UnitigGraph, but keeping the inverse one
+  // through unitig construction and output wastes one byte per SDBG row.
+  // Directed-frontier trimming may already have released it; reset is safe
+  // for every pruning mode, including zero removals and a disabled cache.
+  dbg.ReleaseInverseSimplePathSnapshot();
   return number_tips;
 }
 

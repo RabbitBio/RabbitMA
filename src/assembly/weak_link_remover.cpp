@@ -6,6 +6,9 @@
 #include "unitig_graph.h"
 
 uint32_t DisconnectWeakLinks(UnitigGraph &graph, double local_ratio = 0.1) {
+  const bool profile = std::getenv("MEGAHIT_PROFILE_GRAPH_REFRESH") != nullptr;
+  const double detect_begin = profile ? omp_get_wtime() : 0;
+  const size_t active_before = graph.size();
   uint32_t num_disconnected = 0;
 #pragma omp parallel for reduction(+ : num_disconnected)
   for (UnitigGraph::size_type active_index = 0;
@@ -33,8 +36,17 @@ uint32_t DisconnectWeakLinks(UnitigGraph &graph, double local_ratio = 0.1) {
       }
     }
   }
+  const double detect_time = profile ? omp_get_wtime() - detect_begin : 0;
+  const double refresh_begin = profile ? omp_get_wtime() : 0;
   if (num_disconnected != 0) {
     graph.Refresh(false);
+  }
+  if (profile) {
+    xinfo("Weak-link profile: active-before={}, active-after={}, "
+          "disconnected={}, refresh-calls={}, detect={.4}, refresh={.4}\n",
+          active_before, graph.size(), num_disconnected,
+          num_disconnected != 0 ? 1 : 0, detect_time,
+          omp_get_wtime() - refresh_begin);
   }
   return num_disconnected;
 }

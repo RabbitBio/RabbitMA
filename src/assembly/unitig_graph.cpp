@@ -3,6 +3,7 @@
 //
 
 #include "unitig_graph.h"
+#include "legacy_order_sort.h"
 #include <omp.h>
 #include <atomic>
 #include <cerrno>
@@ -336,9 +337,9 @@ struct XorNeighborAccessor {
 struct ForwardNeighborAccessor {
   const uint32_t *next;
 
-  uint32_t LoadNext32(uint64_t edge) const { return next[edge]; }
+  uint32_t LoadNextId(uint64_t edge) const { return next[edge]; }
   uint64_t Next(uint64_t edge, uint64_t) const {
-    const uint32_t value = LoadNext32(edge);
+    const uint32_t value = LoadNextId(edge);
     return value == kNoSimpleNeighbor ? SDBG::kNullID
                                       : static_cast<uint64_t>(value);
   }
@@ -357,7 +358,7 @@ struct OffsetNeighborAccessor {
     return (edge & 1u) != 0u ? packed >> 4u : packed & 0x0fu;
   }
 
-  uint32_t LoadNext32(uint64_t edge) const {
+  uint32_t LoadNextId(uint64_t edge) const {
     const uint8_t code = LoadCode(edge);
     if (code == 0) {
       return kNoSimpleNeighbor;
@@ -371,7 +372,7 @@ struct OffsetNeighborAccessor {
   }
 
   uint64_t Next(uint64_t edge, uint64_t) const {
-    const uint32_t value = LoadNext32(edge);
+    const uint32_t value = LoadNextId(edge);
     return value == kNoSimpleNeighbor ? SDBG::kNullID
                                       : static_cast<uint64_t>(value);
   }
@@ -386,7 +387,7 @@ struct BlockNeighborAccessor {
   const uint8_t *codes;
   const uint32_t *bases;
 
-  uint32_t LoadNext32(uint64_t edge) const {
+  uint32_t LoadNextId(uint64_t edge) const {
     const uint8_t code = codes[edge];
     if (code == 0) {
       return kNoSimpleNeighbor;
@@ -407,7 +408,7 @@ struct BlockNeighborAccessor {
   }
 
   uint64_t Next(uint64_t edge, uint64_t) const {
-    const uint32_t value = LoadNext32(edge);
+    const uint32_t value = LoadNextId(edge);
     return value == kNoSimpleNeighbor ? SDBG::kNullID
                                       : static_cast<uint64_t>(value);
   }
@@ -420,16 +421,25 @@ struct BlockNeighborAccessor {
 struct SharedSnapshotNeighborAccessor {
   SDBG *sdbg;
 
-  uint32_t LoadNext32(uint64_t edge) const {
+  uint32_t LoadNextId(uint64_t edge) const {
     const uint64_t next = sdbg->CachedOrLiveNextSimplePathEdge(edge);
     return next == SDBG::kNullID ? kNoSimpleNeighbor
                                  : static_cast<uint32_t>(next);
   }
 
   uint64_t Next(uint64_t edge, uint64_t) const {
-    const uint32_t next = LoadNext32(edge);
+    const uint32_t next = LoadNextId(edge);
     return next == kNoSimpleNeighbor ? SDBG::kNullID
                                      : static_cast<uint64_t>(next);
+  }
+};
+
+// The snapshot still has one byte per edge. Only block directory bases and
+// this worker-local decoded address are wide on graphs beyond UINT32_MAX.
+struct LargeSharedSnapshotNeighborAccessor {
+  SDBG *sdbg;
+  uint64_t LoadNextId(uint64_t edge) const {
+    return sdbg->CachedOrLiveNextSimplePathEdge(edge);
   }
 };
 
@@ -714,6 +724,8 @@ size_t AssembleForwardNonLoopPathsMultistream(
     const ForwardAccessor &neighbors, unsigned stream_width,
     const std::vector<size_t> &owner_offsets,
     const std::vector<unsigned> &owner_domains) {
+  using NextId = decltype(neighbors.LoadNextId(uint64_t{0}));
+  const NextId no_next = std::numeric_limits<NextId>::max();
   struct PathState {
     bool active{false};
     bool reverse_phase{false};
@@ -723,7 +735,7 @@ size_t AssembleForwardNonLoopPathsMultistream(
     uint64_t rc_start{SDBG::kNullID};
     uint64_t rc_cur{SDBG::kNullID};
     uint64_t rc_end{SDBG::kNullID};
-    uint32_t pending_next{kNoSimpleNeighbor};
+    NextId pending_next{std::numeric_limits<NextId>::max()};
     int64_t depth{0};
     uint32_t length{0};
   };
@@ -853,14 +865,14 @@ size_t AssembleForwardNonLoopPathsMultistream(
         if (state.active) {
           const uint64_t edge =
               state.reverse_phase ? state.rc_cur : state.cur;
-          state.pending_next = neighbors.LoadNext32(edge);
+          state.pending_next = neighbors.LoadNextId(edge);
         }
       }
 
       // The decoded next IDs make the lock and multiplicity addresses known.
       // Start those dependent requests before the mutation/accumulation pass.
       for (PathState &state : states) {
-        if (state.active && state.pending_next != kNoSimpleNeighbor) {
+        if (state.active && state.pending_next != no_next) {
           locks->prefetch_for_write(state.pending_next);
           if (!state.reverse_phase) {
             sdbg->PrefetchMultiplicity(state.pending_next);
@@ -874,7 +886,7 @@ size_t AssembleForwardNonLoopPathsMultistream(
         }
         if (!state.reverse_phase) {
           const uint64_t next =
-              state.pending_next == kNoSimpleNeighbor
+              state.pending_next == no_next
                   ? SDBG::kNullID
                   : static_cast<uint64_t>(state.pending_next);
           if (next != SDBG::kNullID) {
@@ -908,7 +920,7 @@ size_t AssembleForwardNonLoopPathsMultistream(
         }
 
         const uint64_t rc_next =
-            state.pending_next == kNoSimpleNeighbor
+            state.pending_next == no_next
                 ? SDBG::kNullID
                 : static_cast<uint64_t>(state.pending_next);
         if (rc_next == SDBG::kNullID) {
@@ -1030,6 +1042,14 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
     }
   }
 
+  // Unitig-first rounds do not pass through SDBG RemoveTips, which normally
+  // creates the shared snapshot. Build it here as well for the opt-in large
+  // representation; a budget/allocation failure keeps the uncached fallback.
+  if (sdbg_->UseLargeGraphCaches() &&
+      (auto_select_mode || simple_neighbor_mode == SimpleNeighborMode::kBlock)) {
+    sdbg_->BuildSimplePathSnapshot(sdbg_->HostMemoryBudget());
+  }
+
   if (auto_select_mode) {
     uint64_t available_bytes = 0;
     bool found_available_memory = false;
@@ -1098,7 +1118,11 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
     }
   }
 
-  if (!compact_edge_ids && simple_neighbor_mode != SimpleNeighborMode::kOff) {
+  const bool large_shared_snapshot =
+      simple_neighbor_mode == SimpleNeighborMode::kBlock &&
+      sdbg_->HasSimplePathSnapshot();
+  if (!compact_edge_ids && !large_shared_snapshot &&
+      simple_neighbor_mode != SimpleNeighborMode::kOff) {
     xwarn("Simple-neighbor cache requires fewer than {} edges; using off mode\n",
           kNoSimpleNeighbor);
     simple_neighbor_mode = SimpleNeighborMode::kOff;
@@ -1226,7 +1250,8 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
                  : (simple_neighbor_mode == SimpleNeighborMode::kOffset
                         ? "offset"
                  : (simple_neighbor_mode == SimpleNeighborMode::kBlock
-                        ? "block"
+                        ? (sdbg_->SimplePathSnapshotUsesWideBases()
+                               ? "block-wide-base" : "block")
                  : (simple_neighbor_mode == SimpleNeighborMode::kXor
                         ? "xor"
                         : "off"))));
@@ -1644,7 +1669,14 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
         terminal_ids.size(), num_threads);
     xinfo("Unitig chain traversal: {} interleaved paths per worker\n",
           stream_width);
-    if (reusing_simple_path_snapshot) {
+    if (reusing_simple_path_snapshot &&
+        sdbg_->SimplePathSnapshotUsesWideBases()) {
+      const LargeSharedSnapshotNeighborAccessor neighbors{sdbg_};
+      count_palindrome = AssembleForwardNonLoopPathsMultistream(
+          sdbg_, &locks, &thread_vertices, terminal_ids, num_threads,
+          neighbors, stream_width, terminal_thread_offsets,
+          worker_numa_domains);
+    } else if (reusing_simple_path_snapshot) {
       const SharedSnapshotNeighborAccessor neighbors{sdbg_};
       count_palindrome = AssembleForwardNonLoopPathsMultistream(
           sdbg_, &locks, &thread_vertices, terminal_ids, num_threads,
@@ -1872,6 +1904,7 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
           "keys, {} shards, batch {}\n",
           num_endpoints, id_map_.key_bits(), id_map_.num_shards(),
           id_map_.batch_size());
+    xinfo("Endpoint hash slot payload: {} bytes\n", id_map_.slot_bytes());
   }
   endpoint_allocate_time = omp_get_wtime() - endpoint_stage_begin -
                            endpoint_release_time;
@@ -1900,6 +1933,7 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
   }
   endpoint_insert_time = omp_get_wtime() - endpoint_stage_begin -
                          endpoint_release_time - endpoint_allocate_time;
+  const double active_ids_begin = omp_get_wtime();
   active_ids_.resize(vertices_.size());
   std::iota(active_ids_.begin(), active_ids_.end(), size_type{0});
 
@@ -1917,7 +1951,11 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
         terminal_key |
         (VertexAdapter(vertices_[i]).IsLoop() ? (uint64_t{1} << 63u) : 0u);
   }
+  const double active_ids_time = omp_get_wtime() - active_ids_begin;
+  const double restore_begin = omp_get_wtime();
   if (!retain_sdbg_multiplicity) RestoreLegacyInitialOrder();
+  const double restore_time = omp_get_wtime() - restore_begin;
+  const double adjacency_begin = omp_get_wtime();
 
   // Direct handles require one orientation bit in addition to the stable
   // 32-bit slot ID.  For larger theoretical graphs retain the exact SDBG +
@@ -1956,6 +1994,12 @@ UnitigGraph::UnitigGraph(SDBG *sdbg, bool retain_sdbg_multiplicity)
           endpoint_release_time, endpoint_allocate_time, endpoint_insert_time,
           endpoint_total - endpoint_release_time - endpoint_allocate_time -
               endpoint_insert_time);
+    xinfo("Endpoint build detail: endpoints={}, active-slots={}, "
+          "active-ids={.4}, restore={.4}, adjacency-init={.4}, "
+          "adjacency-bytes={}\n", num_endpoints, vertices_.size(),
+          active_ids_time, restore_time, omp_get_wtime() - adjacency_begin,
+          use_direct_adjacency_ ? vertices_.size() *
+              (sizeof(DirectAdjacency) + sizeof(direct_adjacency_epoch_[0])) : 0u);
   }
   unitig_stage_timer.stop();
   xinfo("Unitig endpoint-map construction time: {.4}\n",
@@ -2068,6 +2112,9 @@ void UnitigGraph::AttachBridges(std::shared_ptr<ContigBridges> bridges) {
 }
 
 void UnitigGraph::RestoreLegacyInitialOrder() {
+  const bool profile = std::getenv("MEGAHIT_PROFILE_UNITIG_BUILD") != nullptr;
+  double stage_begin = profile ? omp_get_wtime() : 0;
+  const double restore_begin = stage_begin;
   // The v0.1.0 one-worker block builder advances 32 forward walks together.
   // Opposite strands can both be admitted before either walk finishes. In
   // that case its endpoint tie-break chooses the owner; otherwise the first
@@ -2075,19 +2122,70 @@ void UnitigGraph::RestoreLegacyInitialOrder() {
   // from lengths and endpoints, without repeating any SDBG edge traversal.
   std::vector<uint64_t> starts;
   starts.reserve(active_ids_.size() * 2u);
-  for (const size_type id : active_ids_) {
-    auto adapter = MakeSudoAdapter(id);
-    if (adapter.IsLoop()) continue;
-    starts.push_back(uint64_t{id} << 1u);
-    if (adapter.b() != adapter.rb()) {
-      starts.push_back((uint64_t{id} << 1u) | 1u);
+  const auto gather_starts = [&](std::vector<uint64_t> *out) {
+    out->clear();
+    for (const size_type id : active_ids_) {
+      auto adapter = MakeSudoAdapter(id);
+      if (adapter.IsLoop()) continue;
+      out->push_back(uint64_t{id} << 1u);
+      if (adapter.b() != adapter.rb()) {
+        out->push_back((uint64_t{id} << 1u) | 1u);
+      }
+      legacy_order_keys_[id] = vertices_[id].TerminalOrderKey();
     }
-    legacy_order_keys_[id] = vertices_[id].TerminalOrderKey();
-  }
-  std::sort(starts.begin(), starts.end(), [this](uint64_t lhs, uint64_t rhs) {
+  };
+  gather_starts(&starts);
+  const double prepare_time = profile ? omp_get_wtime() - stage_begin : 0;
+  if (profile) stage_begin = omp_get_wtime();
+  const auto historical_less = [this](uint64_t lhs, uint64_t rhs) {
     return MakeSudoAdapter(lhs >> 1u, lhs & 1u).b() <
            MakeSudoAdapter(rhs >> 1u, rhs & 1u).b();
-  });
+  };
+  const bool packed_requested =
+      std::getenv("MEGAHIT_EXPERIMENTAL_PACKED_LEGACY_ORDER") != nullptr;
+  bool packed_sorted = false;
+  legacy_order::SortProfile packed_profile;
+  if (packed_requested) {
+    const uint64_t max_handle = vertices_.empty()
+        ? 0u : ((uint64_t{vertices_.size() - 1u} << 1u) | 1u);
+    packed_sorted = legacy_order::TrySortPackedStarts(
+        &starts, sdbg_->size() == 0 ? 0 : sdbg_->size() - 1u, max_handle,
+        [this](uint64_t handle) {
+          return MakeSudoAdapter(handle >> 1u, handle & 1u).b();
+        }, profile ? &packed_profile : nullptr);
+  }
+  double legacy_sort_time = 0;
+  if (!packed_sorted) {
+    const double begin = profile ? omp_get_wtime() : 0;
+    // Wide key/handle combinations and duplicate keys preserve the exact old
+    // comparator and input order; they must not gain an implicit ID tie-break.
+    if (packed_requested) gather_starts(&starts);
+    std::sort(starts.begin(), starts.end(), historical_less);
+    if (profile) legacy_sort_time = omp_get_wtime() - begin;
+  }
+  const double sort_time = profile ? omp_get_wtime() - stage_begin : 0;
+  if (profile) {
+    xinfo("Legacy start sort: mode={s}, starts={}, buffer-bytes={}\n",
+          packed_sorted ? "packed-radix" : "historical-indirect", starts.size(),
+          starts.capacity() * sizeof(starts[0]));
+    xinfo("Legacy start sort detail: pack={.4}, radix={.4}, finish={.4}, "
+          "legacy={.4}, radix_used_count={}, fallback_count={}, reason={s}\n",
+          packed_profile.pack_seconds, packed_profile.radix_seconds,
+          packed_profile.finish_seconds, legacy_sort_time,
+          packed_sorted ? 1u : 0u, packed_requested && !packed_sorted ? 1u : 0u,
+          packed_requested ? packed_profile.fallback_reason : "not-requested");
+  }
+  if (std::getenv("MEGAHIT_VALIDATE_PACKED_LEGACY_ORDER") != nullptr) {
+    const double validation_begin = omp_get_wtime();
+    std::vector<uint64_t> reference;
+    reference.reserve(starts.size());
+    gather_starts(&reference);
+    std::sort(reference.begin(), reference.end(), historical_less);
+    if (reference != starts) xfatal("Packed legacy start order mismatch\n");
+    xinfo("Legacy start order validation: {} exact handles in {.4}s\n",
+          starts.size(), omp_get_wtime() - validation_begin);
+  }
+  if (profile) stage_begin = omp_get_wtime();
 
   struct Event {
     uint64_t time;
@@ -2112,7 +2210,9 @@ void UnitigGraph::RestoreLegacyInitialOrder() {
                              std::numeric_limits<size_type>::max());
   size_t input = 0;
   size_type output_rank = 0;
+  uint64_t event_count = 0;
   while (!events.empty()) {
+    if (profile) ++event_count;
     Event event = events.top();
     events.pop();
     if (event.phase == 0) {
@@ -2151,6 +2251,8 @@ void UnitigGraph::RestoreLegacyInitialOrder() {
     }
     events.push({event.time + 1u, 0, event.slot, 0});
   }
+  const double event_time = profile ? omp_get_wtime() - stage_begin : 0;
+  if (profile) stage_begin = omp_get_wtime();
 #pragma omp parallel for schedule(static)
   for (size_t active_index = 0; active_index < active_ids_.size();
        ++active_index) {
@@ -2161,6 +2263,12 @@ void UnitigGraph::RestoreLegacyInitialOrder() {
     }
   }
   InvalidateDirectAdjacency();
+  if (profile) {
+    xinfo("Legacy order profile: starts={}, events={}, prepare={.4}, "
+          "sort={.4}, simulation={.4}, orientation={.4}, total={.4}\n", starts.size(),
+          event_count, prepare_time, sort_time, event_time,
+          omp_get_wtime() - stage_begin, omp_get_wtime() - restore_begin);
+  }
 }
 
 void UnitigGraph::FinalizeInitialTipCompression() {
@@ -2370,70 +2478,120 @@ std::vector<UnitigGraph::size_type> UnitigGraph::CollectRefreshSeeds(
 
 void UnitigGraph::RefreshDisconnected(
     const std::vector<size_type> &affected) {
-#pragma omp parallel for schedule(static)
-  for (size_t affected_index = 0; affected_index < affected.size();
-       ++affected_index) {
-    const size_type i = affected[affected_index];
-    auto adapter = MakeSudoAdapter(i);
-    if (adapter.IsToDelete() || adapter.IsPalindrome() || adapter.IsLoop()) {
-      continue;
+  const bool batched_rekey = !use_dense_id_map_ &&
+      std::getenv("MEGAHIT_EXPERIMENTAL_BATCHED_ENDPOINT_REKEY") != nullptr;
+  const bool profile = batched_rekey &&
+      std::getenv("MEGAHIT_PROFILE_GRAPH_REFRESH") != nullptr;
+  const double begin = profile ? omp_get_wtime() : 0;
+  double erase_seconds = 0;
+  uint64_t retired_endpoints = 0;
+  if (batched_rekey) {
+    // Only surviving, shortened unitigs change their endpoint keys. The
+    // following mutation phase uses SDBG topology, never the endpoint map;
+    // all old keys can therefore be retired before publishing any new key.
+    // Barriers and FlushAll keep map readers outside that interval. Removed
+    // unitigs, loops and palindromes retain the historical handling below.
+#pragma omp parallel reduction(+ : retired_endpoints)
+    {
+      EndpointMap::BufferedEraser eraser(&id_map_);
+#pragma omp for schedule(static)
+      for (size_t index = 0; index < affected.size(); ++index) {
+        auto adapter = MakeSudoAdapter(affected[index]);
+        if (adapter.IsToDelete() || adapter.IsPalindrome() || adapter.IsLoop())
+          continue;
+        const uint8_t forward = adapter.IsToDisconnect();
+        adapter.ReverseComplement();
+        const uint8_t reverse = adapter.IsToDisconnect();
+        adapter.ReverseComplement();
+        if (adapter.GetLength() <= forward + reverse) continue;
+        if (forward) eraser.Erase(adapter.b());
+        if (reverse) eraser.Erase(adapter.rb());
+        retired_endpoints += forward + reverse;
+      }
+      eraser.FlushAll();
     }
+    if (profile) erase_seconds = omp_get_wtime() - begin;
+  }
 
-    uint8_t to_disconnect = adapter.IsToDisconnect();
-    adapter.ReverseComplement();
-    uint8_t rc_to_disconnect = adapter.IsToDisconnect();
-    adapter.ReverseComplement();
-
-    if (!to_disconnect && !rc_to_disconnect) {
-      continue;
+#pragma omp parallel
+  {
+    std::unique_ptr<EndpointMap::BufferedInserter> new_endpoints;
+    if (batched_rekey && retired_endpoints != 0) {
+      new_endpoints.reset(new EndpointMap::BufferedInserter(&id_map_));
     }
+#pragma omp for schedule(static)
+    for (size_t affected_index = 0; affected_index < affected.size();
+         ++affected_index) {
+      const size_type i = affected[affected_index];
+      auto adapter = MakeSudoAdapter(i);
+      if (adapter.IsToDelete() || adapter.IsPalindrome() || adapter.IsLoop()) {
+        continue;
+      }
 
-    if (adapter.GetLength() <= to_disconnect + rc_to_disconnect) {
-      adapter.SetToDelete();
-      continue;
+      uint8_t to_disconnect = adapter.IsToDisconnect();
+      adapter.ReverseComplement();
+      uint8_t rc_to_disconnect = adapter.IsToDisconnect();
+      adapter.ReverseComplement();
+
+      if (!to_disconnect && !rc_to_disconnect) {
+        continue;
+      }
+
+      if (adapter.GetLength() <= to_disconnect + rc_to_disconnect) {
+        adapter.SetToDelete();
+        continue;
+      }
+
+      auto old_start = adapter.b();
+      auto old_end = adapter.e();
+      auto old_rc_start = adapter.rb();
+      auto old_rc_end = adapter.re();
+      uint64_t new_start, new_end, new_rc_start, new_rc_end;
+
+      if (to_disconnect) {
+        new_start = RawNextEdge(old_start);
+        new_rc_end = RawPreviousEdge(old_rc_end);
+        assert(new_start != SDBG::kNullID && new_rc_end != SDBG::kNullID);
+        sdbg_->SetInvalidEdge(old_start);
+        sdbg_->SetInvalidEdge(old_rc_end);
+      } else {
+        new_start = old_start;
+        new_rc_end = old_rc_end;
+      }
+
+      if (rc_to_disconnect) {
+        new_rc_start = RawNextEdge(old_rc_start);
+        new_end = RawPreviousEdge(old_end);
+        assert(new_rc_start != SDBG::kNullID && new_end != SDBG::kNullID);
+        sdbg_->SetInvalidEdge(old_rc_start);
+        sdbg_->SetInvalidEdge(old_end);
+      } else {
+        new_rc_start = old_rc_start;
+        new_end = old_end;
+      }
+
+      uint32_t new_length =
+          adapter.GetLength() - to_disconnect - rc_to_disconnect;
+      uint64_t new_total_depth = lround(adapter.GetAvgDepth() * new_length);
+      adapter.SetBeginEnd(new_start, new_end, new_rc_start, new_rc_end);
+      adapter.SetLength(new_length);
+      adapter.SetTotalDepth(new_total_depth);
+
+      if (to_disconnect) {
+        if (new_endpoints) new_endpoints->Insert(new_start, i);
+        else ReplaceVertexIdForSdbgId(old_start, new_start, i);
+      }
+      if (rc_to_disconnect) {
+        if (new_endpoints) new_endpoints->Insert(new_rc_start, i);
+        else ReplaceVertexIdForSdbgId(old_rc_start, new_rc_start, i);
+      }
     }
-
-    auto old_start = adapter.b();
-    auto old_end = adapter.e();
-    auto old_rc_start = adapter.rb();
-    auto old_rc_end = adapter.re();
-    uint64_t new_start, new_end, new_rc_start, new_rc_end;
-
-    if (to_disconnect) {
-      new_start = RawNextEdge(old_start);
-      new_rc_end = RawPreviousEdge(old_rc_end);
-      assert(new_start != SDBG::kNullID && new_rc_end != SDBG::kNullID);
-      sdbg_->SetInvalidEdge(old_start);
-      sdbg_->SetInvalidEdge(old_rc_end);
-    } else {
-      new_start = old_start;
-      new_rc_end = old_rc_end;
-    }
-
-    if (rc_to_disconnect) {
-      new_rc_start = RawNextEdge(old_rc_start);
-      new_end = RawPreviousEdge(old_end);
-      assert(new_rc_start != SDBG::kNullID && new_end != SDBG::kNullID);
-      sdbg_->SetInvalidEdge(old_rc_start);
-      sdbg_->SetInvalidEdge(old_end);
-    } else {
-      new_rc_start = old_rc_start;
-      new_end = old_end;
-    }
-
-    uint32_t new_length =
-        adapter.GetLength() - to_disconnect - rc_to_disconnect;
-    uint64_t new_total_depth = lround(adapter.GetAvgDepth() * new_length);
-    adapter.SetBeginEnd(new_start, new_end, new_rc_start, new_rc_end);
-    adapter.SetLength(new_length);
-    adapter.SetTotalDepth(new_total_depth);
-
-    if (to_disconnect) {
-      ReplaceVertexIdForSdbgId(old_start, new_start, i);
-    }
-    if (rc_to_disconnect) {
-      ReplaceVertexIdForSdbgId(old_rc_start, new_rc_start, i);
-    }
+    if (new_endpoints) new_endpoints->FlushAll();
+  }
+  if (profile && retired_endpoints != 0) {
+    xinfo("Batched endpoint rekey: endpoints={}, erase={.4}, "
+          "trim+insert={.4}\n", retired_endpoints, erase_seconds,
+          omp_get_wtime() - begin - erase_seconds);
   }
 }
 

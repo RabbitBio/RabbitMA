@@ -10,6 +10,7 @@
 #include <memory>
 #include <vector>
 #include "parallel_hashmap/phmap.h"
+#include "packed_endpoint_key.h"
 #include "contig_bridges.h"
 #include "sdbg/sdbg.h"
 #include "unitig_graph_vertex.h"
@@ -315,6 +316,7 @@ class UnitigGraph {
     struct Shard {
       phmap::flat_hash_map<uint32_t, size_type> compact_entries;
       phmap::flat_hash_map<uint64_t, size_type> wide_entries;
+      endpoint_map::PackedMap packed_wide_entries;
       SpinLock lock;
     };
 
@@ -382,19 +384,66 @@ class UnitigGraph {
       std::vector<std::vector<BufferedEntry>> buffers_;
     };
 
+    // Refresh can move a large fraction of the endpoints at once. Retiring
+    // their old keys in a separate phase avoids interleaving millions of
+    // erase/insert operations near a shard's growth limit. No endpoint-map
+    // reader runs between this phase and BufferedInserter::FlushAll().
+    class BufferedEraser {
+     public:
+      explicit BufferedEraser(EndpointMap *map)
+          : map_(map), batch_size_(map->batch_size_),
+            buffers_(map->num_shards_) {}
+      BufferedEraser(const BufferedEraser &) = delete;
+      BufferedEraser &operator=(const BufferedEraser &) = delete;
+
+      void Erase(uint64_t key) {
+        const size_t shard = map_->ShardFor(key);
+        auto &buffer = buffers_[shard];
+        if (buffer.empty()) buffer.reserve(batch_size_);
+        buffer.push_back(key);
+        if (buffer.size() == batch_size_) Flush(shard);
+      }
+
+      void FlushAll() {
+        for (size_t shard = 0; shard < map_->num_shards_; ++shard) {
+          if (!buffers_[shard].empty()) Flush(shard);
+        }
+      }
+
+     private:
+      void Flush(size_t shard) {
+        auto &buffer = buffers_[shard];
+        Shard &target = map_->shards_[shard];
+        std::lock_guard<SpinLock> guard(target.lock);
+        for (uint64_t key : buffer) map_->EraseUnlocked(target, key);
+        buffer.clear();
+      }
+
+      EndpointMap *map_;
+      size_t batch_size_;
+      std::vector<std::vector<uint64_t>> buffers_;
+    };
+
     EndpointMap() : shards_(new Shard[1]) {}
 
     void clear() {
       for (size_t i = 0; i < num_shards_; ++i) {
         shards_[i].compact_entries.clear();
         shards_[i].wide_entries.clear();
+        shards_[i].packed_wide_entries.clear();
       }
     }
     void reserve(size_t size, size_t concurrency,
                  uint64_t key_space_size) {
       concurrency = std::max<size_t>(1, concurrency);
       compact_keys_ =
-          key_space_size <= uint64_t{std::numeric_limits<uint32_t>::max()} + 1;
+          key_space_size <= uint64_t{std::numeric_limits<uint32_t>::max()} + 1 &&
+          std::getenv("MEGAHIT_FORCE_PACKED_ENDPOINT_KEYS") == nullptr;
+      // Wide addresses need all 64 bits, but not eight-byte slot alignment.
+      // Keep the padded representation available for controlled comparisons;
+      // disabling packing also takes precedence over the small-graph test flag.
+      packed_wide_keys_ = !compact_keys_ &&
+          std::getenv("MEGAHIT_DISABLE_PACKED_ENDPOINT_KEYS") == nullptr;
 
       // Keep several independently locked shards per active worker, but do
       // not create more shards than the input can populate efficiently.  The
@@ -427,6 +476,8 @@ class UnitigGraph {
       for (size_t i = 0; i < num_shards_; ++i) {
         if (compact_keys_) {
           shards_[i].compact_entries.reserve(per_shard);
+        } else if (packed_wide_keys_) {
+          shards_[i].packed_wide_entries.reserve(per_shard);
         } else {
           shards_[i].wide_entries.reserve(per_shard);
         }
@@ -435,11 +486,15 @@ class UnitigGraph {
     size_t num_shards() const { return num_shards_; }
     size_t batch_size() const { return batch_size_; }
     unsigned key_bits() const { return compact_keys_ ? 32u : 64u; }
+    unsigned slot_bytes() const {
+      return compact_keys_ ? 8u : packed_wide_keys_ ? 12u : 16u;
+    }
     size_t size() const {
       size_t total = 0;
       for (size_t i = 0; i < num_shards_; ++i) {
         total += compact_keys_ ? shards_[i].compact_entries.size()
-                               : shards_[i].wide_entries.size();
+                  : packed_wide_keys_ ? shards_[i].packed_wide_entries.size()
+                                      : shards_[i].wide_entries.size();
       }
       return total;
     }
@@ -447,13 +502,15 @@ class UnitigGraph {
       const Shard &shard = shards_[ShardFor(key)];
       return compact_keys_
                  ? shard.compact_entries.at(static_cast<uint32_t>(key))
-                 : shard.wide_entries.at(key);
+                 : packed_wide_keys_ ? shard.packed_wide_entries.at(key)
+                                     : shard.wide_entries.at(key);
     }
     size_type &operator[](uint64_t key) {
       Shard &shard = shards_[ShardFor(key)];
       return compact_keys_
                  ? shard.compact_entries[static_cast<uint32_t>(key)]
-                 : shard.wide_entries[key];
+                 : packed_wide_keys_ ? shard.packed_wide_entries[key]
+                                     : shard.wide_entries[key];
     }
     void InsertConcurrent(uint64_t key, size_type value) {
       Shard &shard = shards_[ShardFor(key)];
@@ -469,6 +526,10 @@ class UnitigGraph {
         auto it = shard.compact_entries.find(static_cast<uint32_t>(key));
         assert(it != shard.compact_entries.end());
         it->second = value;
+      } else if (packed_wide_keys_) {
+        auto it = shard.packed_wide_entries.find(key);
+        assert(it != shard.packed_wide_entries.end());
+        it->second = value;
       } else {
         auto it = shard.wide_entries.find(key);
         assert(it != shard.wide_entries.end());
@@ -479,7 +540,8 @@ class UnitigGraph {
       Shard &shard = shards_[ShardFor(key)];
       return compact_keys_
                  ? shard.compact_entries.erase(static_cast<uint32_t>(key))
-                 : shard.wide_entries.erase(key);
+                 : packed_wide_keys_ ? shard.packed_wide_entries.erase(key)
+                                     : shard.wide_entries.erase(key);
     }
     void ReplaceConcurrent(uint64_t old_key, uint64_t new_key,
                            size_type value) {
@@ -505,6 +567,8 @@ class UnitigGraph {
     void SetUnlocked(Shard &shard, uint64_t key, size_type value) {
       if (compact_keys_) {
         shard.compact_entries[static_cast<uint32_t>(key)] = value;
+      } else if (packed_wide_keys_) {
+        shard.packed_wide_entries[key] = value;
       } else {
         shard.wide_entries[key] = value;
       }
@@ -512,6 +576,8 @@ class UnitigGraph {
     void EraseUnlocked(Shard &shard, uint64_t key) {
       if (compact_keys_) {
         shard.compact_entries.erase(static_cast<uint32_t>(key));
+      } else if (packed_wide_keys_) {
+        shard.packed_wide_entries.erase(key);
       } else {
         shard.wide_entries.erase(key);
       }
@@ -522,6 +588,7 @@ class UnitigGraph {
     size_t shard_mask_{0};
     size_t batch_size_{4};
     bool compact_keys_{false};
+    bool packed_wide_keys_{false};
   };
 
  private:
